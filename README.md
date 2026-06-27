@@ -178,3 +178,16 @@ speaker order is repaired, and empty rooms are closed.
 - `persona_structural_check` reports structural completeness. `persona_validate`
   remains a compatibility alias. Persona quality requires the host-driven
   evaluation suite.
+
+## Acknowledgements and Inspirations
+
+Persona Continuum is an original implementation, but its design was informed by several open-source projects and public specifications:
+
+* Nuwa Skill, created by Huashu, inspired the public-person research workflow, parallel source collection, cognitive-framework extraction, decision heuristics, expression DNA, evidence transparency, and persona-quality validation.
+* MiroFish inspired the use of world events, branching timelines, multi-agent simulation framing, and counterfactual evolution. Persona Continuum does not include or modify MiroFish or OASIS code.
+* Model Context Protocol and the MCP Python SDK provide the protocol and SDK used by the local MCP server.
+* TRAE Work, Codex, Claude Code, Cursor, OpenCode, and other compatible Agent hosts provide the model reasoning and tool-execution environment.
+
+Persona Continuum does not copy code, prompt templates, or proprietary structures from Nuwa Skill, MiroFish, or OASIS. Its domain model, SQLite persistence layer, persona runtime, memory system, affect and relationship engines, branch isolation, artifact schemas, and MCP implementation are original.
+
+For additional design references, see docs/REFERENCES.md.
