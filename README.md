@@ -1,7 +1,7 @@
 # Persona Continuum
 
 Persona Continuum is a local-first digital persona platform for Agent hosts
-such as Codex, Claude Code, Cursor, and OpenCode. It provides a Python package,
+such as Codex, Claude Code, Cursor, and OpenCode, TRAE Work. It provides a Python package,
 CLI, MCP server, and Agent Skill for creating, storing, running, evaluating,
 exporting, and importing structured persona packages.
 
@@ -36,7 +36,7 @@ uv run persona-continuum init
 uv run persona-continuum doctor --json
 ```
 
-## Codex MCP Configuration
+## MCP Configuration
 
 Codex stores MCP servers in `config.toml`. For stdio:
 
@@ -48,6 +48,11 @@ cwd = "/absolute/path/to/persona-continuum"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
 ```
+MCP Configuration
+
+TRAE Work
+Codex
+Other MCP-compatible hosts
 
 ## Skill Installation
 
