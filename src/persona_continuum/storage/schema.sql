@@ -1,0 +1,1 @@
+-- Canonical SQLite schema lives in persona_continuum.storage.migrations.SCHEMA_SQL.
