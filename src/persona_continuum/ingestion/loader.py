@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import zipfile
 from collections.abc import Sequence
@@ -126,6 +125,9 @@ class SourceLoader:
             rows = [json.loads(line) for line in content.splitlines() if line.strip()]
             return "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
         if suffix == ".csv":
-            rows = list(csv.DictReader(content.splitlines()))
-            return "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+            # Keep CSV in its original tabular form. Downstream structured
+            # material parsers need the header row to map sender, timestamp and
+            # message columns; converting rows to JSONL while retaining the
+            # ``csv`` source type makes that second parse lossy.
+            return content
         return content

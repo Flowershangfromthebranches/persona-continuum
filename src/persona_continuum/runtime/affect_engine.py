@@ -64,6 +64,41 @@ class AffectEngine:
             self.database.conn.commit()
         return list(states.values())
 
+    def apply_deltas(
+        self,
+        persona_id: str,
+        deltas: dict[str, float],
+        reason: str,
+        branch_id: str = "main",
+        now: datetime | None = None,
+        *,
+        commit: bool = True,
+    ) -> list[AffectState]:
+        """Move emotions additively: ``intensity = clamp(intensity + delta)``.
+
+        :meth:`update_emotions` is a *floor* -- ``max(current, amount)`` -- so it
+        can never cool an emotion down.  That is correct for stimulus targets
+        and wrong for deltas, which is why the two are separate methods rather
+        than one field meaning both things.
+        """
+        now = now or datetime.now(UTC)
+        states = {
+            state.name: state
+            for state in self.get_emotions(persona_id, branch_id, now=now, commit=False)
+        }
+        for name, delta in deltas.items():
+            if name not in EMOTION_NAMES:
+                continue
+            state = states[name]
+            state.intensity = clamp(state.intensity + delta)
+            state.updated_at = now
+            state.triggers.append(reason)
+            state.confidence = clamp(max(state.confidence, 0.65))
+            self._save(persona_id, branch_id, state)
+        if commit:
+            self.database.conn.commit()
+        return list(states.values())
+
     def _decay(self, state: AffectState, now: datetime) -> AffectState:
         elapsed_hours = max(0.0, (now - state.updated_at).total_seconds() / 3600)
         if elapsed_hours == 0:

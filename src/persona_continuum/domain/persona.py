@@ -39,6 +39,10 @@ class PersonaManifest(BaseModel):
     active: bool = False
     confidence: dict[str, float] = Field(default_factory=dict)
     source_count: int = 0
+    # Short, evidence-backed card blurb.  Kept on the existing manifest so
+    # legacy Persona packages remain the source of truth and can be surfaced
+    # through the unified Actor/Profile Library without a second Persona format.
+    summary: str = ""
     compile_state: str = "draft"
     has_counterfactual_continuation: bool = False
     current_main_branch: str | None = None

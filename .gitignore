@@ -4,6 +4,7 @@
 .mypy_cache/
 __pycache__/
 __MACOSX/
+.DS_Store
 *.py[cod]
 dist/
 build/
@@ -18,5 +19,9 @@ exports/
 .env.*
 *.pem
 *.key
+.commandcode/
+.qoder/
+.workbuddy-ai/
+/narrative-shooting-pipeline-report.canvas.*
 .agents/
 docs/superpowers/

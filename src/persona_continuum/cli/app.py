@@ -19,16 +19,26 @@ persona_app = typer.Typer(help="Manage personas.")
 session_app = typer.Typer(help="Manage sessions.")
 memory_app = typer.Typer(help="Manage memories.")
 continuation_app = typer.Typer(help="Manage continuation branches.")
+agents_app = typer.Typer(help="Discover and inspect agent cognitive hosts.")
+room_app = typer.Typer(help="Manage multi-agent persona rooms.")
 app.add_typer(persona_app, name="persona")
 app.add_typer(session_app, name="session")
 app.add_typer(memory_app, name="memory")
 app.add_typer(continuation_app, name="continuation")
+app.add_typer(agents_app, name="agents")
+app.add_typer(room_app, name="room")
 
 
 def build() -> PersonaContinuum:
     continuum = PersonaContinuum(Config())
     continuum.init()
     return continuum
+
+
+def _websocket_backend_available() -> bool:
+    from persona_continuum.web.server import websocket_backend_available
+
+    return websocket_backend_available()
 
 
 def _probe_fts5() -> bool:
@@ -101,6 +111,7 @@ def doctor(json_output: Annotated[bool, typer.Option("--json")] = False) -> None
         "database_init_error": init_error,
         "skill_file": str(Path.cwd() / "skills" / "persona-continuum" / "SKILL.md"),
         "skill_file_exists": (Path.cwd() / "skills" / "persona-continuum" / "SKILL.md").exists(),
+        "websocket_backend": _websocket_backend_available(),
     }
     if continuum:
         continuum.close()
@@ -197,6 +208,169 @@ def export(persona_id: str, output: Path | None = None) -> None:
     path = continuum.personas.export_persona(persona_id, output)
     continuum.close()
     typer.echo(str(path))
+
+
+@app.command("web")
+def web_command(
+    port: Annotated[int, typer.Option("--port", "-p", help="Port to listen on")] = 8000,
+    host: Annotated[str, typer.Option("--host", "-h", help="Host to bind to")] = "127.0.0.1",
+) -> None:
+    """Start Persona Continuum local Web server."""
+    from persona_continuum.web.server import run_web_server
+
+    continuum = build()
+    typer.echo(f"Starting Persona Continuum Web UI at http://{host}:{port}")
+    try:
+        run_web_server(continuum, host=host, port=port)
+    finally:
+        continuum.close()
+
+
+@agents_app.command("scan")
+def agents_scan(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Scan and list detected local agent hosts and capabilities."""
+    import asyncio
+
+    continuum = build()
+    try:
+        probes = asyncio.run(continuum.agent_discovery.scan(force_refresh=True))
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    [p.model_dump(mode="json") for p in probes], ensure_ascii=False, indent=2
+                )
+            )
+        else:
+            for p in probes:
+                status_icon = (
+                    "✓"
+                    if p.status.value == "ready"
+                    else ("⚠" if p.status.value in {"auth_required", "detected"} else "✗")
+                )
+                typer.echo(f"{status_icon} [{p.status.value.upper()}] {p.name} ({p.id})")
+                if p.binary_path:
+                    typer.echo(f"   Binary: {p.binary_path}")
+                if p.version:
+                    typer.echo(f"   Version: {p.version}")
+                if p.models:
+                    model_names = ", ".join(m.id for m in p.models[:4])
+                    typer.echo(f"   Models ({len(p.models)}): {model_names}")
+                if p.status_detail:
+                    typer.echo(f"   Detail: {p.status_detail}")
+    finally:
+        continuum.close()
+
+
+@agents_app.command("list")
+def agents_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List registered agent adapters."""
+    import asyncio
+
+    continuum = build()
+    try:
+        probes = asyncio.run(continuum.agent_discovery.scan(force_refresh=False))
+        if json_output:
+            typer.echo(json.dumps([p.model_dump(mode="json") for p in probes], ensure_ascii=False))
+        else:
+            for p in probes:
+                typer.echo(f"{p.id}\t{p.status.value}\t{p.name}")
+    finally:
+        continuum.close()
+
+
+@agents_app.command("inspect")
+def agents_inspect(
+    agent_id: str, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    """Inspect detailed capabilities and model list of an agent."""
+    import asyncio
+
+    continuum = build()
+    try:
+        probe = asyncio.run(continuum.agent_discovery.probe_adapter(agent_id))
+        if not probe:
+            typer.echo(f"Agent '{agent_id}' not found.", err=True)
+            raise typer.Exit(code=1)
+        if json_output:
+            typer.echo(json.dumps(probe.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        else:
+            typer.echo(f"Agent: {probe.name} ({probe.id})")
+            typer.echo(f"Status: {probe.status.value}")
+            typer.echo(f"Binary: {probe.binary_path or 'none'}")
+            typer.echo(f"Protocols: {', '.join(probe.protocols)}")
+            typer.echo("Models:")
+            for m in probe.models:
+                efforts = ", ".join(m.supported_reasoning_efforts)
+                typer.echo(f"  - {m.id} ({m.display_name}) [Efforts: {efforts}]")
+    finally:
+        continuum.close()
+
+
+@room_app.command("list")
+def room_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List multi-agent persona rooms."""
+    continuum = build()
+    try:
+        rooms = continuum.orchestrator.list_rooms()
+        if json_output:
+            typer.echo(json.dumps([r.model_dump(mode="json") for r in rooms], ensure_ascii=False))
+        else:
+            for r in rooms:
+                p_str = ", ".join(p.persona_id for p in r.participants)
+                title_str = r.title or ""
+                typer.echo(
+                    f"{r.id}\t{r.status.value}\tTurns: {r.turn_index}\t[{p_str}]\t{title_str}"
+                )
+    finally:
+        continuum.close()
+
+
+@room_app.command("inspect")
+def room_inspect(
+    room_id: str, json_output: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    """Inspect room details, participant bindings, and transcripts."""
+    continuum = build()
+    try:
+        room = continuum.orchestrator.get_room(room_id)
+        if not room:
+            typer.echo(f"Room '{room_id}' not found.", err=True)
+            raise typer.Exit(code=1)
+        if json_output:
+            typer.echo(json.dumps(room.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        else:
+            typer.echo(f"Room ID: {room.id}")
+            typer.echo(f"Title: {room.title}")
+            typer.echo(f"Status: {room.status.value}")
+            typer.echo(f"Topic: {room.topic or 'None'}")
+            typer.echo("Participant Bindings:")
+            for _p_id, snap in room.binding_snapshots.items():
+                typer.echo(
+                    f"  - {snap.display_name} ({snap.persona_id}) -> "
+                    f"{snap.agent_runtime_name} | {snap.model_id} (effort: {snap.reasoning_effort})"
+                )
+            typer.echo(f"Transcripts ({len(room.transcript)} turns):")
+            for t in room.transcript:
+                typer.echo(f"  [{t.get('speaker_name')}]: {t.get('content', '')[:80]}...")
+    finally:
+        continuum.close()
+
+
+@app.command()
+def web(
+    host: Annotated[str, typer.Option("--host", help="Host IP to bind web server")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port number")] = 8000,
+    log_level: Annotated[str, typer.Option("--log-level", help="Log level")] = "info",
+) -> None:
+    """Start the Persona Continuum Web UI."""
+    from persona_continuum.web.server import run_web_server
+
+    continuum = build()
+    try:
+        typer.echo(f"Starting Persona Continuum Web UI on http://{host}:{port}")
+        run_web_server(continuum, host=host, port=port, log_level=log_level)
+    finally:
+        continuum.close()
 
 
 @app.command()

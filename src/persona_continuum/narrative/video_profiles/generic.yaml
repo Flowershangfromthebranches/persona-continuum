@@ -1,0 +1,46 @@
+# Model-agnostic baseline used when no vendor-specific profile fits.
+id: generic
+display_name: Generic Video Model
+vendor: generic
+profile_version: "1"
+verification_status: verified
+verified_at: "2026-09-01"
+supported_modes:
+  - text_to_video
+  - image_to_video
+  - first_frame
+  - first_last_frame
+  - reference_conditioned
+supported_durations_seconds: null
+duration_min_seconds: 4
+duration_max_seconds: 10
+supported_aspect_ratios:
+  - "16:9"
+  - "9:16"
+  - "1:1"
+supports_text_to_video: true
+supports_image_to_video: true
+supports_negative_prompt: true
+negative_prompt_strategy: separate_field
+# Conservative default: no official evidence of @named-reference syntax.
+reference_prompt_syntax: textual_anchor
+prompt_language_preferences:
+  - en
+  - zh
+prompt_strategy:
+  text_to_video:
+    include_subject_visuals: true
+    include_environment_visuals: true
+    include_camera: true
+    include_subject_motion: true
+    include_environment_motion: true
+  image_to_video:
+    include_subject_visuals: false
+    include_environment_visuals: false
+    focus_on_motion: true
+    include_camera: true
+clip_planning:
+  prefer_single_continuous_action: true
+  allow_multi_shot_sequence: false
+  max_major_actions: 2
+  prefer_duration_seconds: 8

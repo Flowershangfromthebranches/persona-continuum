@@ -472,15 +472,11 @@ class ContinuationService:
 
         return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
 
-    def _get_parent_branch(
-        self, continuation_id: str, parent_branch_id: str
-    ) -> ContinuationBranch:
+    def _get_parent_branch(self, continuation_id: str, parent_branch_id: str) -> ContinuationBranch:
         try:
             parent = self.get_branch(parent_branch_id)
         except KeyError as exc:
-            raise CodedError(
-                "continuation_parent_branch_not_found", parent_branch_id
-            ) from exc
+            raise CodedError("continuation_parent_branch_not_found", parent_branch_id) from exc
         if parent.continuation_id != continuation_id:
             raise CodedError("continuation_parent_branch_mismatch", parent_branch_id)
         return parent

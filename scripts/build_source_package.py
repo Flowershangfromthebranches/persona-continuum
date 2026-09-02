@@ -12,13 +12,19 @@ EXCLUDED_NAMES = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".cache",
+    ".hypothesis",
+    ".nox",
+    ".tox",
+    ".coverage",
     "__pycache__",
     "__MACOSX",
+    "node_modules",
     "dist",
     "build",
 }
 
-EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".sqlite", ".db"}
+EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".sqlite", ".sqlite3", ".db", ".wal", ".shm"}
 
 EXCLUDED_PATH_PREFIXES = {
     ("docs", "superpowers"),

@@ -11,7 +11,7 @@ from persona_continuum.config import Config
 @pytest.fixture()
 def app(tmp_path) -> Iterator[PersonaContinuum]:
     config = Config(data_dir=tmp_path / "pc-data")
-    continuum = PersonaContinuum(config)
+    continuum = PersonaContinuum(config, include_fake_agent=True)
     continuum.init()
     yield continuum
     continuum.close()

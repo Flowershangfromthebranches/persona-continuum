@@ -10,7 +10,7 @@ def safe_slug(value: str) -> str:
     allowed = []
     previous_dash = False
     for char in value.lower():
-        if char.isalnum():
+        if char.isalnum() or char == "_":
             allowed.append(char)
             previous_dash = False
         elif not previous_dash:

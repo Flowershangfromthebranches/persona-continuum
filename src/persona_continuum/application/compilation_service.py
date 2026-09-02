@@ -6,15 +6,29 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from persona_continuum.application._utils import dumps, loads, new_id
 from persona_continuum.application.memory_service import MemoryService
 from persona_continuum.application.persona_service import PersonaService
+from persona_continuum.compiler.contract import (
+    COMPILE_CONTRACT,
+    CompileCoverage,
+    build_coverage,
+    normalize_artifact,
+)
 from persona_continuum.compiler.schemas import ResearchArtifact
+from persona_continuum.compiler.scope_guard import apply_scope_guard
 from persona_continuum.domain.evidence import EvidenceClaim
 from persona_continuum.domain.memory import MemoryType
-from persona_continuum.domain.persona import PersonaRecord
+from persona_continuum.domain.persona import PersonaRecord, PersonaType
+from persona_continuum.domain.provenance import (
+    CHARACTER_VISIBLE,
+    MATERIAL_SCOPES,
+    normalise_fictional_provenance,
+    normalise_material_scope,
+)
+from persona_continuum.numeric import safe_int, safe_probability
 from persona_continuum.security.validation import CodedError
 from persona_continuum.storage.database import Database
 
@@ -28,6 +42,19 @@ REQUIRED_DIMENSIONS = [
     "affect_relationship_defense",
     "values_desires_contradictions",
 ]
+
+
+def _probability_or_default(value: Any, default: float = 0.5) -> float:
+    """Normalize an optional probability without treating a valid 0 as missing."""
+
+    normalized = safe_probability(value, default=default)
+    return float(normalized if normalized is not None else default)
+
+
+def _render_markdown_evidence(value: Any) -> str:
+    """Render scalar or structured evidence without assuming string entries."""
+    entries = value if isinstance(value, list) else [value]
+    return "\n".join(item if isinstance(item, str) else dumps(item) for item in entries)
 
 REQUIRED_COMPONENTS_BY_DIMENSION = {
     "identity_and_timeline": [
@@ -51,10 +78,17 @@ REQUIRED_COMPONENTS_BY_DIMENSION = {
 }
 
 ALLOWED_CLAIM_TYPES = {
+    # Real / historical people.
     "historical_self_report",
     "historical_third_party_report",
     "historical_inference",
+    # Fictional people: author canon and lived canon, never history.
+    "fictional_author_defined",
+    "fictional_canon",
+    # Simulated divergence.
     "counterfactual_simulated",
+    "narrative_simulated",
+    # Operational.
     "user_correction",
 }
 
@@ -70,12 +104,29 @@ class CompilationTask(BaseModel):
 
 class EvaluationResult(BaseModel):
     persona_id: str
-    score: float
+    score: float = 0.0
     evidence: list[str]
     failure_reason: str | None = None
-    confidence: float
+    confidence: float = 0.5
     recommended_fix: str | None = None
     dimensions: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_numbers(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        for field, default in (("score", 0.0), ("confidence", 0.5)):
+            if field in data:
+                data[field] = _probability_or_default(data[field], default)
+        if isinstance(data.get("dimensions"), dict):
+            data["dimensions"] = {
+                str(key): _probability_or_default(item, 0.0)
+                for key, item in data["dimensions"].items()
+                if safe_probability(item, default=None) is not None
+            }
+        return data
 
 
 class CompiledPersona(BaseModel):
@@ -151,11 +202,15 @@ class CompilationService:
         task = self.get_task(task_id)
         validated = self._validate_artifact(task, artifact)
         artifact_data = validated.model_dump(mode="json")
-        canonical_sha256 = self._canonical_artifact_sha256(artifact_data)
+        submitted_canonical_sha256 = self._canonical_artifact_sha256(artifact_data)
         if self._looks_like_sha256(validated.artifact_hash) and (
-            validated.artifact_hash != canonical_sha256
+            validated.artifact_hash != submitted_canonical_sha256
         ):
             raise CodedError("artifact_hash_mismatch", validated.artifact_hash)
+        persona = self.personas.get(task.persona_id)
+        if persona.manifest.persona_type is PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON:
+            normalise_fictional_provenance(artifact_data)
+        canonical_sha256 = self._canonical_artifact_sha256(artifact_data)
         artifact_data["artifact_canonical_sha256"] = canonical_sha256
         duplicate_hash = next(
             (
@@ -219,6 +274,38 @@ class CompilationService:
         self._save_task(task)
         return task
 
+    def retain_latest_dimension_artifacts(self, task_id: str) -> int:
+        """Drop superseded artifact versions so compilation matches the audit.
+
+        compile_persona merges every attached artifact.  When a retry reuse or
+        audit repair has produced a newer version for a dimension, the older
+        rejected version must not leak its claims back into the compiled
+        persona; the quality gate always judges latest-per-dimension.
+        """
+        task = self.get_task(task_id)
+        latest: dict[str, dict[str, Any]] = {}
+        for artifact in task.artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            dimension = str(artifact.get("dimension") or "")
+            if dimension:
+                latest[dimension] = artifact
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for artifact in task.artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            dimension = str(artifact.get("dimension") or "")
+            if not dimension or dimension in seen:
+                continue
+            seen.add(dimension)
+            deduped.append(latest[dimension])
+        removed = len(task.artifacts) - len(deduped)
+        if removed > 0:
+            task.artifacts = deduped
+            self._save_task(task)
+        return removed
+
     def compile_persona(self, persona_id: str, task_id: str) -> CompiledPersona:
         task = self.get_task(task_id)
         if task.persona_id != persona_id:
@@ -262,20 +349,38 @@ class CompilationService:
             for memory_data in artifact.get("memories", []):
                 existing_memory = self._find_existing_memory(persona_id, dict(memory_data))
                 if existing_memory is None:
+                    importance = safe_probability(memory_data.get("importance"), default=0.5)
+                    source_confidence = safe_probability(
+                        memory_data.get("source_confidence"), default=0.5
+                    )
                     memory = self.memories.add_memory(
                         persona_id,
                         content=str(memory_data["content"]),
-                        memory_type=MemoryType(str(memory_data.get("type", "semantic"))),
-                        importance=float(memory_data.get("importance", 0.5)),
+                        memory_type=MemoryType.from_raw(memory_data.get("type", "semantic")),
+                        importance=importance if importance is not None else 0.5,
                         source_kind=str(memory_data.get("source_kind", "historical_inference")),
                         source_id=memory_data.get("source_id"),
-                        source_confidence=float(memory_data.get("source_confidence", 0.5)),
+                        source_confidence=(
+                            source_confidence if source_confidence is not None else 0.5
+                        ),
                         participants=list(memory_data.get("participants", [])),
                         metadata={
                             "artifact_id": artifact["artifact_id"],
                             "dimension": dimension,
                             "compile_version": version,
                             "compile_task_id": task.id,
+                            # Scope travels with the memory so retrieval can
+                            # refuse author-only / evaluation-only content
+                            # without inspecting its text.
+                            "material_scope": self._compiled_material_scope(
+                                persona_id,
+                                (
+                                    (memory_data.get("metadata") or {}).get("material_scope")
+                                    if isinstance(memory_data.get("metadata"), dict)
+                                    else memory_data.get("material_scope")
+                                ),
+                                memory_data.get("source_id"),
+                            ),
                         },
                     )
                     self._insert_lineage(
@@ -297,7 +402,8 @@ class CompilationService:
                         )
             if expression := artifact.get("expression"):
                 self._write_json(persona_id, "expression/style.json", expression)
-        self._write_compiled_components(persona_id, task.artifacts, version)
+        merged, coverage = self.merge_components(task.artifacts)
+        self._write_compiled_components(persona_id, task.artifacts, version, merged, coverage)
         persona = self.personas.get(persona_id)
         persona.manifest.source_count = self.personas.source_count(persona_id)
         persona.manifest.confidence = self._confidence(persona_id)
@@ -308,6 +414,8 @@ class CompilationService:
         present = {str(artifact.get("dimension")) for artifact in task.artifacts}
         missing = [dimension for dimension in REQUIRED_DIMENSIONS if dimension not in present]
         component_gaps = self._component_gaps(task.artifacts)
+        task.plan["compile_coverage"] = coverage.as_dict()
+        self._write_json(persona_id, "evaluation/compile_coverage.json", coverage.as_dict())
         task.plan["missing_dimensions"] = missing
         task.plan["component_gaps"] = component_gaps
         task.plan["compiled_version"] = version
@@ -531,12 +639,12 @@ class CompilationService:
             claim_type=str(row["claim_type"]),
             raw_location=row["raw_location"],
             event_time=row["event_time"],
-            reliability=float(row["reliability"]),
+            reliability=_probability_or_default(row["reliability"]),
             is_self_report=bool(row["is_self_report"]),
             is_third_party_report=bool(row["is_third_party_report"]),
             has_counter_evidence=bool(row["has_counter_evidence"]),
-            inference_strength=float(row["inference_strength"]),
-            confidence=float(row["confidence"]),
+            inference_strength=_probability_or_default(row["inference_strength"]),
+            confidence=_probability_or_default(row["confidence"]),
             created_by=str(row["created_by"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             metadata=dict(loads(row["metadata_json"])),
@@ -602,26 +710,46 @@ class CompilationService:
             """,
             (persona_id,),
         ).fetchone()
-        return int(row["version"]) + 1
+        return (safe_int(row["version"], default=0, minimum=0) or 0) + 1
 
     def _bump_version(self, version: str) -> str:
         parts = version.split(".")
         if len(parts) >= 3 and parts[-1].isdigit():
-            parts[-1] = str(int(parts[-1]) + 1)
+            parts[-1] = str((safe_int(parts[-1], default=0, minimum=0) or 0) + 1)
             return ".".join(parts)
         return f"{version}.1"
 
     def _write_compiled_components(
-        self, persona_id: str, artifacts: list[dict[str, Any]], version: int
+        self,
+        persona_id: str,
+        artifacts: list[dict[str, Any]],
+        version: int,
+        merged: dict[str, Any] | None = None,
+        coverage: CompileCoverage | None = None,
     ) -> None:
-        merged = self._merge_components(artifacts)
+        if merged is None:
+            merged = self._merge_components(artifacts)
+
+        # Defence-in-depth: character-knowledge slots may only contain entries
+        # the character-visible material actually attests.  Scope on the source
+        # is the primary boundary; this catches lists a research agent mixed.
+        corpus = self._character_visible_corpus(persona_id)
+        guard = apply_scope_guard(merged, corpus)
+        merged = guard.kept
+        if guard.removed and coverage is not None:
+            coverage.unused_artifact_fields.extend(
+                f"scope_guard_removed:{entry}" for entry in guard.removed
+            )
+            self._write_json(persona_id, "evaluation/compile_coverage.json", coverage.as_dict())
         file_map = {
             "identity/profile.json": {
                 "identity_profile": merged["identity_profile"],
                 "schema_version": "1.1",
             },
             "identity/timeline.jsonl": merged["timeline_events"],
-            "identity/self_narrative.md": "\n".join(merged["self_narrative_evidence"]),
+            "identity/self_narrative.md": _render_markdown_evidence(
+                merged["self_narrative_evidence"]
+            ),
             "cognition/mental_models.json": merged["mental_models"],
             "cognition/decision_heuristics.json": merged["decision_heuristics"],
             "cognition/values.json": merged["values"],
@@ -678,56 +806,73 @@ class CompilationService:
                     relation="compiled_from",
                 )
 
-    def _merge_components(self, artifacts: list[dict[str, Any]]) -> dict[str, Any]:
-        defaults: dict[str, Any] = {
-            "identity_profile": {},
-            "timeline_events": [],
-            "self_narrative_evidence": [],
-            "mental_models": [],
-            "decision_heuristics": [],
-            "values": [],
-            "contradictions": [],
-            "failure_patterns": [],
-            "temperament": {},
-            "emotional_triggers": [],
-            "attachment_patterns": {},
-            "needs_and_desires": [],
-            "defenses": [],
-            "expression_style": {},
-            "vocabulary": [],
-            "dialogue_examples": [],
-            "anti_patterns": [],
-            "relationships": [],
+    def merge_components(
+        self, artifacts: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], CompileCoverage]:
+        """Bridge research output into the compiled schema.
+
+        Every artifact field is accounted for: mapped through
+        :data:`persona_continuum.compiler.contract.KEY_MAP` or recorded in
+        ``unused_artifact_fields``.  The old implementation discarded unknown
+        keys with a bare ``continue``, which is how a fully researched persona
+        compiled to 3/18 components without a single error.
+        """
+        merged: dict[str, Any] = {
+            key: ({} if spec.shape == "dict" else [])
+            for key, spec in COMPILE_CONTRACT.items()
         }
+        records = []
         for artifact in artifacts:
-            components = dict(artifact.get("extracted_components", {}))
-            for key, value in components.items():
-                if key not in defaults:
-                    continue
-                if isinstance(defaults[key], list):
-                    defaults[key] = self._dedupe_list([*defaults[key], *self._as_list(value)])
-                elif isinstance(defaults[key], dict):
-                    if isinstance(value, dict):
-                        defaults[key] = {**defaults[key], **value}
-                    else:
-                        defaults[key] = {"value": value}
-        return defaults
+            dimension = str(artifact.get("dimension", "unspecified"))
+            record = normalize_artifact(
+                dimension, dict(artifact.get("extracted_components") or {})
+            )
+            records.append(record)
+            for target, entries in record.mapped.items():
+                spec = COMPILE_CONTRACT[target]
+                if spec.shape == "dict":
+                    for label, value in entries:
+                        if isinstance(value, dict):
+                            merged[target] = {**merged[target], **value}
+                        else:
+                            merged[target][label] = value
+                else:
+                    merged[target] = self._dedupe_list([*merged[target], *entries])
+        return merged, build_coverage(records, merged)
+
+    def _merge_components(self, artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Backwards-compatible view: merged components only."""
+        return self.merge_components(artifacts)[0]
+
+    def _character_visible_corpus(self, persona_id: str) -> str:
+        """Text of this persona's character-visible sources.
+
+        Falls back to every source for personas whose material has not been
+        partitioned yet, so pre-existing personas compile exactly as before.
+        """
+        rows = self.database.conn.execute(
+            "SELECT path, content, metadata_json FROM sources WHERE persona_id = ?",
+            (persona_id,),
+        ).fetchall()
+        scoped = [
+            row
+            for row in rows
+            if str(loads(row["metadata_json"] or "{}")).find("character_visible") >= 0
+            and loads(row["metadata_json"] or "{}").get("material_scope") == "character_visible"
+        ]
+        chosen = scoped or list(rows)
+        return "\n".join(str(row["content"] or "") for row in chosen)
 
     def _component_gaps(self, artifacts: list[dict[str, Any]]) -> dict[str, list[str]]:
         gaps: dict[str, list[str]] = {}
-        by_dimension: dict[str, dict[str, Any]] = {}
+        present_dimensions: set[str] = set()
         for artifact in artifacts:
-            dimension = str(artifact.get("dimension"))
-            components = by_dimension.setdefault(dimension, {})
-            components.update(dict(artifact.get("extracted_components", {})))
+            present_dimensions.add(str(artifact.get("dimension")))
+        components, _ = self.merge_components(artifacts)
         for dimension, required_keys in REQUIRED_COMPONENTS_BY_DIMENSION.items():
-            if dimension not in by_dimension:
+            if dimension not in present_dimensions:
                 continue
-            missing = [
-                key
-                for key in required_keys
-                if self._is_gap_value(by_dimension[dimension].get(key))
-            ]
+            missing = [key for key in required_keys if self._is_gap_value(components.get(key))]
             if missing:
                 gaps[dimension] = missing
         return gaps
@@ -818,7 +963,8 @@ class CompilationService:
         for row in claim_rows:
             metadata = dict(loads(row["metadata_json"]))
             compile_version = metadata.get("compile_version")
-            if isinstance(compile_version, int | float) and int(compile_version) > version:
+            normalized_version = safe_int(compile_version, default=None, minimum=0)
+            if normalized_version is not None and normalized_version > version:
                 self.database.conn.execute(
                     "DELETE FROM claims WHERE persona_id = ? AND id = ?",
                     (persona_id, row["id"]),
@@ -829,7 +975,8 @@ class CompilationService:
         for row in memory_rows:
             metadata = dict(loads(row["metadata_json"]))
             compile_version = metadata.get("compile_version")
-            if isinstance(compile_version, int | float) and int(compile_version) > version:
+            normalized_version = safe_int(compile_version, default=None, minimum=0)
+            if normalized_version is not None and normalized_version > version:
                 self.database.conn.execute(
                     "DELETE FROM memories_fts WHERE persona_id = ? AND memory_id = ?",
                     (persona_id, row["id"]),
@@ -855,16 +1002,62 @@ class CompilationService:
             dimension=dimension,
             source_id=claim_data.get("source_id"),
             claim_type=claim_type,
-            reliability=float(claim_data.get("reliability", claim_data.get("confidence", 0.5))),
+            reliability=_probability_or_default(
+                claim_data.get("reliability", claim_data.get("confidence"))
+            ),
             is_self_report=claim_type == "historical_self_report",
             is_third_party_report=claim_type == "historical_third_party_report",
             has_counter_evidence=bool(claim_data.get("has_counter_evidence", False)),
-            inference_strength=float(claim_data.get("inference_strength", 0.5)),
-            confidence=float(claim_data.get("confidence", 0.5)),
+            inference_strength=_probability_or_default(claim_data.get("inference_strength")),
+            confidence=_probability_or_default(claim_data.get("confidence")),
             raw_location=claim_data.get("raw_location"),
             event_time=claim_data.get("event_time"),
-            metadata=dict(claim_data.get("metadata", {})),
+            metadata={
+                **dict(claim_data.get("metadata", {})),
+                # Scope travels with the claim so retrieval can exclude
+                # author-only and evaluation-only material without matching
+                # against its wording.
+                "material_scope": self._compiled_material_scope(
+                    persona_id,
+                    dict(claim_data.get("metadata", {})).get("material_scope")
+                    or claim_data.get("material_scope"),
+                    claim_data.get("source_id"),
+                ),
+            },
         )
+
+    def _source_material_scope(self, source_id: Any) -> str | None:
+        if not source_id:
+            return None
+        row = self.database.conn.execute(
+            "SELECT metadata_json FROM sources WHERE id = ?", (str(source_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        metadata = loads(row["metadata_json"] or "{}")
+        return str(metadata.get("material_scope")) if metadata.get("material_scope") else None
+
+    def _compiled_material_scope(
+        self, persona_id: str, explicit_scope: Any, source_id: Any
+    ) -> str:
+        """Resolve scope while preserving pre-partitioning package behavior.
+
+        New partitioned personas fail closed when an artifact omits scope. A
+        legacy persona whose sources have no scope labels keeps the historical
+        behavior: submitted research becomes character-visible.
+        """
+        scope = explicit_scope or self._source_material_scope(source_id)
+        if scope:
+            return normalise_material_scope(scope)
+        rows = self.database.conn.execute(
+            "SELECT metadata_json FROM sources WHERE persona_id = ?", (persona_id,)
+        ).fetchall()
+        has_partitioned_source = any(
+            str(loads(row["metadata_json"] or "{}").get("material_scope") or "")
+            in MATERIAL_SCOPES
+            for row in rows
+        )
+        return normalise_material_scope(None) if has_partitioned_source else CHARACTER_VISIBLE
 
     def _insert_claim(self, claim: EvidenceClaim) -> None:
         self.database.conn.execute(
@@ -921,7 +1114,12 @@ class CompilationService:
             """,
             (persona_id,),
         ).fetchall()
-        return {str(row["dimension"]): float(row["confidence"]) for row in rows}
+        return {
+            str(row["dimension"]): (
+                safe_probability(row["confidence"], default=0.0) or 0.0
+            )
+            for row in rows
+        }
 
     def _count(self, table: str, persona_id: str) -> int:
         if table not in {"claims", "memories", "sources"}:
@@ -929,14 +1127,14 @@ class CompilationService:
         row = self.database.conn.execute(
             f"SELECT COUNT(*) AS count FROM {table} WHERE persona_id = ?", (persona_id,)
         ).fetchone()
-        return int(row["count"])
+        return safe_int(row["count"], default=0, minimum=0) or 0
 
     def _count_components(self, persona_id: str) -> int:
         row = self.database.conn.execute(
             "SELECT COUNT(*) AS count FROM compiled_components WHERE persona_id = ?",
             (persona_id,),
         ).fetchone()
-        return int(row["count"])
+        return safe_int(row["count"], default=0, minimum=0) or 0
 
     def _write_json(self, persona_id: str, relative_path: str, value: Any) -> None:
         path = Path(self.personas.get(persona_id).package_path) / relative_path

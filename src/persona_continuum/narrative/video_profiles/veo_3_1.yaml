@@ -1,0 +1,56 @@
+# Google Veo 3.1 — verified against official Vertex AI documentation.
+id: veo_3_1
+display_name: Google Veo 3.1
+vendor: google
+model_family: veo
+model_version: veo-3.1-generate-001
+profile_version: "1"
+verification_status: verified
+verified_at: "2026-09-01"
+official_sources:
+  - https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/veo/3-1-generate
+  - https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/veo-video-generation
+supported_modes:
+  - text_to_video
+  - image_to_video
+  - first_last_frame
+supported_durations_seconds: [4.0, 6.0, 8.0]
+supported_aspect_ratios:
+  - "16:9"
+  - "9:16"
+supports_audio: true
+supports_sfx: true
+supports_text_to_video: true
+supports_image_to_video: true
+supports_first_frame: true
+supports_last_frame: true
+supports_first_last_frame: true
+# referenceImages is marked Preview on GA; treat as unknown.
+max_reference_images: 3
+supports_negative_prompt: true
+negative_prompt_strategy: api_parameter
+# Conservative default: no official evidence of @named-reference syntax.
+reference_prompt_syntax: textual_anchor
+prompt_language_preferences:
+  - en
+prompt_strategy:
+  text_to_video:
+    include_subject_visuals: true
+    include_environment_visuals: true
+    include_camera: true
+    include_subject_motion: true
+    include_environment_motion: true
+    structured: subject/action/scene/camera/ambiance
+  image_to_video:
+    include_subject_visuals: false
+    include_environment_visuals: false
+    focus_on_motion: true
+    include_camera: true
+clip_planning:
+  prefer_single_continuous_action: true
+  allow_multi_shot_sequence: false
+  max_major_actions: 2
+  prefer_duration_seconds: 8
+continuity_strategy:
+  previous_clip_end_frame: true
+  reference_images: prefer_for_characters

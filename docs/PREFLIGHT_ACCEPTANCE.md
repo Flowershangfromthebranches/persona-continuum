@@ -1,22 +1,76 @@
 # Preflight Acceptance Report
 
-Date: 2026-06-26
+Date: 2026-08-23
 
-Scope: Persona Continuum V1.1-RC5 branch runtime isolation, reflection branch
-binding, atomic commit rollback, multi-session reflection lineage, database
-upgrade, and release source-package acceptance.
+Scope: Persona Continuum Tavern Runtime final official-protocol fix for Codex
+app-server V2 model discovery, Grok ACP authentication/readiness, Generic ACP
+authentication conformance, and reasoning capability honesty. Previously passed
+Room, Persona, Recall Gate, Director, Random Resolver, Web UI, Tool Calling, and
+Transaction Integrity behavior remains covered by the full suite.
 
 ## Current Counts
 
 - MCP tools: 57 (`scripts/preflight_acceptance.py`)
-- Tests: 91 pytest tests
-- New RC5 regression tests: 10 in
-  `tests/integration/test_v11_rc5_branch_runtime_atomicity.py`
+- Tests: 167 pytest tests
+- New official-protocol regression tests: 20 in
+  `tests/unit/test_final_official_protocol_fix.py`
 
-## New Failing Tests Added First
+## Official Protocol Red Baseline
 
-The RC5 regression file was added before implementation and initially failed
-against RC4 behavior. The observed red state included:
+The new regression file was run before implementation. The old adapter code
+produced 14 failures and 4 passes. The failures reproduced:
+
+- Codex object-shaped `supportedReasoningEfforts` rejection, unknown effort
+  loss, missing pagination, and silent fallback after schema errors
+- non-standard ACP initialize fields and secrets in `authenticate.params.token`
+- Grok probe treating any advertised auth method as immediately auth-required
+- incorrect Grok 4.5/4.6 fallback reasoning capabilities
+- fabricated Generic ACP, Cursor, Manifest, and JSON-RPC reasoning metadata
+- JSON-RPC version success being reported as READY without a protocol smoke
+
+## Official Protocol Gates
+
+`uv run python scripts/preflight_acceptance.py` executes exact test nodes for
+each gate. Current result:
+
+| Gate | Result | Evidence |
+|---|---|---|
+| `codex_model_list_official_schema` | PASS | 5 tests |
+| `grok_official_acp_auth` | PASS | 1 strict-shape test |
+| `grok_probe_authenticated_ready` | PASS | 3 tests |
+| `generic_acp_auth_conformance` | PASS | 3 tests |
+| `generic_reasoning_honesty` | PASS | 2 tests |
+| `cursor_reasoning_honesty` | PASS | 2 tests |
+| `manifest_reasoning_honesty` | PASS | 1 test |
+
+Preflight output: `overall_status = COMPLETED`.
+
+## Protocol Behavior
+
+- Codex `model/list` consumes V2 `data` plus `nextCursor` until null. Object
+  reasoning options are converted from `reasoningEffort`, unknown strings are
+  preserved, and `defaultReasoningEffort` is retained verbatim.
+- Codex model schema/protocol failures are exposed as
+  `model_discovery_error`; the UI-facing fallback is `Agent Default` with
+  `source=manual`, never a fake dynamic discovery result.
+- ACP initialize advertises only `protocolVersion` and implemented
+  `clientCapabilities`.
+- Grok chooses `xai.api_key` only when `XAI_API_KEY` is available, otherwise
+  `cached_token` when advertised. Authenticate sends only `methodId` and
+  `_meta.headless`; no secret is serialized into ACP JSON-RPC.
+- Generic ACP handles agent/default, API-key-via-environment, cached, and
+  terminal auth types. Unsupported terminal login returns
+  `INTERACTIVE_AUTH_REQUIRED` without calling `authenticate`.
+- ACP READY requires initialize, any required authentication, and a successful
+  `session/new`; probe never calls `session/prompt`.
+- Grok 4.6 supports exactly `low, medium, high, xhigh`; Grok 4.5 supports
+  exactly `low, medium, high`; both default to `high`.
+- Unknown ACP/Cursor/Manifest/JSON-RPC models have no invented reasoning
+  efforts. A bare `--effort` flag does not imply allowed values.
+
+## Preserved RC5 Coverage
+
+The existing RC5 suite continues to cover:
 
 - branch B reading branch A anger from global `affect_states`
 - `persona_prepare_reflection` and `persona_commit_reflection` missing
@@ -91,35 +145,35 @@ Formal source package command:
 python scripts/build_source_package.py --output persona-continuum-v1.1-source.zip
 ```
 
-Result: 107 members, bad_count 0.
+Result: 169 members, bad_count 0; content privacy scan found no local user path
+or credential-shaped fixture value.
 
 ## Verification Commands
 
 ```bash
-.venv/bin/pytest -q --tb=short
-.venv/bin/ruff check .
-.venv/bin/mypy
-env PERSONA_CONTINUUM_HOME=/tmp/persona-continuum-doctor .venv/bin/persona-continuum doctor --json
-.venv/bin/python scripts/preflight_acceptance.py
+uv run pytest
+uv run ruff check .
+uv run mypy
+uv run python scripts/preflight_acceptance.py
 python scripts/build_source_package.py --output persona-continuum-v1.1-source.zip
 ```
 
 Current results:
 
-- `pytest`: 91 passed, 1 expected duplicate-ZIP-member warning in checksum
-  tampering coverage
+- `pytest`: 167 passed; 2 non-failing warnings (Starlette TestClient
+  deprecation and the expected duplicate-ZIP-member checksum tampering case)
 - `ruff`: all checks passed
-- `mypy`: success, 78 source files
-- `doctor`: ok with SQLite FTS5, writable temporary data directory, and Skill
-  present
-- `preflight`: ok, tool_count 57, branch runtime isolation ok, atomic commit
-  rollback ok
-- source ZIP scan: 107 members, bad_count 0
+- `mypy`: success, 114 source files
+- `doctor`: ok through preflight with SQLite FTS5, writable temporary data
+  directory, and Skill present
+- `preflight`: `overall_status=COMPLETED`, tool_count 57, all seven official
+  protocol gates PASS, branch runtime isolation ok, atomic commit rollback ok
+- source ZIP scan: 169 members, bad_count 0, privacy scan clean
 
 ## Remaining Limits
 
-- No LLM API, embedding API, cloud database, Docker, GUI, voice, or avatar is
-  included.
+- No LLM API, embedding API, cloud database, or Docker dependency was added;
+  this protocol fix adds no new GUI, voice, or avatar feature.
 - `persona_run_reflection` remains an extractive fallback; semantic reflection
   must use branch-bound `persona_prepare_reflection` and
   `persona_commit_reflection`.

@@ -31,6 +31,40 @@ DIMENSIONS = [
     "values_desires_contradictions",
 ]
 
+OFFICIAL_PROTOCOL_GATES: dict[str, list[str]] = {
+    "codex_model_list_official_schema": [
+        "tests/unit/test_final_official_protocol_fix.py::test_codex_model_list_reasoning_option_objects",
+        "tests/unit/test_final_official_protocol_fix.py::test_codex_model_list_reasoning_object_schema",
+        "tests/unit/test_final_official_protocol_fix.py::test_codex_model_list_preserves_unknown_effort",
+        "tests/unit/test_final_official_protocol_fix.py::test_codex_model_list_pagination",
+        "tests/unit/test_final_official_protocol_fix.py::test_codex_model_schema_error_not_silent_dynamic_fallback",
+    ],
+    "grok_official_acp_auth": [
+        "tests/unit/test_final_official_protocol_fix.py::test_grok_official_auth_params_exact_shape",
+    ],
+    "grok_probe_authenticated_ready": [
+        "tests/unit/test_final_official_protocol_fix.py::test_grok_api_key_env_can_probe_ready",
+        "tests/unit/test_final_official_protocol_fix.py::test_grok_cached_login_can_probe_ready",
+        "tests/unit/test_final_official_protocol_fix.py::test_grok_auth_methods_not_automatically_auth_required",
+    ],
+    "generic_acp_auth_conformance": [
+        "tests/unit/test_final_official_protocol_fix.py::test_generic_acp_authenticate_has_no_token",
+        "tests/unit/test_final_official_protocol_fix.py::test_generic_acp_terminal_auth_not_sent_to_authenticate",
+        "tests/unit/test_final_official_protocol_fix.py::test_generic_acp_ready_requires_session_new",
+    ],
+    "generic_reasoning_honesty": [
+        "tests/unit/test_final_official_protocol_fix.py::test_generic_acp_does_not_fabricate_reasoning",
+        "tests/unit/test_final_official_protocol_fix.py::test_jsonrpc_version_only_is_not_ready",
+    ],
+    "cursor_reasoning_honesty": [
+        "tests/unit/test_final_official_protocol_fix.py::test_cursor_effort_flag_without_enum_does_not_fabricate_values",
+        "tests/unit/test_final_official_protocol_fix.py::test_cursor_effort_flag_without_allowed_values_has_empty_reasoning_capability",
+    ],
+    "manifest_reasoning_honesty": [
+        "tests/unit/test_final_official_protocol_fix.py::test_manifest_string_model_has_no_fabricated_reasoning",
+    ],
+}
+
 
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
@@ -240,9 +274,7 @@ def run_service_flow(project_root: Path, data_dir: Path) -> dict[str, str]:
     assert_true(comparison["branch_count"] == 2, "continuation did not persist two branches")
     app.continuations.select_main_branch(continuation.id, branch_a.id)
     app.continuations.compile_persona(continuation.id)
-    branch_session = app.sessions.start_session(
-        persona.id, "Branch A check", branch_id=branch_a.id
-    )
+    branch_session = app.sessions.start_session(persona.id, "Branch A check", branch_id=branch_a.id)
     branch_a_context = app.sessions.prepare_turn(
         persona.id,
         branch_session.id,
@@ -250,7 +282,8 @@ def run_service_flow(project_root: Path, data_dir: Path) -> dict[str, str]:
         branch_id=branch_a.id,
     )
     assert_true(
-        "transparent correction note" not in json.dumps(
+        "transparent correction note"
+        not in json.dumps(
             [memory.content for memory in branch_a_context.relevant_memories],
             ensure_ascii=False,
         ),
@@ -419,6 +452,39 @@ async def run_mcp_flow(project_root: Path, data_dir: Path) -> dict[str, Any]:
         return {"tool_count": len(names), "persona_id": persona_id}
 
 
+def run_official_protocol_gates(project_root: Path) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for gate, node_ids in OFFICIAL_PROTOCOL_GATES.items():
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *node_ids],
+            cwd=project_root,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        output_lines = (completed.stdout or completed.stderr).strip().splitlines()
+        results[gate] = {
+            "status": "PASS" if completed.returncode == 0 else "FAIL",
+            "tests": node_ids,
+            "result": output_lines[-1] if output_lines else "pytest produced no output",
+        }
+    return results
+
+
+def build_preflight_result(project_root: Path, data_dir: Path) -> dict[str, Any]:
+    protocol_gates = run_official_protocol_gates(project_root)
+    completed = all(gate["status"] == "PASS" for gate in protocol_gates.values())
+    return {
+        "overall_status": "COMPLETED" if completed else "FAILED",
+        "data_dir": str(data_dir),
+        "service": run_service_flow(project_root, data_dir),
+        "cli_doctor": run_cli(project_root, data_dir, "doctor", "--json"),
+        "cli_list": run_cli(project_root, data_dir, "persona", "list"),
+        "mcp": asyncio.run(run_mcp_flow(project_root, data_dir)),
+        "official_protocol": protocol_gates,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path)
@@ -429,23 +495,11 @@ def main() -> None:
     if args.data_dir:
         data_dir = args.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
-        result = {
-            "data_dir": str(data_dir),
-            "service": run_service_flow(project_root, data_dir),
-            "cli_doctor": run_cli(project_root, data_dir, "doctor", "--json"),
-            "cli_list": run_cli(project_root, data_dir, "persona", "list"),
-            "mcp": asyncio.run(run_mcp_flow(project_root, data_dir)),
-        }
+        result = build_preflight_result(project_root, data_dir)
     else:
         with tempfile.TemporaryDirectory(prefix="persona-continuum-preflight-") as tmp:
             data_dir = Path(tmp)
-            result = {
-                "data_dir": str(data_dir),
-                "service": run_service_flow(project_root, data_dir),
-                "cli_doctor": run_cli(project_root, data_dir, "doctor", "--json"),
-                "cli_list": run_cli(project_root, data_dir, "persona", "list"),
-                "mcp": asyncio.run(run_mcp_flow(project_root, data_dir)),
-            }
+            result = build_preflight_result(project_root, data_dir)
             if args.keep_data:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return
