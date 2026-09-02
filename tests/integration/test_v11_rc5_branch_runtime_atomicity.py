@@ -223,9 +223,7 @@ def test_reflection_memory_and_deltas_are_written_to_current_branch(
     assert {str(row["branch_id"]) for row in memory_rows} == {branch_a.id}
     assert app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust
     assert app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_b.id).trust == 0
-    assert app.memories.search_memories(
-        persona.id, "RC5_BRANCH_WRITE", branch_id=branch_b.id
-    ) == []
+    assert app.memories.search_memories(persona.id, "RC5_BRANCH_WRITE", branch_id=branch_b.id) == []
 
 
 def test_invalid_commit_turn_rolls_back_all_writes(app: PersonaContinuum) -> None:
@@ -259,9 +257,7 @@ def test_invalid_commit_turn_rolls_back_all_writes(app: PersonaContinuum) -> Non
         for table in ["session_turns", "memories", "change_events"]
     }
     assert after == before
-    relationship = app.relationships.get_relationship(
-        persona.id, "Alice", branch_id=branch_a.id
-    )
+    relationship = app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id)
     assert relationship.familiarity == 0
 
 
@@ -345,8 +341,7 @@ def test_deleting_one_support_session_keeps_multisession_reflection_until_last_s
         branch_id=branch_a.id,
     )
     assert (
-        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust
-        == 0.8
+        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust == 0.8
     )
 
     app.sessions.delete_session(persona.id, turn_one["session"].id, delete_derived_memories=True)
@@ -359,8 +354,7 @@ def test_deleting_one_support_session_keeps_multisession_reflection_until_last_s
     ).fetchall()
     assert len(remaining) == len(result["memory_ids"])
     assert (
-        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust
-        == 0.8
+        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust == 0.8
     )
     for row in remaining:
         metadata = json.loads(row["metadata_json"])
@@ -491,8 +485,7 @@ def test_migration_adds_branch_columns_and_moves_legacy_rows_to_main(tmp_path: P
     try:
         for table in ["affect_states", "needs", "relationships", "change_events"]:
             columns = {
-                row["name"]
-                for row in migrated.database.conn.execute(f"PRAGMA table_info({table})")
+                row["name"] for row in migrated.database.conn.execute(f"PRAGMA table_info({table})")
             }
             assert "branch_id" in columns
             rows = migrated.database.conn.execute(f"SELECT branch_id FROM {table}").fetchall()

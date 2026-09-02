@@ -11,7 +11,7 @@ import zipfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -29,8 +29,18 @@ from persona_continuum.security.validation import (
 )
 from persona_continuum.storage.database import Database
 
+if TYPE_CHECKING:
+    from persona_continuum.application.profile_library_service import ProfileLibraryService
+
 DATA_TABLES = [
     "sources",
+    "persona_material_jobs",
+    "persona_evidence_units",
+    "persona_evidence_clusters",
+    "persona_fused_evidence",
+    "persona_contradictions",
+    "persona_conversation_episodes",
+    "persona_identity_aliases",
     "claims",
     "memories",
     "affect_states",
@@ -46,6 +56,9 @@ DATA_TABLES = [
     "research_artifacts",
     "compiled_components",
     "compile_snapshots",
+    "actor_profiles",
+    "profile_versions",
+    "profile_enrichment_jobs",
     "change_events",
     "change_event_supports",
     "evaluation_suites",
@@ -55,6 +68,13 @@ DATA_TABLES = [
 
 DATA_FILES = {
     "sources": "data/sources.jsonl",
+    "persona_material_jobs": "data/persona_material_jobs.jsonl",
+    "persona_evidence_units": "data/persona_evidence_units.jsonl",
+    "persona_evidence_clusters": "data/persona_evidence_clusters.jsonl",
+    "persona_fused_evidence": "data/persona_fused_evidence.jsonl",
+    "persona_contradictions": "data/persona_contradictions.jsonl",
+    "persona_conversation_episodes": "data/persona_conversation_episodes.jsonl",
+    "persona_identity_aliases": "data/persona_identity_aliases.jsonl",
     "claims": "data/claims.jsonl",
     "memories": "data/memories.jsonl",
     "affect_states": "data/affect_states.jsonl",
@@ -70,6 +90,9 @@ DATA_FILES = {
     "research_artifacts": "data/research_artifacts.jsonl",
     "compiled_components": "data/compiled_components.jsonl",
     "compile_snapshots": "data/compile_snapshots.jsonl",
+    "actor_profiles": "data/actor_profiles.jsonl",
+    "profile_versions": "data/profile_versions.jsonl",
+    "profile_enrichment_jobs": "data/profile_enrichment_jobs.jsonl",
     "change_events": "data/change_events.jsonl",
     "change_event_supports": "data/change_event_supports.jsonl",
     "evaluation_suites": "data/evaluation_suites.jsonl",
@@ -85,6 +108,8 @@ class PersonaService:
         self.config = config
         self.database = database
         self.loader = SourceLoader(config.max_source_bytes)
+        # Wired by the container after construction (optional dependency).
+        self.profile_library: ProfileLibraryService | None = None
 
     def create(
         self,
@@ -123,6 +148,56 @@ class PersonaService:
         self.database.conn.commit()
         return self.get(persona_id)
 
+    def create_from_manifest(
+        self, manifest_data: dict[str, Any] | PersonaManifest
+    ) -> PersonaRecord:
+        if isinstance(manifest_data, dict):
+            p_id = manifest_data.get("id")
+            name = str(manifest_data.get("display_name") or p_id or "Persona")
+            aliases = list(manifest_data.get("aliases", []))
+            p_type_val = manifest_data.get("persona_type", "public_historical_person")
+            r_mode_val = manifest_data.get("run_mode", "counterfactual_continuation")
+
+            type_map = {
+                "historical": PersonaType.PUBLIC_HISTORICAL_PERSON,
+                "public_historical_person": PersonaType.PUBLIC_HISTORICAL_PERSON,
+                "living": PersonaType.PUBLIC_LIVING_PERSON,
+                "public_living_person": PersonaType.PUBLIC_LIVING_PERSON,
+                "private_living": PersonaType.PRIVATE_LIVING_PERSON,
+                "private_living_person": PersonaType.PRIVATE_LIVING_PERSON,
+                "private_deceased": PersonaType.PRIVATE_DECEASED_PERSON,
+                "private_deceased_person": PersonaType.PRIVATE_DECEASED_PERSON,
+                "fictional": PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON,
+                "fictional_or_synthetic_person": PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON,
+            }
+            mode_map = {
+                "continuation": RunMode.COUNTERFACTUAL_CONTINUATION,
+                "counterfactual_continuation": RunMode.COUNTERFACTUAL_CONTINUATION,
+                "snapshot": RunMode.HISTORICAL_SNAPSHOT,
+                "historical_snapshot": RunMode.HISTORICAL_SNAPSHOT,
+                "digital": RunMode.DIGITAL_CONTINUATION,
+                "digital_continuation": RunMode.DIGITAL_CONTINUATION,
+            }
+
+            p_type = type_map.get(str(p_type_val).lower(), PersonaType.PUBLIC_HISTORICAL_PERSON)
+            r_mode = mode_map.get(str(r_mode_val).lower(), RunMode.COUNTERFACTUAL_CONTINUATION)
+
+            return self.create(
+                display_name=name,
+                aliases=aliases,
+                persona_type=p_type,
+                run_mode=r_mode,
+                persona_id=p_id,
+            )
+        else:
+            return self.create(
+                display_name=manifest_data.display_name,
+                aliases=manifest_data.aliases,
+                persona_type=manifest_data.persona_type,
+                run_mode=manifest_data.run_mode,
+                persona_id=manifest_data.id,
+            )
+
     def list(self, include_archived: bool = False) -> list[PersonaRecord]:
         if include_archived:
             rows = self.database.conn.execute(
@@ -152,6 +227,66 @@ class PersonaService:
         self._write_package_skeleton(manifest)
         return self.get(manifest.id)
 
+    PERSONA_NAME_MAX_LENGTH = 120
+
+    @staticmethod
+    def normalize_persona_name(value: str) -> str:
+        name = " ".join(str(value or "").split())
+        if not name:
+            raise ConflictError("persona_name_required")
+        if len(name) > PersonaService.PERSONA_NAME_MAX_LENGTH:
+            raise ConflictError("persona_name_too_long")
+        if any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise ConflictError("persona_name_invalid_characters")
+        return name
+
+    def rename(
+        self,
+        persona_id: str,
+        display_name: str,
+        *,
+        aliases: builtins.list[str] | None = None,
+    ) -> PersonaRecord:
+        """Rename a Persona's display name without touching its identity.
+
+        The stable ``persona_id`` — and therefore every room binding, world
+        binding, memory relation, research artifact, and revision chain — is
+        untouched.  This is a lightweight metadata revision: no research,
+        artifact, or compilation work is invalidated.
+        """
+        name = self.normalize_persona_name(display_name)
+        persona = self.get(persona_id)
+        if persona.manifest.display_name == name and aliases is None:
+            self.database.conn.execute(
+                "UPDATE persona_creation_jobs SET display_name = ?, updated_at = ? "
+                "WHERE persona_id = ? AND display_name != ?",
+                (name, datetime.now(UTC).isoformat(), persona_id, name),
+            )
+            self.database.conn.commit()
+            if self.profile_library is not None:
+                self.profile_library.sync_persona(persona)
+            return persona
+        persona.manifest.display_name = name
+        if aliases is not None:
+            persona.manifest.aliases = [
+                str(alias).strip() for alias in aliases if str(alias).strip()
+            ]
+        record = self.update_manifest(persona.manifest)
+        self.database.conn.execute(
+            "UPDATE persona_creation_jobs SET display_name = ?, updated_at = ? "
+            "WHERE persona_id = ?",
+            (name, datetime.now(UTC).isoformat(), persona_id),
+        )
+        self.database.conn.commit()
+        if self.profile_library is not None:
+            self.profile_library.sync_persona(record)
+        # The static persona kernel caches identity text per manifest revision;
+        # drop it so room/world prompts render the new name immediately.
+        from persona_continuum.room.static_kernel import default_static_kernel_cache
+
+        default_static_kernel_cache().invalidate_persona(persona_id)
+        return record
+
     def activate(self, persona_id: str) -> PersonaRecord:
         persona = self.get(persona_id)
         persona.manifest.active = True
@@ -165,7 +300,35 @@ class PersonaService:
         return self.update_manifest(persona.manifest)
 
     def delete(self, persona_id: str) -> bool:
-        persona = self.get(persona_id)
+        try:
+            persona = self.get(persona_id)
+        except NotFoundError:
+            # Older Persona deletions left the unified actor profile behind
+            # because actor_profiles.persona_id uses ON DELETE SET NULL.  The
+            # library then rendered a Persona card whose id no longer existed
+            # in the authoritative personas table.  Accept that exact orphan
+            # shape here so users can remove legacy ghost cards as well.
+            orphan = self.database.conn.execute(
+                "SELECT id FROM actor_profiles "
+                "WHERE id = ? AND profile_type = 'persona' AND persona_id IS NULL",
+                (persona_id,),
+            ).fetchone()
+            if orphan is None:
+                raise
+            try:
+                self.database.conn.execute("BEGIN")
+                self.database.conn.execute(
+                    "DELETE FROM actor_profiles WHERE id = ?", (persona_id,)
+                )
+                self.database.conn.commit()
+            except Exception:
+                self.database.conn.rollback()
+                raise
+            orphan_package = ensure_child_path(
+                self.config.personas_dir, self.config.personas_dir / persona_id
+            )
+            shutil.rmtree(orphan_package, ignore_errors=True)
+            return True
         package_path = ensure_child_path(self.config.personas_dir, Path(persona.package_path))
         try:
             self.database.conn.execute("BEGIN")
@@ -234,51 +397,111 @@ class PersonaService:
         hash: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> EvidenceSource:
-        self.get(persona_id)
-        computed_hash = self._hash_text(content)
-        if hash and hash != computed_hash:
-            raise CodedError("source_hash_mismatch", hash)
-        hash_value = hash or computed_hash
-        source = EvidenceSource(
-            id=new_id("src"),
-            persona_id=persona_id,
-            source_type=source_type,
-            path=canonical_url or f"text://{hash_value}",
-            title=title,
-            hash=hash_value,
-            content=content,
-            metadata={
-                **(metadata or {}),
-                "canonical_url": canonical_url,
-                "publisher": publisher,
-                "author": author,
-                "published_at": published_at,
-                "accessed_at": accessed_at,
-                "ingest_method": "text",
-            },
+        batch: list[EvidenceSource] = self.add_source_texts(
+            persona_id,
+            entries=[
+                {
+                    "title": title,
+                    "source_type": source_type,
+                    "canonical_url": canonical_url,
+                    "publisher": publisher,
+                    "author": author,
+                    "published_at": published_at,
+                    "accessed_at": accessed_at,
+                    "content": content,
+                    "hash": hash,
+                    "metadata": metadata,
+                }
+            ],
         )
+        return batch[0]
+
+    def add_source_texts(
+        self,
+        persona_id: str,
+        *,
+        entries: builtins.list[dict[str, Any]],
+    ) -> builtins.list[EvidenceSource]:
+        """Ingest many sources in ONE transaction with ONE manifest update.
+
+        Historically every single source rewrote the manifest YAML and the
+        full ``sources.jsonl`` / ``claims.jsonl`` artifacts, making a 60-source
+        research round cost 60 full-artifact rewrites.  The database stays the
+        source of truth during ingest; derived artifacts are materialized
+        once per batch.  Per-entry duplicate failures are collected so one
+        duplicate cannot discard an entire batch.
+        """
+
+        self.get(persona_id)
+        added: builtins.list[EvidenceSource] = []
+        duplicates: builtins.list[str] = []
         try:
-            self.database.conn.execute(
-                "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    source.id,
-                    source.persona_id,
-                    source.source_type,
-                    source.path,
-                    source.title,
-                    source.hash,
-                    source.content,
-                    dumps(source.metadata),
-                    source.created_at.isoformat(),
-                ),
-            )
-        except sqlite3.IntegrityError as exc:
-            raise ConflictError(f"duplicate_source:{hash_value}") from exc
-        manifest = self.get(persona_id).manifest
-        manifest.source_count = self.source_count(persona_id)
-        self.update_manifest(manifest)
-        self._write_database_evidence_files(persona_id)
-        return source
+            self.database.conn.execute("BEGIN")
+            for entry in entries:
+                content = str(entry.get("content") or "")
+                canonical_url = entry.get("canonical_url") or None
+                supplied_hash = str(entry.get("hash") or "")
+                computed_hash = self._hash_text(content)
+                hash_value = supplied_hash or computed_hash
+                if supplied_hash and supplied_hash != computed_hash:
+                    raise CodedError("source_hash_mismatch", supplied_hash)
+                if not content.strip():
+                    continue
+                source = EvidenceSource(
+                    id=new_id("src"),
+                    persona_id=persona_id,
+                    source_type=str(entry.get("source_type") or "web"),
+                    path=str(canonical_url or f"text://{hash_value}"),
+                    title=str(entry.get("title") or canonical_url or hash_value[:12]),
+                    hash=hash_value,
+                    content=content,
+                    metadata={
+                        **(entry.get("metadata") or {}),
+                        "canonical_url": canonical_url,
+                        "publisher": entry.get("publisher"),
+                        "author": entry.get("author"),
+                        "published_at": entry.get("published_at"),
+                        "accessed_at": entry.get("accessed_at"),
+                        "ingest_method": "text",
+                    },
+                )
+                try:
+                    self.database.conn.execute(
+                        "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            source.id,
+                            source.persona_id,
+                            source.source_type,
+                            source.path,
+                            source.title,
+                            source.hash,
+                            source.content,
+                            dumps(source.metadata),
+                            source.created_at.isoformat(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    duplicates.append(f"duplicate_source:{hash_value[:12]} ({exc})")
+                    continue
+                added.append(source)
+            # The transaction covers ONLY the evidence rows; manifest refresh
+            # and artifact materialization run once afterwards, never inside.
+            self.database.conn.commit()
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.database.conn.execute("ROLLBACK")
+            raise
+        if added:
+            manifest = self.get(persona_id).manifest
+            manifest.source_count = self.source_count(persona_id)
+            self.update_manifest(manifest)
+            # One artifact materialization per batch instead of per source.
+            self._write_database_evidence_files(persona_id)
+        else:
+            self.database.conn.commit()
+        if duplicates and not added:
+            raise ConflictError(duplicates[0])
+        return added
 
     def source_count(self, persona_id: str) -> int:
         row = self.database.conn.execute(
@@ -328,9 +551,7 @@ class PersonaService:
             for object_type, object_id in descendants
             if object_type == "compiled_component"
         }
-        claim_ids = {
-            object_id for object_type, object_id in descendants if object_type == "claim"
-        }
+        claim_ids = {object_id for object_type, object_id in descendants if object_type == "claim"}
         memory_ids = {
             object_id for object_type, object_id in descendants if object_type == "memory"
         }
@@ -476,6 +697,19 @@ class PersonaService:
         self.database.conn.execute(
             "DELETE FROM sources WHERE persona_id = ? AND id = ?", (persona_id, source_id)
         )
+        # Evidence-layer rows are derived from the raw source corpus.  Remove
+        # only derived indexes on source deletion; the source lineage and all
+        # remaining raw material stay intact and can be re-indexed later.
+        for table in (
+            "persona_evidence_clusters",
+            "persona_fused_evidence",
+            "persona_contradictions",
+            "persona_conversation_episodes",
+        ):
+            with contextlib.suppress(Exception):
+                self.database.conn.execute(
+                    f"DELETE FROM {table} WHERE persona_id = ?", (persona_id,)
+                )
         affected_objects = {
             ("source", source_id),
             *descendants,
@@ -559,9 +793,7 @@ class PersonaService:
                 package_root.mkdir(parents=True)
                 self._extract_package_files(archive, package_root)
                 self._write_package_skeleton(manifest)
-                self._rewrite_package_file_ids(
-                    package_root, original_id, manifest.id, id_maps
-                )
+                self._rewrite_package_file_ids(package_root, original_id, manifest.id, id_maps)
                 now = datetime.now(UTC).isoformat()
                 self.database.conn.execute(
                     "INSERT INTO personas VALUES (?, ?, ?, ?, ?, ?)",
@@ -752,14 +984,40 @@ class PersonaService:
                 tuple(sorted(persona_ids)),
             ).fetchall()
         placeholders = ",".join("?" for _ in persona_ids)
+        if table == "actor_profiles":
+            return self.database.conn.execute(
+                f"SELECT * FROM actor_profiles WHERE persona_id IN ({placeholders}) "
+                "ORDER BY rowid",
+                tuple(sorted(persona_ids)),
+            ).fetchall()
+        if table == "profile_versions":
+            return self.database.conn.execute(
+                f"""
+                SELECT versions.*
+                FROM profile_versions versions
+                JOIN actor_profiles profiles ON profiles.id = versions.profile_id
+                WHERE profiles.persona_id IN ({placeholders})
+                ORDER BY versions.rowid
+                """,
+                tuple(sorted(persona_ids)),
+            ).fetchall()
+        if table == "profile_enrichment_jobs":
+            return self.database.conn.execute(
+                f"""
+                SELECT jobs.*
+                FROM profile_enrichment_jobs jobs
+                JOIN actor_profiles profiles ON profiles.id = jobs.target_profile_id
+                WHERE profiles.persona_id IN ({placeholders})
+                ORDER BY jobs.rowid
+                """,
+                tuple(sorted(persona_ids)),
+            ).fetchall()
         return self.database.conn.execute(
             f"SELECT * FROM {table} WHERE persona_id IN ({placeholders}) ORDER BY rowid",
             tuple(sorted(persona_ids)),
         ).fetchall()
 
-    def _export_persona_ids(
-        self, persona_id: str, room_export_mode: str, mode: str
-    ) -> set[str]:
+    def _export_persona_ids(self, persona_id: str, room_export_mode: str, mode: str) -> set[str]:
         if mode != "full" or room_export_mode != "bundle":
             return {persona_id}
         persona_ids = {persona_id}
@@ -838,7 +1096,23 @@ class PersonaService:
             )
 
     def _delete_persona_rows(self, persona_id: str) -> None:
+        # The unified Persona profile is part of the Persona aggregate. Delete
+        # it explicitly before the personas row; relying on ON DELETE SET NULL
+        # creates a visible, non-deletable ghost profile. Profile versions and
+        # enrichment jobs cascade from actor_profiles.
+        self.database.conn.execute(
+            "DELETE FROM actor_profiles "
+            "WHERE persona_id = ? OR (id = ? AND profile_type = 'persona')",
+            (persona_id, persona_id),
+        )
         for sql in [
+            "DELETE FROM persona_identity_aliases WHERE persona_id = ?",
+            "DELETE FROM persona_conversation_episodes WHERE persona_id = ?",
+            "DELETE FROM persona_contradictions WHERE persona_id = ?",
+            "DELETE FROM persona_fused_evidence WHERE persona_id = ?",
+            "DELETE FROM persona_evidence_clusters WHERE persona_id = ?",
+            "DELETE FROM persona_evidence_units WHERE persona_id = ?",
+            "DELETE FROM persona_material_jobs WHERE persona_id = ?",
             "DELETE FROM memories_fts WHERE persona_id = ?",
             "DELETE FROM affect_states WHERE persona_id = ?",
             "DELETE FROM needs WHERE persona_id = ?",
@@ -1028,6 +1302,9 @@ class PersonaService:
                 if not old_id:
                     continue
                 old = str(old_id)
+                if table == "actor_profiles" and old in maps["personas"]:
+                    maps[table][old] = maps["personas"][old]
+                    continue
                 prefix = old.split("_", 1)[0] if "_" in old else table[:4]
                 maps[table][old] = old if not self._id_exists(table, old) else new_id(prefix)
         return maps
@@ -1057,9 +1334,7 @@ class PersonaService:
                 )
                 self._insert_row(table, remapped)
 
-    def _read_bundle_persona_rows(
-        self, archive: zipfile.ZipFile
-    ) -> builtins.list[dict[str, Any]]:
+    def _read_bundle_persona_rows(self, archive: zipfile.ZipFile) -> builtins.list[dict[str, Any]]:
         if BUNDLE_PERSONAS_FILE not in archive.namelist():
             return []
         rows = []
@@ -1140,6 +1415,11 @@ class PersonaService:
             )
         if "id" in remapped and table in id_maps:
             remapped["id"] = id_maps[table].get(str(remapped["id"]), remapped["id"])
+        if table == "actor_profiles" and remapped.get("id") != row.get("id"):
+            # Persona profile slugs are unique library identifiers. A portable
+            # package imported under a new Persona ID must not replace the
+            # original profile through the old slug's UNIQUE constraint.
+            remapped["slug"] = safe_slug(str(remapped["id"]))
         for key, mapped_table in {
             "event_id": "change_events",
             "source_id": "sources",
@@ -1151,6 +1431,8 @@ class PersonaService:
             "supersedes_id": "memories",
             "suite_id": "evaluation_suites",
             "case_id": "evaluation_cases",
+            "profile_id": "actor_profiles",
+            "target_profile_id": "actor_profiles",
         }.items():
             if remapped.get(key) is not None:
                 remapped[key] = id_maps.get(mapped_table, {}).get(str(remapped[key]), remapped[key])
@@ -1174,6 +1456,14 @@ class PersonaService:
             "source_artifact_ids_json",
             "files_manifest_json",
             "data_json",
+            "aliases_json",
+            "runtime_snapshot_json",
+            "coverage_json",
+            "payload_json",
+            "source_ids_json",
+            "selected_runtime_json",
+            "research_policy_json",
+            "progress_json",
         ]:
             if json_key in remapped and remapped[json_key] is not None:
                 with contextlib.suppress(json.JSONDecodeError):
@@ -1192,6 +1482,11 @@ class PersonaService:
             remapped["parent_id"] = self._remap_object_id(
                 str(remapped["parent_type"]), str(remapped["parent_id"]), id_maps
             )
+        if table == "profile_enrichment_jobs":
+            # Persona creation jobs are runtime queue state and are not part of
+            # portable Persona packages. Preserve the enrichment history while
+            # dropping a dangling queue foreign key on import.
+            remapped["persona_creation_job_id"] = None
         return remapped
 
     def _remap_json(
@@ -1214,9 +1509,7 @@ class PersonaService:
                 for item in value
             ]
         if isinstance(value, str):
-            return self._remap_scalar_id(
-                value, original_persona_id, target_persona_id, id_maps
-            )
+            return self._remap_scalar_id(value, original_persona_id, target_persona_id, id_maps)
         return value
 
     def _remap_scalar_id(

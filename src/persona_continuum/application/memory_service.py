@@ -7,6 +7,7 @@ from typing import Any
 
 from persona_continuum.application._utils import dt, dumps, loads, new_id, parse_dt
 from persona_continuum.domain.memory import MemoryRecord, MemoryType
+from persona_continuum.domain.provenance import CHARACTER_VISIBLE
 from persona_continuum.storage.database import Database
 
 
@@ -16,12 +17,12 @@ class MemoryService:
 
     def add_memory(
         self,
-        persona_id: str,
+        persona_id: str | MemoryRecord,
         *,
-        content: str,
-        memory_type: MemoryType | str,
+        content: str | None = None,
+        memory_type: MemoryType | str | None = None,
         importance: float = 0.5,
-        source_kind: str,
+        source_kind: str = "direct",
         source_id: str | None = None,
         source_confidence: float = 0.5,
         participants: list[str] | None = None,
@@ -35,11 +36,24 @@ class MemoryService:
         metadata: dict[str, object] | None = None,
         commit: bool = True,
     ) -> MemoryRecord:
+        if isinstance(persona_id, MemoryRecord):
+            record = persona_id
+            self._insert(record, commit=commit)
+            return record
+
+        if content is None or memory_type is None:
+            raise ValueError("content and memory_type are required when persona_id is a string")
+
+        record_metadata = dict(metadata or {})
+        # Creating a persona memory through the application service is an
+        # explicit runtime action. Callers that ingest author/evaluation-only
+        # material must label it; ordinary runtime memories are character-visible.
+        record_metadata.setdefault("material_scope", CHARACTER_VISIBLE)
         record = MemoryRecord(
             id=new_id("mem"),
             persona_id=persona_id,
             content=content,
-            type=MemoryType(memory_type),
+            type=MemoryType.from_raw(memory_type),
             occurred_at=occurred_at,
             participants=participants or [],
             emotions=emotions or {},
@@ -52,7 +66,7 @@ class MemoryService:
             user_corrected=user_corrected,
             forgettable=forgettable,
             supersedes_id=supersedes_id,
-            metadata=metadata or {},
+            metadata=record_metadata,
         )
         self._insert(record, commit=commit)
         return record
@@ -62,6 +76,13 @@ class MemoryService:
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         return self._row_to_memory(row) if row else None
+
+    def list_memories(self, persona_id: str, limit: int = 100) -> list[MemoryRecord]:
+        rows = self.database.conn.execute(
+            "SELECT * FROM memories WHERE persona_id = ? ORDER BY written_at DESC LIMIT ?",
+            (persona_id, limit),
+        ).fetchall()
+        return [self._row_to_memory(r) for r in rows]
 
     def search_memories(
         self,
@@ -454,7 +475,7 @@ class MemoryService:
             id=str(row["id"]),
             persona_id=str(row["persona_id"]),
             content=str(row["content"]),
-            type=MemoryType(str(row["type"])),
+            type=MemoryType.from_raw(row["type"]),
             occurred_at=parse_dt(row["occurred_at"]),
             written_at=parse_dt(row["written_at"]) or datetime.now(UTC),
             participants=list(loads(row["participants_json"])),

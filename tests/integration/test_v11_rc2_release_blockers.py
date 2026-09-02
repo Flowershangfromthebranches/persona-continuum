@@ -606,4 +606,4 @@ def test_add_source_text_and_skill_schema_support_public_person_creation_flow(
         "continuation_commit_step",
     ]:
         assert required in skill_text
-    assert "\"expression\"" not in skill_text
+    assert '"expression"' not in skill_text

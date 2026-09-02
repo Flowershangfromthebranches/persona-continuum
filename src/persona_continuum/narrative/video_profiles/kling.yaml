@@ -1,0 +1,36 @@
+# Kling AI — draft status: aspects below could not be fully verified.
+id: kling
+display_name: Kling AI
+vendor: kuaishou
+model_family: kling
+model_version: kling-v3
+profile_version: "1"
+verification_status: draft
+verified_at: "2026-09-01"
+official_sources:
+  - https://klingai.com/dev
+  - https://klingai.com/document-api/apiReference/updateNotice
+supported_modes:
+  - text_to_video
+  - image_to_video
+supported_durations_seconds: null
+duration_min_seconds: 3
+duration_max_seconds: 15
+# supported_aspect_ratios: not verifiable from official sources.
+supports_audio: true
+# Official release notes show narration/dialogue examples.
+supports_dialogue: true
+supports_image_to_video: true
+supports_text_to_video: true
+supports_first_frame: true
+# Conservative default: no official evidence of @named-reference syntax.
+reference_prompt_syntax: textual_anchor
+prompt_language_preferences:
+  - zh
+  - en
+clip_planning:
+  prefer_single_continuous_action: true
+  allow_multi_shot_sequence: true
+  max_major_actions: 3
+  prefer_duration_seconds: 5
+  note: smart storyboard via shot_type=intelligence per official changelog

@@ -113,9 +113,7 @@ class CompiledPersonaContextService:
         runtime_state = self._runtime_state(persona_id, effective_branch_id)
         active_goals = self._active_goals(by_key)
         active_goals.extend(
-            self._runtime_active_goals(
-                persona_id, runtime_state, branch_id=effective_branch_id
-            )
+            self._runtime_active_goals(persona_id, runtime_state, branch_id=effective_branch_id)
         )
         active_goals = self._dedupe(active_goals)[:8]
         latest_version = max(selected_versions) if selected_versions else base_version

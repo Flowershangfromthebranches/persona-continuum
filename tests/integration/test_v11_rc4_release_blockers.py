@@ -166,6 +166,7 @@ def _commit_step(
 def test_delete_persona_removes_database_fts_rooms_and_package(app) -> None:
     persona = _create_persona(app, persona_id="rc4-delete-all")
     other = _create_persona(app, persona_id="rc4-delete-other", name="Other")
+    profile = app.profile_library.sync_persona(persona)
     package_path = Path(app.personas.get(persona.id).package_path)
     source = _source(app, persona.id, "RC4_DELETE")
     app.memories.add_memory(
@@ -225,9 +226,39 @@ def test_delete_persona_removes_database_fts_rooms_and_package(app) -> None:
         == 0
     )
     assert not package_path.exists()
+    assert (
+        app.database.conn.execute(
+            "SELECT COUNT(*) AS count FROM actor_profiles WHERE id = ? OR persona_id = ?",
+            (profile.id, persona.id),
+        ).fetchone()["count"]
+        == 0
+    )
     room_state = app.rooms.get_state(room["id"])
     assert persona.id not in room_state["persona_ids"]
     assert persona.id not in room_state.get("room_sessions", {})
+
+
+def test_delete_persona_cleans_legacy_orphan_profile(app) -> None:
+    persona = _create_persona(app, persona_id="rc4-orphan-profile", name="Legacy Ghost")
+    profile = app.profile_library.sync_persona(persona)
+    package_path = Path(persona.package_path)
+    app.database.conn.execute("DELETE FROM personas WHERE id = ?", (persona.id,))
+    app.database.conn.commit()
+    orphan = app.database.conn.execute(
+        "SELECT persona_id FROM actor_profiles WHERE id = ?", (profile.id,)
+    ).fetchone()
+    assert orphan is not None
+    assert orphan["persona_id"] is None
+
+    assert app.personas.delete(profile.id) is True
+
+    assert (
+        app.database.conn.execute(
+            "SELECT COUNT(*) AS count FROM actor_profiles WHERE id = ?", (profile.id,)
+        ).fetchone()["count"]
+        == 0
+    )
+    assert not package_path.exists()
 
 
 def test_delete_room_participant_repairs_room_and_prepare_next(app) -> None:
@@ -287,12 +318,12 @@ def test_delete_session_replays_commit_turn_auto_relationship_and_emotion(app) -
         persona.id,
         session.id,
         user_message="trust Alice",
-        persona_response="Thanks, I will verify.",
+        persona_response="Thanks, I feel hopeful and will verify.",
         counterpart_id="Alice",
     )
     assert app.relationships.get_relationship(persona.id, "Alice").familiarity > 0
     assert any(
-        state.name == "hope" and state.intensity >= 0.2
+        state.name == "hope" and state.intensity > 0
         for state in app.affect.get_emotions(persona.id)
     )
 

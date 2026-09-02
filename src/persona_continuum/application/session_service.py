@@ -11,14 +11,37 @@ from persona_continuum.application._utils import dumps, loads, new_id, parse_dt
 from persona_continuum.application.compiled_context_service import CompiledPersonaContextService
 from persona_continuum.application.memory_service import MemoryService
 from persona_continuum.application.persona_service import PersonaService
+from persona_continuum.application.state_appraisal import (
+    AppraisalLimits,
+    AppraisalRequest,
+    AppraisalResult,
+    PersonaStateAppraisalService,
+)
+from persona_continuum.config import Config
 from persona_continuum.domain.affect import EMOTION_NAMES, NEED_NAMES
 from persona_continuum.domain.memory import MemoryType
+from persona_continuum.domain.provenance import (
+    NON_CHARACTER_SCOPES,
+    PersonaRetrievalPolicy,
+    normalise_material_scope,
+)
 from persona_continuum.domain.session import PreparedTurn, SessionRecord
 from persona_continuum.runtime.affect_engine import AffectEngine
 from persona_continuum.runtime.motivation_engine import MotivationEngine
 from persona_continuum.runtime.relationship_engine import RELATIONSHIP_FIELDS, RelationshipEngine
 from persona_continuum.security.validation import CodedError
 from persona_continuum.storage.database import Database
+
+EVALUATION_CONTEXT_TAGS = frozenset(
+    {
+        "evaluation",
+        "evaluation_only",
+        "expected_answer",
+        "test_fixture",
+        "验收题",
+        "验收问题",
+    }
+)
 
 
 def _validate_numeric_map(
@@ -147,6 +170,7 @@ class SessionService:
         affect: AffectEngine,
         motivation: MotivationEngine,
         relationships: RelationshipEngine,
+        config: Config | None = None,
     ) -> None:
         self.database = database
         self.personas = personas
@@ -155,6 +179,15 @@ class SessionService:
         self.affect = affect
         self.motivation = motivation
         self.relationships = relationships
+        self.config = config or Config()
+        self.state_appraisal = PersonaStateAppraisalService(
+            mode=self.config.persona_state_appraisal_mode,
+            limits=AppraisalLimits(
+                affect=self.config.persona_state_max_affect_delta,
+                need=self.config.persona_state_max_need_delta,
+                relationship=self.config.persona_state_max_relationship_delta,
+            ),
+        )
 
     def start_session(
         self,
@@ -205,20 +238,26 @@ class SessionService:
         max_context_size: int | None = None,
         counterpart_id: str = "user",
         branch_id: str | None = None,
+        preset_memories: list[Any] | None = None,
     ) -> PreparedTurn:
         session = self._require_session(persona_id, session_id, allow_status={"active"})
         persona = self.personas.get(persona_id)
         self._require_counterpart(session, counterpart_id)
         effective_branch_id = self._effective_branch_id(persona_id, session, branch_id)
         query = self._query_from_message(user_message)
-        memories = self.memories.search_memories(
-            persona_id,
-            query,
-            limit=max_context_items,
-            branch_id=effective_branch_id,
-            include_main_history=True,
-            include_shared_pre_divergence=True,
-        )
+        if preset_memories is not None:
+            # A room turn retrieves memories exactly once (Recall Gate) and
+            # forwards that single result here instead of repeating the search.
+            memories = list(preset_memories)[:max_context_items]
+        else:
+            memories = self.memories.search_memories(
+                persona_id,
+                query,
+                limit=max_context_items,
+                branch_id=effective_branch_id,
+                include_main_history=True,
+                include_shared_pre_divergence=True,
+            )
         if max_context_size is not None:
             memories = self._fit_memories(memories, max_context_size)
         compiled_context = self.compiled_context.prepare_context(
@@ -231,6 +270,11 @@ class SessionService:
         session.metadata["branch_id"] = effective_branch_id
         session.metadata.setdefault("counterpart_id", counterpart_id)
         session.metadata["persona_runtime_version"] = compiled_context.get("runtime_version", {})
+        if external_events:
+            # Stage for the commit appraisal: see _drain_pending_events.
+            staged = list(session.metadata.get("pending_external_events") or [])
+            staged.extend(event for event in external_events if isinstance(event, dict))
+            session.metadata["pending_external_events"] = staged
         self._save_session_metadata(session)
         self._ensure_runtime_state(persona_id, effective_branch_id)
         compiled_by_key = dict(compiled_context.get("by_key", {}))
@@ -247,15 +291,41 @@ class SessionService:
         )
         current_needs = self.motivation.get_needs(persona_id, effective_branch_id)
         appraisal = self._appraise(user_message, external_events or [])
+        persona_type = persona.manifest.persona_type
+        policy = PersonaRetrievalPolicy(
+            persona_type=persona_type, branch_id=effective_branch_id
+        )
+        visible = [
+            memory
+            for memory in memories
+            if normalise_material_scope(
+                (memory.metadata or {}).get("material_scope")
+            )
+            not in NON_CHARACTER_SCOPES
+            and policy.allows(memory.source_kind)
+        ]
+        relevant_facts = [memory.content for memory in visible]
+        relevant_facts.extend(
+            self._relevant_claim_contents(
+                persona_id,
+                query,
+                policy=policy,
+                limit=min(4, max(0, max_context_items - len(relevant_facts))),
+            )
+        )
+        relevant_facts = list(dict.fromkeys(relevant_facts))[:max_context_items]
         return PreparedTurn(
             persona_id=persona_id,
             session_id=session_id,
             identity_anchor=persona.manifest,
             current_run_mode=persona.manifest.run_mode.value,
+            relevant_persona_facts=relevant_facts,
             relevant_historical_facts=[
-                memory.content for memory in memories if memory.source_kind.startswith("historical")
+                memory.content
+                for memory in visible
+                if memory.source_kind.startswith("historical")
             ],
-            relevant_memories=memories,
+            relevant_memories=visible,
             activated_emotional_memories=emotional,
             current_emotions=current_emotions,
             current_mood={
@@ -357,42 +427,43 @@ class SessionService:
                 parent_id=turn_id,
                 relation="digital_experience_from",
             )
-            observations = self._emotion_observations(
-                user_message, persona_response, user_feedback
+            appraisal = self._appraise_commit(
+                persona_id=persona_id,
+                branch_id=branch_id,
+                counterpart_id=counterpart_id,
+                user_message=user_message,
+                persona_response=persona_response,
+                user_feedback=user_feedback,
+                goal_completed=bool(goal_completed),
+                external_events=self._drain_pending_events(session),
             )
-            self._apply_affect_delta(
-                persona_id,
-                branch_id,
-                session_id,
-                turn_id,
-                observations,
-                "commit_turn observation",
-            )
-            relationship = self.relationships.get_relationship(
-                persona_id, counterpart_id, branch_id=branch_id
-            )
-            self._apply_relationship_delta(
-                persona_id,
-                counterpart_id,
-                {
-                    "familiarity": min(
-                        1.0,
-                        relationship.familiarity + 0.05,
-                    )
-                },
-                branch_id,
-                session_id,
-                turn_id,
-                "conversation turn committed",
-            )
-            if goal_completed:
+            if appraisal.affect:
+                self._apply_affect_delta(
+                    persona_id,
+                    branch_id,
+                    session_id,
+                    turn_id,
+                    appraisal.affect,
+                    "commit_turn appraisal",
+                )
+            if appraisal.needs:
                 self._apply_need_delta(
                     persona_id,
                     branch_id,
                     session_id,
                     turn_id,
-                    {"achievement": 0.05},
-                    "goal completed",
+                    appraisal.needs,
+                    "commit_turn appraisal",
+                )
+            for entry in appraisal.relationships:
+                self._apply_relationship_delta(
+                    persona_id,
+                    str(entry["counterpart_id"]),
+                    dict(entry["changes"]),
+                    branch_id,
+                    session_id,
+                    turn_id,
+                    "commit_turn appraisal",
                 )
             if normalized_state_patch:
                 self._apply_state_patch(
@@ -408,7 +479,13 @@ class SessionService:
         except Exception:
             self.database.conn.rollback()
             raise
-        return {"turn_id": turn_id, "memory_id": memory.id}
+        return {
+            "turn_id": turn_id,
+            "memory_id": memory.id,
+            # Public delta summary for the UI (§20): what moved and by how
+            # much, never why.  No chain-of-thought is ever exposed here.
+            "state_summary": appraisal.summary,
+        }
 
     def end_session(self, session_id: str) -> bool:
         self.database.conn.execute(
@@ -635,9 +712,7 @@ class SessionService:
             ],
             "current_relationships": [
                 state.model_dump(mode="json")
-                for state in self.relationships.list_relationships(
-                    persona_id, effective_branch_id
-                )
+                for state in self.relationships.list_relationships(persona_id, effective_branch_id)
             ],
             "unresolved_events": [],
             "current_needs": [
@@ -802,9 +877,7 @@ class SessionService:
                     "invalid_reflection", f"supporting_turn_persona_mismatch:{turn_id}"
                 )
             if self._turn_branch(row) != branch_id:
-                raise CodedError(
-                    "invalid_reflection", f"supporting_turn_branch_mismatch:{turn_id}"
-                )
+                raise CodedError("invalid_reflection", f"supporting_turn_branch_mismatch:{turn_id}")
             rows.append(row)
         return rows
 
@@ -852,8 +925,7 @@ class SessionService:
             )
         if artifact.affect_deltas:
             affect_updates = {
-                key: min(1.0, float(value) + 0.01)
-                for key, value in artifact.affect_deltas.items()
+                key: min(1.0, float(value) + 0.01) for key, value in artifact.affect_deltas.items()
             }
             self.affect.update_emotions(
                 persona_id,
@@ -1319,18 +1391,168 @@ class SessionService:
         ).fetchall()
         return [str(row["content"]) for row in rows]
 
+    def _relevant_claim_contents(
+        self,
+        persona_id: str,
+        query: str,
+        *,
+        policy: PersonaRetrievalPolicy,
+        limit: int,
+    ) -> list[str]:
+        """Backfill memory recall with query-matched, runtime-visible claims."""
+
+        if limit <= 0 or not query.strip():
+            return []
+        rows = self.database.conn.execute(
+            """
+            SELECT content, claim_type, confidence, metadata_json
+            FROM claims
+            WHERE persona_id = ?
+            ORDER BY confidence DESC, created_at DESC
+            """,
+            (persona_id,),
+        ).fetchall()
+        features = self._retrieval_features(query)
+        scored: list[tuple[int, float, str]] = []
+        for row in rows:
+            metadata = dict(loads(row["metadata_json"] or "{}"))
+            if normalise_material_scope(metadata.get("material_scope")) in NON_CHARACTER_SCOPES:
+                continue
+            if not policy.allows(str(row["claim_type"])):
+                continue
+            content = str(row["content"])
+            normalized = content.lower()
+            matched = sum(feature in normalized for feature in features)
+            raw_evidence_ids = metadata.get("evidence_ids", [])
+            evidence_ids = (
+                [str(value) for value in raw_evidence_ids]
+                if isinstance(raw_evidence_ids, list)
+                else []
+            )
+            if matched and not self._has_evaluation_evidence(evidence_ids):
+                scored.append((matched, float(row["confidence"]), content))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return list(dict.fromkeys(content for _, _, content in scored))[:limit]
+
+    @staticmethod
+    def _retrieval_features(query: str) -> set[str]:
+        normalized = query.strip().lower()
+        features = {
+            token.strip(".,!?;:，。！？；：()[]{}\"'")
+            for token in normalized.replace(" OR ", " ").split()
+        }
+        compact = "".join(char for char in normalized if not char.isspace())
+        if any("\u4e00" <= char <= "\u9fff" for char in compact):
+            for size in (2, 3):
+                for index in range(max(0, len(compact) - size + 1)):
+                    features.add(compact[index : index + size])
+        return {feature for feature in features if feature}
+
+    def _has_evaluation_evidence(self, evidence_ids: list[str]) -> bool:
+        unit_ids: set[str] = set()
+        for evidence_id in evidence_ids:
+            if evidence_id.startswith("evu_"):
+                unit_ids.add(evidence_id)
+                continue
+            if not evidence_id.startswith("evf_"):
+                continue
+            row = self.database.conn.execute(
+                "SELECT supporting_evidence_ids_json FROM persona_fused_evidence WHERE id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if row is not None:
+                unit_ids.update(str(value) for value in loads(row[0] or "[]"))
+        if not unit_ids:
+            return False
+        placeholders = ",".join("?" for _ in unit_ids)
+        rows = self.database.conn.execute(
+            f"SELECT context_tags_json FROM persona_evidence_units "
+            f"WHERE id IN ({placeholders})",
+            tuple(sorted(unit_ids)),
+        ).fetchall()
+        for row in rows:
+            tags = {str(value).strip().casefold() for value in loads(row[0] or "[]")}
+            if tags & EVALUATION_CONTEXT_TAGS:
+                return True
+        return False
+
     def _emotion_observations(
         self, user_message: str, persona_response: str, user_feedback: str | None
     ) -> dict[str, float]:
-        text = f"{user_message} {persona_response} {user_feedback or ''}".lower()
-        observations: dict[str, float] = {}
-        if any(token in text for token in ["worried", "challenge", "wrong", "担心"]):
-            observations["anxiety"] = 0.35
-            observations["frustration"] = 0.25
-        if any(token in text for token in ["good", "thanks", "trust", "谢谢"]):
-            observations["hope"] = 0.35
-            observations["affection"] = 0.25
-        return observations or {"curiosity": 0.1}
+        """Affect-only view of the appraisal, for callers that predate it.
+
+        The previous implementation ended with ``observations or
+        {"curiosity": 0.1}``.  ``curiosity`` is a NEED, not an emotion, so
+        ``AffectEngine.update_emotions`` skipped it via its
+        ``if name not in EMOTION_NAMES: continue`` guard -- the fallback was a
+        silent no-op disguised as a state update.  It is gone: when nothing
+        fires, nothing is written.
+        """
+
+        result = self.state_appraisal.appraise(
+            AppraisalRequest(
+                user_message=user_message,
+                persona_response=persona_response,
+                user_feedback=user_feedback,
+            )
+        )
+        return dict(result.affect)
+
+    def _appraise_commit(
+        self,
+        *,
+        persona_id: str,
+        branch_id: str,
+        counterpart_id: str,
+        user_message: str,
+        persona_response: str,
+        user_feedback: str | None,
+        goal_completed: bool,
+        external_events: list[dict[str, Any]] | None = None,
+    ) -> AppraisalResult:
+        """Appraise one committed turn against the persona's *current* state.
+
+        Current values are passed in so the service can cap per-turn movement
+        instead of absolute position -- the difference between "trust drifted
+        up 4 points" and "trust teleported to 90%".
+        """
+
+        emotions = self.affect.get_emotions(persona_id, branch_id, commit=False)
+        needs = self.motivation.get_needs(persona_id, branch_id)
+        relationship = self.relationships.get_relationship(
+            persona_id, counterpart_id, branch_id=branch_id
+        )
+        return self.state_appraisal.appraise(
+            AppraisalRequest(
+                user_message=user_message,
+                persona_response=persona_response,
+                user_feedback=user_feedback,
+                external_events=list(external_events or []),
+                goal_completed=goal_completed,
+                counterpart_id=counterpart_id,
+                current_affect={state.name: state.intensity for state in emotions},
+                current_needs={state.name: state.level for state in needs},
+                current_relationship=relationship.model_dump(mode="python"),
+            )
+        )
+
+    def _drain_pending_events(self, session: SessionRecord) -> list[dict[str, Any]]:
+        """Consume the events staged by ``prepare_turn``.
+
+        Events declared at prepare time describe the world as it was when the
+        turn was set up, so they belong to the appraisal of the turn that
+        answers them.  Staging them on the session is what lets a caller pass
+        events through the normal prepare/commit flow and still have them
+        move state, instead of needing a hand-written ``state_patch``.
+        """
+        pending = session.metadata.pop("pending_external_events", None)
+        if not pending:
+            return []
+        if isinstance(pending, list):
+            session.metadata["pending_external_events"] = []
+            self._save_session_metadata(session)
+            return [event for event in pending if isinstance(event, dict)]
+        return []
 
     def _require_session(
         self, persona_id: str, session_id: str, allow_status: set[str]
@@ -1423,21 +1645,53 @@ class SessionService:
         return dict(delta) if isinstance(delta, dict) else {}
 
     def _validate_state_patch(self, state_patch: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"affect", "needs", "relationships", "unresolved_events"}
+        """Normalise a caller-supplied state patch into explicit semantics.
+
+        Affect used to accept a single ``affect`` key whose meaning was
+        ambiguous: the engine treats it as an absolute floor
+        (``max(current, amount)``) while the name reads like a delta.  The two
+        are now separate, explicitly named keys and ``affect`` is kept only as
+        a deprecated alias for ``affect_set``.
+        """
+        allowed = {
+            "affect_set",
+            "affect_delta",
+            "affect",  # deprecated alias for affect_set
+            "needs",
+            "relationships",
+            "unresolved_events",
+        }
         unknown = set(state_patch) - allowed
         if unknown:
             raise CodedError("invalid_state_patch", ",".join(sorted(unknown)))
+        has_explicit = "affect_set" in state_patch or "affect_delta" in state_patch
+        if "affect" in state_patch and has_explicit:
+            raise CodedError("invalid_state_patch", "affect_conflicts_with_affect_set_or_delta")
         normalized: dict[str, Any] = {}
-        if "affect" in state_patch:
-            affect = state_patch.get("affect")
-            if not isinstance(affect, dict):
-                raise CodedError("invalid_state_patch", "affect")
+        if "affect_set" in state_patch or "affect" in state_patch:
+            raw = state_patch.get("affect_set", state_patch.get("affect"))
+            if not isinstance(raw, dict):
+                raise CodedError("invalid_state_patch", "affect_set")
             try:
-                normalized["affect"] = _validate_numeric_map(
-                    affect,
+                normalized["affect_set"] = _validate_numeric_map(
+                    raw,
                     allowed_keys=set(EMOTION_NAMES),
-                    field_name="affect",
+                    field_name="affect_set",
                     minimum=0,
+                    maximum=1,
+                )
+            except ValueError as exc:
+                raise CodedError("invalid_state_patch", str(exc)) from exc
+        if "affect_delta" in state_patch:
+            raw = state_patch.get("affect_delta")
+            if not isinstance(raw, dict):
+                raise CodedError("invalid_state_patch", "affect_delta")
+            try:
+                normalized["affect_delta"] = _validate_numeric_map(
+                    raw,
+                    allowed_keys=set(EMOTION_NAMES),
+                    field_name="affect_delta",
+                    minimum=-1,
                     maximum=1,
                 )
             except ValueError as exc:
@@ -1463,14 +1717,19 @@ class SessionService:
         for delta in relationships:
             if not isinstance(delta, dict) or not str(delta.get("counterpart_id", "")):
                 raise CodedError("invalid_state_patch", "relationships")
-            changes = delta.get("changes", {})
+            # ``changes`` is the historical name for what is actually an
+            # absolute set.  ``set`` says so; ``changes`` is kept as an alias
+            # so existing callers keep working.
+            if "set" in delta and "changes" in delta:
+                raise CodedError("invalid_state_patch", "relationship_set_conflicts_with_changes")
+            changes = delta.get("set", delta.get("changes"))
             if not isinstance(changes, dict) or not changes:
                 raise CodedError("invalid_state_patch", "relationships")
             try:
                 normalized_relationships.append(
                     {
                         "counterpart_id": str(delta["counterpart_id"]),
-                        "changes": _validate_numeric_map(
+                        "set": _validate_numeric_map(
                             changes,
                             allowed_keys=RELATIONSHIP_FIELDS,
                             field_name="relationships",
@@ -1498,14 +1757,34 @@ class SessionService:
         branch_id: str,
         state_patch: dict[str, Any],
     ) -> None:
-        if affect := state_patch.get("affect"):
+        if affect_set := state_patch.get("affect_set"):
+            # Floor semantics: AffectEngine raises to the target and never
+            # lowers.  Cooling is the engine's exponential decay.
             self._apply_affect_delta(
                 persona_id,
                 branch_id,
                 session_id,
                 turn_id,
-                dict(affect),
-                "state_patch",
+                dict(affect_set),
+                "state_patch.affect_set",
+            )
+        if affect_delta := state_patch.get("affect_delta"):
+            # Additive semantics: can raise or lower within one turn.
+            self.affect.apply_deltas(
+                persona_id,
+                dict(affect_delta),
+                "state_patch.affect_delta",
+                branch_id=branch_id,
+            )
+            self._insert_change_event(
+                persona_id,
+                branch_id,
+                "affect_delta",
+                "affect",
+                "current",
+                session_id,
+                turn_id,
+                dict(affect_delta),
             )
         if needs := state_patch.get("needs"):
             self._apply_need_delta(
@@ -1516,11 +1795,11 @@ class SessionService:
                 dict(needs),
                 "state_patch",
             )
-        for delta in state_patch.get("relationships", []) or []:
+        for entry in state_patch.get("relationships", []) or []:
             self._apply_relationship_delta(
                 persona_id,
-                str(delta["counterpart_id"]),
-                dict(delta["changes"]),
+                str(entry["counterpart_id"]),
+                dict(entry["set"]),
                 branch_id,
                 session_id,
                 turn_id,

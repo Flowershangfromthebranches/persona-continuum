@@ -1,0 +1,2 @@
+{"method":"item/completed","params":{"item":{"type":"agent_message","text":"{\"summary\":\"captured\"}"}}}
+{"method":"turn/completed","params":{"status":"completed"}}

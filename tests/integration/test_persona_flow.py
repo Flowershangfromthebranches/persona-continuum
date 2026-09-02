@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from persona_continuum.domain.memory import MemoryType
 from persona_continuum.domain.persona import PersonaType, RunMode
+from persona_continuum.room.tool_broker import PersonaToolBroker
 
 
 def test_persona_compile_session_and_export_import_flow(app, tmp_path) -> None:
@@ -79,3 +84,26 @@ def test_persona_compile_session_and_export_import_flow(app, tmp_path) -> None:
     imported = app.personas.import_persona(export_path, new_id="alex-chen-imported")
     assert imported.id == "alex-chen-imported"
     assert app.personas.get(imported.id).display_name == "Alex Chen"
+
+
+@pytest.mark.anyio
+async def test_runtime_state_and_tool_broker_json_serializable(app) -> None:
+    persona = app.personas.create(
+        display_name="Test Persona",
+        aliases=["Test"],
+        persona_type=PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON,
+        run_mode=RunMode.DIGITAL_CONTINUATION,
+    )
+
+    state = app.runtime_state(persona.id)
+    # Direct json.dumps without custom default handler must succeed
+    serialized = json.dumps(state)
+    assert isinstance(serialized, str)
+    assert persona.id in serialized
+
+    broker = PersonaToolBroker(app)
+    result = await broker.execute_tool(persona.id, "persona_get_runtime_state", {})
+    # Broker tool result must also be directly JSON serializable
+    broker_json = json.dumps(result)
+    assert isinstance(broker_json, str)
+    assert result.get("status") == "success"

@@ -48,6 +48,17 @@ active rooms that would otherwise reference personas not present in the package.
 
 Compiled V1.1 personas write non-empty eight-layer files:
 
+## Creation provenance
+
+New Personas are created by `PersonaCreationOrchestrator`, but the package
+format is unchanged. A creation job may add user-provided or web
+`EvidenceSource` rows, eight schema-version `1.1` `ResearchArtifact` rows,
+claims, memories, compiled components and lineage. A job in `draft` or
+`completed_with_gaps` is deliberately not represented as a high-confidence
+compiled identity. Re-running creation for an existing Persona appends
+evidence and creates a new compilation version; it never replaces historical
+provenance or creates a silent `_2` identity.
+
 - identity profile, timeline, self narrative, and boundaries
 - cognition mental models, decision heuristics, values, contradictions, failure patterns
 - affect temperament, triggers, attachment, needs, defenses
@@ -69,3 +80,14 @@ files/runtime/branches/<branch_id>/runtime_state.json
 `affect_states`, `needs`, `relationships`, and `change_events` carry
 `branch_id`; `change_event_supports` carries all supporting session/turn pairs
 for reflection-derived change events.
+
+## Agent / Profile Library compatibility
+
+The unified library stores an `ActorProfile` envelope in SQLite and points a
+Persona profile back to `personas.id`. It does not replace `manifest.yaml`, the
+EvidenceSource/ResearchArtifact records, or the eight-dimension compiler, and
+it never accepts an unsourced system prompt as a compiled identity.
+Organization, Institution, and Collective profiles use typed library payloads;
+they are World Agent records rather than Persona packages. Enrichment writes a
+new `profile_versions` record while keeping the previous Persona provenance
+and package files intact.

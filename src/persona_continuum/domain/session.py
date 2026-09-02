@@ -26,7 +26,16 @@ class PreparedTurn(BaseModel):
     session_id: str
     identity_anchor: PersonaManifest
     current_run_mode: str
-    relevant_historical_facts: list[str]
+    #: Canonical field: facts this persona may actually read, filtered by
+    #: :class:`PersonaRetrievalPolicy` (provenance) and material scope.
+    #: Consumers should use this rather than ``relevant_historical_facts``,
+    #: which is literal about history and therefore empty for a fictional
+    #: persona -- correct behaviour, but a misleading name.
+    relevant_persona_facts: list[str] = Field(default_factory=list)
+    #: Deprecated alias kept for backwards compatibility.  Contains only
+    #: historical-provenance facts, so it is legitimately empty for fictional
+    #: personas.  New code must read ``relevant_persona_facts``.
+    relevant_historical_facts: list[str] = Field(default_factory=list)
     relevant_memories: list[MemoryRecord]
     activated_emotional_memories: list[MemoryRecord]
     current_emotions: list[AffectState]

@@ -1,0 +1,65 @@
+# Runway Gen-4.5 — verified against official Help Center and dev docs.
+id: runway_gen_4_5
+display_name: Runway Gen-4.5
+vendor: runway
+model_family: gen-4
+model_version: gen4.5
+profile_version: "1"
+verification_status: verified
+verified_at: "2026-09-01"
+official_sources:
+  - https://help.runwayml.com/ (Creating with Gen-4.5, article 46974685288467)
+  - https://docs.dev.runwayml.com/guides/models.md
+  - https://docs.dev.runwayml.com/api.md
+supported_modes:
+  - text_to_video
+  - image_to_video
+supported_durations_seconds: null
+duration_min_seconds: 2
+duration_max_seconds: 10
+supported_aspect_ratios:
+  - "16:9"
+  - "9:16"
+  - "4:3"
+  - "1:1"
+  - "3:4"
+  - "21:9"
+# API has no audio field; docs contain the phrase "when the output has audio".
+supports_image_to_video: true
+supports_text_to_video: true
+supports_first_frame: true
+supports_last_frame: false
+supports_first_last_frame: false
+supports_reference_images: false  # "coming soon" per Help Center
+supports_timestamp_prompting: true  # official guide supports [00:00-00:02] style
+supports_negative_prompt: false
+negative_prompt_strategy: positive_phrasing_only
+# Conservative default: no official evidence of @named-reference syntax.
+reference_prompt_syntax: textual_anchor
+prompt_language_preferences:
+  - en
+prompt_strategy:
+  text_to_video:
+    include_subject_visuals: true
+    include_environment_visuals: true
+    include_camera: true
+    include_subject_motion: true
+    include_environment_motion: true
+    structure: >-
+      [Camera] shot of [subject] [action] in [environment].
+      [supporting descriptions]
+  image_to_video:
+    include_subject_visuals: false
+    include_environment_visuals: false
+    focus_on_motion: true
+    include_camera: true
+clip_planning:
+  prefer_single_continuous_action: true
+  allow_multi_shot_sequence: false
+  max_major_actions: 2
+  prefer_duration_seconds: 5
+recommended_defaults:
+  max_prompt_chars: 1000
+  t2v_ratio_note: >-
+    official Help Center documents 16:9 (1280:720) for T2V;
+    API enum also lists 720:1280

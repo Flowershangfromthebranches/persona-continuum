@@ -1,0 +1,1797 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Persona Continuum</title>
+  <link rel="stylesheet" href="/static/app.css?v=2.7.3" />
+</head>
+<body>
+  <a class="skip" href="#content" data-i="skipToContent">跳到内容</a>
+  <header class="topnav" data-od-id="topnav">
+    <div class="container topnav-inner">
+      <span class="logo" data-od-id="brand">Persona Continuum</span>
+      <nav class="nav-links" data-od-id="main-nav">
+        <button type="button" class="is-active" data-nav="rooms" data-i="navRooms">房间</button>
+        <button type="button" data-nav="worlds" data-i="navWorlds">平行世界</button>
+        <button type="button" data-nav="narrative" data-i="navNarrative">叙事创作</button>
+        <button type="button" data-nav="agents" data-i="navAgents">智能体</button>
+        <button type="button" data-nav="api" data-i="navApi">API</button>
+        <button type="button" data-nav="personas" data-i="navPersonas">人物</button>
+      </nav>
+      <div class="nav-tools">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-label" data-i="localFirst">本地优先运行时</span>
+        <div class="lang-switch" role="group" aria-label="Language">
+          <button type="button" data-lang="zh-CN" class="is-active">中文</button>
+          <button type="button" data-lang="en">EN</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="content" class="app-stage">
+    <!-- 1. ROOMS VIEW (Tavern Multi-Agent Room) -->
+    <section class="view is-on" id="view-rooms" data-od-id="rooms">
+      <div id="sub-room-list">
+        <div class="chapter">
+          <div class="container">
+            <p class="eyebrow" data-i="roomsEyebrow">Multi-Agent Room · Local-first</p>
+            <div class="row-between panel-head" style="align-items:flex-end;">
+              <div>
+                <h1 data-i="roomsTitle">多人讨论，本地编排</h1>
+                <p class="lead" style="margin-top:12px;" data-i="roomsLead">把已编译人物与本地 Agent 宿主解耦绑定，由 Director 推进每一回合。</p>
+              </div>
+              <button class="btn btn-primary" id="btn-new-room" data-od-id="cta-new-room" data-i="newRoom">新建房间</button>
+            </div>
+          </div>
+        </div>
+        <div class="workspace">
+          <div class="container">
+            <div class="row-between panel-head">
+              <div class="seg" id="room-filter" role="tablist">
+                <button type="button" class="is-active" data-filter="all" data-i="filterAll">全部</button>
+                <button type="button" data-filter="active" data-i="filterActive">进行中</button>
+                <button type="button" data-filter="paused" data-i="filterPaused">已暂停</button>
+                <button type="button" data-filter="stopped" data-i="filterStopped">已结束</button>
+              </div>
+              <span class="meta" id="room-count">0</span>
+            </div>
+            <div class="room-grid" id="rooms-grid">
+              <div class="empty" style="grid-column:1/-1">
+                <h3 data-i="emptyRooms">还没有房间</h3>
+                <p data-i="emptyRoomsHint">创建一个房间，开始多人讨论。</p>
+                <button class="btn btn-primary" id="empty-new-room" type="button" data-i="newRoom">新建房间</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-room-lobby" hidden>
+        <div class="workspace">
+          <div class="container">
+            <div class="row-between panel-head">
+              <div>
+                <button class="btn btn-back" id="btn-back-rooms">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                  <span data-i="backRooms">返回房间列表</span>
+                </button>
+                <h2 data-i="lobbyTitle">房间配置</h2>
+                <p class="lead" data-i="lobbyLead">人物身份与运行时、模型、思考强度分开绑定，启动时冻结快照。</p>
+              </div>
+              <div class="row" style="flex-wrap:wrap;">
+                <button class="btn btn-ghost" id="btn-randomize" data-i="randomize">随机绑定</button>
+                <button class="btn btn-ghost" id="btn-preview" data-i="preview">解析预览</button>
+                <button class="btn btn-primary" id="btn-start" data-od-id="cta-start-room" data-i="startRoom">启动房间</button>
+              </div>
+            </div>
+            <div class="lobby-grid">
+              <div>
+                <div class="card" style="margin-bottom:20px;">
+                  <div class="row-between" style="align-items:center;margin-bottom:4px;">
+                    <h3 data-i="roomSettings">房间设置</h3>
+                    <div class="seg seg-sm" id="lobby-mode-toggle" role="tablist">
+                      <button type="button" class="is-active" data-lobby-mode="simple">简单模式</button>
+                      <button type="button" data-lobby-mode="advanced">高级模式</button>
+                    </div>
+                  </div>
+                  <div class="stack" style="margin-top:16px;">
+                    <div class="field">
+                      <label for="lobby-title" data-i="labelTitle">标题</label>
+                      <input class="input" id="lobby-title" maxlength="80" />
+                      <span class="error" id="title-error" hidden></span>
+                    </div>
+                    <div class="field">
+                      <label for="lobby-template">房间模板</label>
+                      <select class="input" id="lobby-template"><option value="">不使用模板</option></select>
+                      <p class="meta" id="template-hint" style="margin-top:4px;">模板会自动配置协作流程与角色，只需为每个角色槽位选择人物。</p>
+                    </div>
+                    <div class="field">
+                      <label for="lobby-protocol">房间协作模式 / Room Protocol</label>
+                      <select class="input" id="lobby-protocol">
+                        <option value="free_discussion">自由讨论</option>
+                        <option value="host_moderated">主持人模式</option>
+                        <option value="expert_consultation">专家会诊</option>
+                        <option value="debate">辩论</option>
+                        <option value="committee">委员会</option>
+                        <option value="custom">自定义</option>
+                      </select>
+                      <p class="meta" id="protocol-help"></p>
+                    </div>
+                    <div class="field" data-fd-only>
+                      <label for="lobby-mode">讨论方式</label>
+                      <select class="input" id="lobby-mode">
+                        <option value="autonomous">自动讨论（Host + Director）</option>
+                        <option value="manual">手动推进</option>
+                      </select>
+                    </div>
+                    <div class="field" data-fd-only>
+                      <label for="lobby-speaker-selection">发言选择</label>
+                      <select class="input" id="lobby-speaker-selection">
+                        <option value="intelligent">智能</option>
+                        <option value="round_robin">轮询</option>
+                        <option value="manual">手动</option>
+                      </select>
+                    </div>
+                    <div class="field" data-fd-only data-advanced>
+                      <label for="lobby-director" data-i="labelDirector">Director 模式</label>
+                      <select class="input" id="lobby-director"></select>
+                    </div>
+                    <div class="field" data-advanced>
+                      <label for="lobby-topic" data-i="labelTopic">议题</label>
+                      <textarea class="textarea" id="lobby-topic" rows="2"></textarea>
+                    </div>
+                    <div class="field">
+                      <label for="room-shared-background">共享设定</label>
+                      <textarea class="textarea" id="room-shared-background" rows="3" placeholder="本次讨论的背景、约束或场景设定（可选）"></textarea>
+                    </div>
+                    <div data-advanced>
+                      <details class="protocol-config">
+                        <summary>共享场景高级字段</summary>
+                        <div class="stack" style="margin-top:12px;">
+                          <div class="field"><label for="lobby-description">房间说明</label><textarea class="textarea" id="lobby-description" rows="2"></textarea></div>
+                          <div class="field"><label for="room-shared-rules">协作规则（每行一条）</label><textarea class="textarea" id="room-shared-rules" rows="3"></textarea></div>
+                          <div class="field"><label for="room-custom-instructions">自定义指令</label><textarea class="textarea" id="room-custom-instructions" rows="2"></textarea></div>
+                        </div>
+                      </details>
+                    </div>
+                    <div data-advanced>
+                      <details class="protocol-config">
+                        <summary>协议高级设置</summary>
+                        <div id="protocol-settings" class="grid-2" style="margin-top:12px;"></div>
+                      </details>
+                    </div>
+                    <p class="meta" id="room-init-progress" aria-live="polite"></p>
+                  </div>
+                </div>
+                <div class="card error-box" id="room-init-error" style="display:none;margin-bottom:20px;border:1px solid var(--danger);background:rgba(239, 68, 68, 0.08);padding:16px;">
+                  <div class="row-between">
+                    <strong style="color:var(--danger);font-size:14px;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:text-bottom;margin-right:6px;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>房间初始化失败 (Initialization Blocked)</strong>
+                    <button class="btn btn-sm btn-ghost" id="btn-dismiss-room-error" type="button">关闭</button>
+                  </div>
+                  <div id="room-error-details" style="margin-top:8px;font-size:13px;line-height:1.6;color:var(--text);"></div>
+                </div>
+                <div class="row-between" style="margin-bottom:12px;">
+                  <h3 data-i="slots">参与者席位</h3>
+                  <button class="btn btn-sm btn-secondary" id="btn-add-slot" data-i="addSlot">添加席位</button>
+                </div>
+                <div id="slots"></div>
+              </div>
+              <aside class="card" data-od-id="binding-preview">
+                <h3 data-i="previewTitle">绑定快照预览</h3>
+                <p class="meta" style="margin:8px 0 12px;" data-i="previewHelp">启动前检查将冻结的引擎组合。</p>
+                <div id="preview-box"></div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-room-live" hidden>
+        <div class="container">
+          <div class="row-between live-head">
+            <div>
+              <button class="btn btn-back" id="btn-leave">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                <span data-i="backRooms">返回房间列表</span>
+              </button>
+              <h2 id="live-title" data-i="liveRoomTitle">房间</h2>
+              <div class="live-meta">
+                <span class="tag solid" id="live-status">ACTIVE</span>
+                <span class="live-topic-wrap">
+                  <span class="meta" id="live-topic"></span>
+                  <button type="button" class="topic-toggle" id="btn-topic-toggle" hidden></button>
+                </span>
+                <span class="meta num" id="live-turn"></span>
+              </div>
+            </div>
+            <div class="live-controls">
+              <button class="btn btn-primary" id="btn-next" data-od-id="cta-next-turn" data-i="nextTurn">下一回合</button>
+              <select class="input" id="manual-speaker" style="width:auto;min-width:160px;"></select>
+              <button class="btn btn-ghost" id="btn-manual" data-i="speak">指定发言</button>
+              <button class="btn btn-ghost" id="btn-pause" data-i="pause">暂停</button>
+              <button class="btn btn-ghost" id="btn-resume" hidden data-i="resume">继续</button>
+              <button class="btn btn-ghost" id="btn-cancel-turn" data-i="cancelTurn">取消当前轮</button>
+              <button class="btn btn-ghost" id="btn-finalize-room">主持人立即总结</button>
+              <button class="btn btn-ghost" id="btn-stop" data-i="stop">结束房间</button>
+            </div>
+          </div>
+          <div id="live-error-banner" style="display:none;background:rgba(239, 68, 68, 0.12);color:var(--danger, #ef4444);border:1px solid rgba(239, 68, 68, 0.3);border-radius:var(--radius-md);padding:10px 16px;margin:12px 0;font-size:13px;line-height:1.5;">
+            <div class="row-between" style="gap:12px;align-items:center;">
+              <div><strong>错误: </strong><span id="live-error-text"></span></div>
+              <button class="btn btn-sm btn-secondary" id="btn-retry-room" type="button">重新初始化房间</button>
+            </div>
+          </div>
+          <div class="pills-bar" id="live-pills"></div>
+          <div id="protocol-upgrade-warning" hidden style="background:rgba(245, 158, 11, 0.10);color:var(--warning, #b45309);border:1px solid rgba(245, 158, 11, 0.35);border-radius:var(--radius-md);padding:10px 16px;margin:12px 0;font-size:13px;line-height:1.5;">
+            <div class="row-between" style="gap:12px;align-items:center;">
+              <div>这个房间仍在使用「自由讨论」协议。如果你希望主持人路由专家、显示协作阶段并生成会诊总结，可以升级为「专家会诊」。</div>
+              <button class="btn btn-sm btn-secondary" id="protocol-upgrade-button" type="button">升级为专家会诊</button>
+            </div>
+          </div>
+          <details class="card protocol-live" id="protocol-live-panel" open>
+            <summary><strong>房间协作状态</strong></summary>
+            <div class="protocol-status-grid" style="margin-top:12px;">
+              <div><span class="meta">当前模式</span><strong id="live-protocol">自由讨论</strong></div>
+              <div><span class="meta">阶段</span><strong id="live-protocol-stage">等待提问</strong></div>
+              <div><span class="meta">进度</span><strong id="live-protocol-progress">—</strong></div>
+              <div><span class="meta">运行结果</span><strong id="live-run-status">待开始</strong></div>
+            </div>
+            <div id="protocol-clarification-banner" hidden style="background:rgba(59, 130, 246, 0.10);color:var(--info, #2563eb);border:1px solid rgba(59, 130, 246, 0.35);border-radius:var(--radius-md);padding:10px 14px;margin-top:12px;font-size:13px;line-height:1.5;">
+              <span id="protocol-clarification-text"></span>
+            </div>
+            <div class="protocol-members-row">
+              <div>
+                <span class="meta" data-i="liveWorking">正在工作</span>
+                <div id="live-active-members" class="stack compact"></div>
+              </div>
+              <div>
+                <span class="meta" data-i="liveDone">已完成</span>
+                <div id="live-completed-members" class="stack compact"></div>
+              </div>
+              <div>
+                <span class="meta">未调用成员</span>
+                <div id="live-uncalled-members" class="stack compact"></div>
+              </div>
+            </div>
+            <div style="margin-top:12px;" data-protocol-detail>
+              <details class="protocol-config">
+                <summary>运行详情</summary>
+                <div class="grid-2" style="margin-top:12px;">
+                  <div><span class="meta">主持人 / 主席</span><div id="live-protocol-host" class="stack compact">—</div></div>
+                  <div><span class="meta">未调用成员</span><div id="live-inactive-members" class="stack compact"></div></div>
+                </div>
+                <div id="protocol-event-feed" class="protocol-event-feed" style="margin-top:12px;"></div>
+              </details>
+            </div>
+          </details>
+          <div class="live-layout">
+            <div class="chat-shell">
+              <div class="chat-toolbar">
+                <span class="chat-toolbar-spacer"></span>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-icon chat-clear-btn"
+                  id="btn-clear-chat"
+                  data-i="clearConversation"
+                  data-i-title="clearConversationTitle"
+                  title="清除全部对话历史"
+                  disabled
+                >
+                  <span class="chat-clear-glyph" aria-hidden="true">⌫</span>
+                  <span class="chat-clear-label">清空对话</span>
+                </button>
+              </div>
+              <div class="chat-feed" id="chat-feed"></div>
+              <div class="banner" id="turn-banner"><span class="spinner"></span><span id="banner-text"></span></div>
+              <div class="composer">
+                <input class="input" id="inject" data-i-placeholder="injectPh" />
+                <button class="btn btn-secondary" id="btn-inject" data-i="inject" disabled>注入</button>
+              </div>
+            </div>
+            <aside class="inspector">
+              <div class="inspector-tabs">
+                <button type="button" class="is-active" data-ipanel="state" data-i="inspState">人物状态</button>
+                <button type="button" data-ipanel="relation" data-i="inspRelation">关系状态</button>
+                <button type="button" data-ipanel="recall" data-i="inspRecall">召回证据</button>
+                <button type="button" data-ipanel="bind" data-i="inspBind">引擎绑定</button>
+              </div>
+              <div class="inspector-body">
+                <div id="insp-state"></div>
+                <div id="insp-relation" hidden></div>
+                <div id="insp-recall" hidden></div>
+                <div id="insp-bind" hidden></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div style="height:32px;"></div>
+      </div>
+    </section>
+
+    <!-- 2. PARALLEL WORLD VIEW (Counterfactual Simulation Engine) -->
+
+    <!-- 2.5 NARRATIVE STUDIO VIEW -->
+    <section class="view" id="view-narrative" data-od-id="narrative">
+      <div id="sub-narrative-list">
+        <div class="chapter">
+          <div class="container">
+            <p class="eyebrow" data-i="narrEyebrow">Narrative Studio · 短剧创作工作台</p>
+            <div class="row-between panel-head" style="align-items:flex-end;">
+              <div>
+                <h1 data-i="narrTitle">叙事创作</h1>
+                <p class="lead" style="margin-top:12px;" data-i="narrLead">先设定故事，再生成圣经与大纲，然后按集创作、审核并提交正史。</p>
+              </div>
+              <div class="row" style="gap:8px;">
+                <button class="btn btn-secondary" id="btn-narr-refresh" type="button" data-i="narrRefresh">刷新</button>
+                <button class="btn btn-primary" id="btn-narr-new" type="button" data-i="narrNew">新建作品</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="workspace">
+          <div class="container">
+            <ol class="narr-flow-hint" aria-label="创作顺序">
+              <li data-i="narrFlowSettings">作品设定</li>
+              <li data-i="narrFlowBible">故事圣经</li>
+              <li data-i="narrFlowCast">绑定核心人物</li>
+              <li data-i="narrFlowOutline">全剧大纲</li>
+              <li data-i="narrFlowEpisode">单集创作</li>
+              <li data-i="narrFlowAudit">审核并提交正史</li>
+              <li data-i="narrFlowProd">制作包</li>
+            </ol>
+            <div class="row-between narr-list-toolbar" id="narr-list-toolbar" hidden>
+              <label class="narr-check">
+                <input type="checkbox" id="narr-select-all" />
+                <span data-i="narrSelectAll">全选</span>
+                <span class="meta" id="narr-selected-count"></span>
+              </label>
+              <button class="btn btn-sm btn-danger" id="btn-narr-delete-selected" type="button" disabled data-i="narrDeleteSelected">删除所选</button>
+            </div>
+            <div id="narr-project-list" class="stack" style="gap:10px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-narrative-detail" hidden>
+        <div class="chapter narr-detail-head">
+          <div class="container">
+            <div class="row-between" style="align-items:flex-start;gap:16px;">
+              <div style="min-width:0;flex:1;">
+                <button class="btn btn-back" id="btn-narr-back" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                  <span data-i="narrBack">返回作品列表</span>
+                </button>
+                <p class="eyebrow" id="narr-detail-eyebrow" data-i="narrStudioEyebrow">叙事创作工作台</p>
+                <h1 id="narr-detail-title">—</h1>
+                <p class="lead" id="narr-detail-logline" style="margin-top:8px;"></p>
+                <p class="narr-format-line" id="narr-detail-format"></p>
+                <div class="narr-status-chips" id="narr-status-chips"></div>
+              </div>
+              <div class="row narr-head-actions" style="gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-secondary" id="btn-narr-runtime" type="button" data-i="narrRuntimeOpen">⚙ 创作模型</button>
+              </div>
+            </div>
+            <div id="narr-job-status" class="narr-job-card" hidden></div>
+          </div>
+        </div>
+        <div class="workspace">
+          <div class="container stack" style="gap:16px;">
+            <nav class="narr-tabs" id="narr-tabs" aria-label="创作工作台">
+              <button type="button" class="is-active" data-narr-tab="settings" id="btn-narr-tab-settings" data-i="narrTabSettings">作品设定</button>
+              <button type="button" data-narr-tab="bible" id="btn-narr-tab-bible" data-i="narrTabBible">故事圣经</button>
+              <button type="button" data-narr-tab="cast" id="btn-narr-tab-cast" data-i="narrTabCast">角色</button>
+              <button type="button" data-narr-tab="outline" id="btn-narr-tab-outline" data-i="narrTabOutline">全剧大纲</button>
+              <button type="button" data-narr-tab="episode" id="btn-narr-tab-episode" data-i="narrTabEpisode">单集创作</button>
+              <button type="button" data-narr-tab="continuity" id="btn-narr-tab-continuity" data-i="narrTabContinuity">连续性</button>
+              <button type="button" data-narr-tab="production" id="btn-narr-tab-production" data-i="narrTabProduction">制作</button>
+            </nav>
+
+            <div id="narr-tab-settings" class="card narr-panel">
+              <div class="row-between" style="margin-bottom:12px;">
+                <div>
+                  <h3 data-i="narrTabSettings">作品设定</h3>
+                  <p class="meta" data-i="narrSettingsHelp">完整填写作品类型、集数与时长。这些设定会进入后续生成。</p>
+                </div>
+                <button class="btn btn-sm btn-primary" id="btn-narr-settings-save" type="button" data-i="save">保存</button>
+              </div>
+              <form id="form-narr-settings" class="stack" style="gap:12px;">
+                <div class="grid-2 narr-form-grid">
+                  <div class="field">
+                    <label for="narr-set-title">标题 *</label>
+                    <input class="input" id="narr-set-title" required />
+                  </div>
+                  <div class="field">
+                    <label for="narr-set-format">作品类型</label>
+                    <select class="input" id="narr-set-format">
+                      <option value="micro_drama">微短剧</option>
+                      <option value="series">剧集</option>
+                      <option value="novel">长篇</option>
+                      <option value="interactive_story">互动故事</option>
+                      <option value="custom">自定义</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="narr-set-logline">Logline *</label>
+                  <textarea class="textarea" id="narr-set-logline" rows="2"></textarea>
+                </div>
+                <div class="field">
+                  <label for="narr-set-description">完整故事简介</label>
+                  <textarea class="textarea" id="narr-set-description" rows="4"></textarea>
+                </div>
+                <div class="grid-2 narr-form-grid">
+                  <div class="field">
+                    <label for="narr-set-genre">Genre（逗号分隔）</label>
+                    <input class="input" id="narr-set-genre" placeholder="悬疑, 都市, 科幻" />
+                  </div>
+                  <div class="field">
+                    <label for="narr-set-tone">Tone（逗号分隔）</label>
+                    <input class="input" id="narr-set-tone" placeholder="克制, 紧张, 温暖" />
+                  </div>
+                </div>
+                <div class="grid-2 narr-form-grid">
+                  <div class="field">
+                    <label for="narr-set-audience">目标受众</label>
+                    <input class="input" id="narr-set-audience" />
+                  </div>
+                  <div class="field">
+                    <label for="narr-set-episodes">计划集数</label>
+                    <input class="input" id="narr-set-episodes" type="number" min="1" />
+                  </div>
+                </div>
+                <div class="grid-2 narr-form-grid">
+                  <div class="field">
+                    <label for="narr-set-dur-min">单集最短时长（秒）</label>
+                    <input class="input" id="narr-set-dur-min" type="number" min="1" />
+                  </div>
+                  <div class="field">
+                    <label for="narr-set-dur-max">单集最长时长（秒）</label>
+                    <input class="input" id="narr-set-dur-max" type="number" min="1" />
+                  </div>
+                </div>
+              </form>
+              <div class="narr-danger-zone">
+                <h4 data-i="narrDangerTitle">危险区</h4>
+                <p class="meta" data-i="narrDangerHelp">删除作品不可恢复。</p>
+                <button class="btn btn-sm btn-danger" id="btn-narr-delete" type="button" data-i="narrDelete">删除作品</button>
+              </div>
+            </div>
+
+            <div id="narr-tab-bible" class="card narr-panel" hidden>
+              <div class="row-between" style="margin-bottom:12px;gap:10px;flex-wrap:wrap;">
+                <div>
+                  <h3 data-i="narrTabBible">故事圣经</h3>
+                  <p class="meta" data-i="narrBibleHelp">核心故事约束。作者秘密默认折叠，不会注入角色知识。</p>
+                </div>
+                <div class="row" style="gap:8px;flex-wrap:wrap;">
+                  <button class="btn btn-sm btn-secondary" id="btn-narr-bible-edit" type="button" data-i="narrBibleEdit">编辑</button>
+                  <button class="btn btn-sm btn-primary" id="btn-narr-bible-save" type="button" hidden data-i="narrBibleSave">保存新版本</button>
+                  <button class="btn btn-sm btn-ghost" id="btn-narr-bible-cancel" type="button" hidden data-i="cancel">取消</button>
+                  <button class="btn btn-sm btn-secondary" id="btn-narr-bible-versions" type="button" data-i="narrBibleVersions">版本历史</button>
+                  <button class="btn btn-sm btn-secondary" id="btn-narr-bible-generate" type="button" data-i="narrBibleGen">AI 重新生成</button>
+                </div>
+              </div>
+              <div id="narr-bible-sync" class="narr-sync-banner" hidden></div>
+              <div id="narr-bible-versions" class="narr-version-list" hidden></div>
+              <div id="narr-bible-view" class="stack" style="gap:12px;"></div>
+            </div>
+
+            <div id="narr-tab-cast" class="card narr-panel" hidden>
+              <div class="row-between" style="margin-bottom:12px;gap:10px;flex-wrap:wrap;">
+                <div>
+                  <h3 data-i="narrTabCast">角色</h3>
+                  <p class="meta" data-i="narrCastHelp">核心角色绑定已有完整 Persona；普通剧情角色可以不绑定。</p>
+                </div>
+                <div class="row" style="gap:8px;flex-wrap:wrap;">
+                  <button class="btn btn-sm btn-secondary" id="btn-narr-char-add" type="button" data-i="narrCharAdd">＋ 添加角色</button>
+                </div>
+              </div>
+              <div id="narr-cast-view" class="narr-cast-grid"></div>
+              <details class="narr-advanced-block" id="narr-cast-advanced">
+                <summary data-i="narrCastAdvanced">高级操作</summary>
+                <p class="meta" data-i="narrLightPersonaHelp">创建轻量虚构 Persona：用于次要角色快速模拟。这不会运行完整 Persona Creation。核心角色建议绑定已有完整 Persona。</p>
+                <button class="btn btn-sm btn-secondary" id="btn-narr-char-create-missing" type="button" data-i="narrCharCreate">创建轻量虚构 Persona</button>
+              </details>
+            </div>
+
+            <div id="narr-tab-outline" class="card narr-panel" hidden>
+              <div class="row-between" style="margin-bottom:12px;gap:10px;flex-wrap:wrap;">
+                <div>
+                  <h3 data-i="narrTabOutline">全剧大纲</h3>
+                  <p class="meta" data-i="narrOutlineHelp">按集查看目标、钩子与悬念。点击一集进入单集创作。</p>
+                </div>
+                <button class="btn btn-sm btn-primary" id="btn-narr-outline" type="button" data-i="narrOutline">AI 生成 / 重新生成</button>
+              </div>
+              <div id="narr-outline-view" class="narr-outline-grid"></div>
+            </div>
+
+            <div id="narr-tab-episode" class="narr-panel" hidden>
+              <div class="narr-workbench">
+                <aside class="narr-ep-rail" id="narr-ep-rail"></aside>
+                <div class="narr-ep-main stack" style="gap:12px;">
+                  <div class="card" id="narr-ep-plan"></div>
+                  <div id="narr-pipeline" class="stack" style="gap:10px;"></div>
+                  <details class="card narr-advanced-block" id="narr-writer-advanced">
+                    <summary data-i="narrWriterAdvanced">高级创作工具 · Writer Room</summary>
+                    <p class="meta" data-i="narrWriterHelp">不会默认使用故事人物当编剧。请先在创作模型设置中配置 Writer Personas。</p>
+                    <div id="narr-writer-config"></div>
+                    <div id="narr-writer-room-results" class="stack" style="gap:8px;margin-top:8px;"></div>
+                  </details>
+                </div>
+              </div>
+            </div>
+
+            <div id="narr-tab-continuity" class="card narr-panel" hidden>
+              <h3 data-i="narrTabContinuity">连续性</h3>
+              <p class="meta" data-i="narrContinuityHelp">信息差、伏笔、角色弧与 Canon 状态。技术 ID 默认隐藏。</p>
+              <div class="narr-continuity-sections">
+                <section>
+                  <h4 data-i="narrKnowledge">信息差</h4>
+                  <div id="narr-knowledge-view"></div>
+                </section>
+                <section>
+                  <h4 data-i="narrClues">伏笔与线索</h4>
+                  <div id="narr-clues-view" class="stack" style="gap:8px;"></div>
+                </section>
+                <section>
+                  <h4 data-i="narrArcs">角色弧 / Plot Threads</h4>
+                  <div id="narr-threads-view" class="stack" style="gap:8px;"></div>
+                </section>
+                <section>
+                  <h4 data-i="narrCanon">Canon 状态</h4>
+                  <div id="narr-canon-view" class="stack" style="gap:8px;"></div>
+                </section>
+              </div>
+            </div>
+
+            <div id="narr-tab-production" class="card narr-panel" hidden>
+              <h3 data-i="narrTabProduction">制作</h3>
+              <p class="meta" data-i="narrProductionHelp">按集展开剧本、分镜、画面与成片提示。不要只看截断文本。</p>
+              <div id="narr-production-view" class="stack" style="gap:10px;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button class="btn btn-primary narr-director-fab" id="btn-narr-director" type="button" data-i="directorOpen" hidden>导演 Agent</button>
+      <aside id="narr-director-panel" hidden aria-label="导演 Agent">
+        <div class="narr-dir-head">
+          <h3 data-i="directorTitle">导演 Agent</h3>
+          <div class="narr-dir-modes" role="group" aria-label="Director mode">
+            <button type="button" data-dir-mode="discuss" data-i="directorModeDiscuss">讨论</button>
+            <button type="button" data-dir-mode="advise" data-i="directorModeAdvise">建议</button>
+            <button type="button" data-dir-mode="agent" class="is-active" data-i="directorModeAgent">代理</button>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="btn-narr-director-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <details class="narr-dir-runtime">
+          <summary data-i="directorRuntimeTitle">导演模型</summary>
+          <div class="narr-dir-runtime-body">
+            <div class="field"><label data-i="directorRuntimeSource">运行来源</label>
+              <div class="row" style="gap:12px;flex-wrap:wrap;margin-top:4px;">
+                <label class="narr-radio" style="cursor:pointer;"><input type="radio" name="dir-source" value="local_cli" /> 本地 CLI</label>
+                <label class="narr-radio" style="cursor:pointer;"><input type="radio" name="dir-source" value="api" /> API 提供方</label>
+              </div>
+            </div>
+            <div class="field"><label data-i="labelAgent">智能体</label><select class="input" id="dir-agent"></select></div>
+            <div class="field"><label data-i="labelModel">模型</label><select class="input" id="dir-model"></select></div>
+            <div class="field"><label data-i="labelReasoning">思考强度</label><select class="input" id="dir-reasoning"></select></div>
+            <p class="meta" id="dir-reasoning-notice"></p>
+            <button class="btn btn-sm btn-secondary" id="btn-narr-dir-save-runtime" type="button" data-i="directorSaveRuntime">保存为作品导演模型</button>
+          </div>
+        </details>
+        <div class="narr-dir-banner" id="narr-dir-banner" hidden></div>
+        <div class="narr-dir-thread" id="narr-dir-thread"></div>
+        <div class="narr-dir-input">
+          <textarea class="textarea" id="narr-dir-input" rows="2" data-i-placeholder="directorInputPh" placeholder="用自然语言描述修改要求，例如：这个秘密暴露太早了，删掉。"></textarea>
+          <div class="row" style="gap:8px;justify-content:flex-end;">
+            <button class="btn btn-ghost btn-sm" id="btn-narr-dir-stop" type="button" data-i="directorStop" hidden>停止</button>
+            <button class="btn btn-primary btn-sm" id="btn-narr-dir-send" type="button" data-i="directorSend">发送</button>
+          </div>
+        </div>
+      </aside>
+      <button class="btn btn-primary narr-director-fab narr-shoot-fab" id="btn-narr-shooting" type="button" data-i="shootOpen" hidden>拍摄 Agent</button>
+      <aside id="narr-shooting-panel" hidden aria-label="拍摄 Agent">
+        <div class="narr-dir-head">
+          <h3 data-i="shootTitle">拍摄 Agent</h3>
+          <div class="narr-dir-modes" role="group" aria-label="Shooting mode">
+            <button type="button" data-shoot-mode="discuss" data-i="shootModeDiscuss">讨论</button>
+            <button type="button" data-shoot-mode="advise" data-i="shootModeAdvise">建议</button>
+            <button type="button" data-shoot-mode="agent" class="is-active" data-i="shootModeAgent">代理</button>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="btn-narr-shoot-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <details class="narr-dir-runtime">
+          <summary data-i="shootTargetModelTitle">目标视频模型</summary>
+          <div class="narr-dir-runtime-body">
+            <p class="meta" data-i="shootTargetModelHelp">目标视频模型 = 最终 Prompt 交给哪个视频生成模型。</p>
+            <div class="field"><label data-i="prodTargetModel">目标视频模型</label><select class="input" id="shoot-target-model"></select></div>
+          </div>
+        </details>
+        <details class="narr-dir-runtime">
+          <summary data-i="shootRuntimeTitle">拍摄模型（CLI 工具 / 模型 / 思考强度）</summary>
+          <div class="narr-dir-runtime-body">
+            <p class="meta" data-i="shootAgentRuntimeHelp">拍摄 Agent = 谁负责思考。</p>
+            <div class="field"><label data-i="shootRuntimeSource">运行来源</label>
+              <div class="row" style="gap:12px;flex-wrap:wrap;margin-top:4px;">
+                <label class="narr-radio" style="cursor:pointer;"><input type="radio" name="shoot-source" value="local_cli" /> 本地 CLI</label>
+                <label class="narr-radio" style="cursor:pointer;"><input type="radio" name="shoot-source" value="api" /> API 提供方</label>
+              </div>
+            </div>
+            <div class="field"><label data-i="labelAgent">智能体</label><select class="input" id="shoot-agent"></select></div>
+            <div class="field"><label data-i="labelModel">模型</label><select class="input" id="shoot-model"></select></div>
+            <div class="field"><label data-i="labelReasoning">思考强度</label><select class="input" id="shoot-reasoning"></select></div>
+            <p class="meta" id="shoot-reasoning-notice"></p>
+            <button class="btn btn-sm btn-secondary" id="btn-narr-shoot-save-runtime" type="button" data-i="shootSaveRuntime">保存为作品拍摄模型</button>
+          </div>
+        </details>
+        <div class="narr-dir-banner" id="narr-shoot-banner" hidden></div>
+        <div class="narr-dir-thread" id="narr-shoot-thread"></div>
+        <div class="narr-dir-input">
+          <textarea class="textarea" id="narr-shoot-input" rows="2" data-i-placeholder="shootInputPh" placeholder="用自然语言描述拍摄方案调整，例如：拆分 Clip 7 为两个视频。"></textarea>
+          <div class="row" style="gap:8px;justify-content:flex-end;">
+            <button class="btn btn-ghost btn-sm" id="btn-narr-shoot-stop" type="button" data-i="shootStop" hidden>停止</button>
+            <button class="btn btn-primary btn-sm" id="btn-narr-shoot-send" type="button" data-i="shootSend">发送</button>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="view" id="view-worlds" data-od-id="worlds">
+      <div id="sub-world-list">
+        <div class="chapter">
+          <div class="container">
+            <p class="eyebrow" data-i="worldsEyebrow">Counterfactual Simulation · Multi-Branch</p>
+            <div class="row-between panel-head" style="align-items:flex-end;">
+              <div>
+                <h1 data-i="worldsTitle">平行世界，因果演化</h1>
+                <p class="lead" style="margin-top:12px;" data-i="worldsLead">自适应时钟、时间知识防火墙、因果事件链与多分支推演评估。</p>
+              </div>
+              <button class="btn btn-primary" id="btn-new-world" data-od-id="cta-new-world" data-i="newWorld">创建平行世界</button>
+            </div>
+          </div>
+        </div>
+        <div class="workspace">
+          <div class="container">
+            <div class="row-between panel-head">
+              <h2 data-i="allWorlds">全部平行世界</h2>
+              <span class="meta" id="world-count">0</span>
+            </div>
+            <div class="world-grid" id="worlds-grid">
+              <div class="empty" style="grid-column:1/-1">
+                <h3 data-i="emptyWorlds">还没有平行世界</h3>
+                <p data-i="emptyWorldsHint">设定初始历史分歧条件，开启推演。</p>
+                <button class="btn btn-primary" id="empty-new-world" type="button" data-i="newWorld">创建平行世界</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-world-create" hidden>
+        <div class="workspace">
+          <div class="container" style="max-width:760px;">
+            <div class="row-between panel-head">
+              <div>
+                <button class="btn btn-back" id="btn-back-worlds">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                  <span data-i="backWorlds">返回平行世界</span>
+                </button>
+                <h2 data-i="createWorldTitle">设定平行世界</h2>
+                <p class="lead" data-i="createWorldLead">输入自然语言历史分歧设定，系统将自动构建 WorldSeed 种子（不提前预设结局）。</p>
+              </div>
+            </div>
+            <div class="card">
+              <form class="stack" id="form-create-world">
+                <div class="field">
+                  <label for="world-desc" data-i="worldDescLabel">世界分歧描述 (Historical Divergence)</label>
+                  <textarea class="textarea" id="world-desc" rows="3" placeholder="例如：乔布斯在2011年没有去世，并决定推动 Apple 建立自研 AI 芯片与神经网络战略。" required></textarea>
+                </div>
+                <div class="grid-2">
+                  <div class="field">
+                    <label for="world-baseline" data-i="worldBaselineLabel">基准世界</label>
+                    <input class="input" id="world-baseline" value="real_world" />
+                  </div>
+                  <div class="field">
+                    <label for="world-start-date" data-i="worldStartDateLabel">起始时间 (T0)</label>
+                    <input class="input" id="world-start-date" value="2011-10-05" placeholder="YYYY-MM-DD" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="world-end-date" data-i="worldEndDateLabel">推演终点</label>
+                  <input class="input" id="world-end-date" value="2030" placeholder="2030" />
+                </div>
+
+                <hr style="border:none;border-top:1px solid var(--border-soft);margin:6px 0;" />
+
+                <!-- 2. World Builder AI Engine -->
+                <h4 style="margin:0 0 2px;">World Builder 种子构建引擎</h4>
+                <p class="meta" style="margin-bottom:10px;">调用大模型 Agent 将自然语言设定提取为 WorldSeed（不预设结局）。</p>
+                <div class="grid-2" style="gap:10px;background:var(--surface);padding:12px;border-radius:var(--radius-sm);">
+                  <div class="field">
+                    <label>运行来源</label>
+                    <div class="row" style="gap:12px;margin-top:4px;">
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="wb-source" value="local_cli" checked /> 本地 CLI
+                      </label>
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="wb-source" value="api" /> API 提供方
+                      </label>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="wb-agent">智能体 / 端点</label>
+                    <select class="input" id="wb-agent"></select>
+                  </div>
+                  <div class="field">
+                    <label for="wb-model">模型 (Model)</label>
+                    <select class="input" id="wb-model"></select>
+                  </div>
+                  <div class="field">
+                    <label for="wb-reasoning">思考强度 (Reasoning)</label>
+                    <select class="input" id="wb-reasoning">
+                      <option value="none">none (无/关闭)</option>
+                      <option value="low">low (低)</option>
+                      <option value="medium">medium (中)</option>
+                      <option value="high">high (高)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <hr style="border:none;border-top:1px solid var(--border-soft);margin:6px 0;" />
+
+                <!-- 3. Shared Actor Completion Runtime -->
+                <h4 style="margin:0 0 2px;" data-i="actorEngineTitle">Actor 补全引擎</h4>
+                <p class="meta" style="margin-bottom:10px;">当世界解析到缺失的人物、组织、机构或群体 Agent 档案时，使用此运行时研究、创建并绑定对应决策档案。</p>
+                <div class="grid-2" style="gap:10px;background:var(--surface);padding:12px;border-radius:var(--radius-sm);">
+                  <div class="field">
+                    <label>运行来源</label>
+                    <div class="row" style="gap:12px;margin-top:4px;">
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="persona-creator-source" value="local_cli" checked /> 本地 CLI
+                      </label>
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="persona-creator-source" value="api" /> API 提供方
+                      </label>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="persona-creator-agent" data-i="labelAgentProvider">智能体 / 提供方</label>
+                    <select class="input" id="persona-creator-agent"></select>
+                  </div>
+                  <div class="field">
+                    <label for="persona-creator-model" data-i="labelModel">模型</label>
+                    <select class="input" id="persona-creator-model"></select>
+                  </div>
+                  <div class="field">
+                    <label for="persona-creator-reasoning" data-i="labelReasoning">思考强度</label>
+                    <select class="input" id="persona-creator-reasoning"></select>
+                  </div>
+                  <div class="field">
+                    <label for="persona-creator-policy" data-i="labelResearchPolicy">研究策略</label>
+                    <select class="input" id="persona-creator-policy">
+                      <option value="deep">Deep（自适应，至少 30，目标 60+，推荐）</option>
+                      <option value="standard">Standard（约 25 个独立高质量来源）</option>
+                      <option value="exhaustive">Exhaustive（通常 100+，持续扩展）</option>
+                      <option value="custom">Custom（高级）</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- 3. Default Actor Runtime -->
+                <h4 style="margin:0 0 2px;">默认 Actor 决策运行时</h4>
+                <p class="meta" style="margin-bottom:10px;">用于所有 Agent-capable 角色在世界推演中的默认决策运行时；人物、组织、机构、群体未单独覆盖时继承此配置。</p>
+                <div class="grid-2" style="gap:10px;background:var(--surface);padding:12px;border-radius:var(--radius-sm);">
+                  <div class="field">
+                    <label>运行来源</label>
+                    <div class="row" style="gap:12px;margin-top:4px;">
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="actor-default-source" value="local_cli" checked /> 本地 CLI
+                      </label>
+                      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:13px;">
+                        <input type="radio" name="actor-default-source" value="api" /> API 提供方
+                      </label>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="actor-default-agent">智能体 / 端点</label>
+                    <select class="input" id="actor-default-agent"></select>
+                  </div>
+                  <div class="field">
+                    <label for="actor-default-model">模型 (Model)</label>
+                    <select class="input" id="actor-default-model"></select>
+                  </div>
+                  <div class="field">
+                    <label for="actor-default-reasoning">思考强度 (Reasoning)</label>
+                    <select class="input" id="actor-default-reasoning">
+                      <option value="none">none (无/关闭)</option>
+                      <option value="low">low (低)</option>
+                      <option value="medium">medium (中)</option>
+                      <option value="high">high (高)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <hr style="border:none;border-top:1px solid var(--border-soft);margin:6px 0;" />
+
+                <!-- 4. Dynamic Actor Configuration Table -->
+                <div class="row-between" style="align-items:center;">
+                  <div>
+                    <h4 style="margin:0 0 2px;">Actor 阵容与个性化绑定</h4>
+                    <p class="meta" style="margin:0;">可先点击智能解析提取角色阵容，或直接创建（自动解析并绑定）。</p>
+                  </div>
+                  <button class="btn btn-sm btn-secondary" id="btn-preview-seed" type="button">智能解析 Actor 阵容</button>
+                </div>
+                <div id="world-seed-preview-panel" style="display:none;background:var(--surface);padding:12px;border-radius:var(--radius-sm);margin-top:8px;">
+                  <div id="world-agent-classification-container"></div>
+                  <div id="world-non-agent-entities-container" style="margin-top:14px;"></div>
+                  <div id="world-actors-table-container"></div>
+                </div>
+
+                <div class="card error-box" id="world-create-error" style="display:none;margin-top:12px;border:1px solid var(--danger);background:rgba(239, 68, 68, 0.08);padding:14px;">
+                  <div id="world-error-details" style="font-size:13px;color:var(--text);"></div>
+                </div>
+
+                <div class="row" style="justify-content:flex-end;margin-top:16px;">
+                  <button type="button" class="btn btn-ghost" id="btn-cancel-world" data-i="cancel">取消</button>
+                  <button type="submit" class="btn btn-primary" id="btn-submit-world" data-i="create">构建并初始化</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-world-live" hidden>
+        <div class="container">
+          <div class="row-between live-head">
+            <div>
+              <button class="btn btn-back" id="btn-leave-world">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                <span data-i="backWorlds">返回平行世界</span>
+              </button>
+              <h2 id="world-live-title" data-i="liveWorldTitle">世界</h2>
+              <div class="live-meta">
+                <span class="tag solid" id="world-live-time">2011-10-05</span>
+                <div class="row" style="gap:6px;">
+                  <label class="meta" for="world-branch-select" data-i="currentBranch">分支:</label>
+                  <select class="input" id="world-branch-select" style="width:auto;min-width:140px;min-height:36px;padding:4px 10px;"></select>
+                </div>
+              </div>
+            </div>
+            <div class="live-controls">
+              <button class="btn btn-primary" id="btn-step-world">继续模拟</button>
+              <button class="btn btn-ghost" id="btn-pause-world">暂停</button>
+              <button class="btn btn-ghost" id="btn-resume-world" hidden>继续</button>
+              <button class="btn btn-ghost" id="btn-view-timeline">查看时间线</button>
+              <button class="btn btn-ghost" id="btn-open-scene">查看人物</button>
+              <button class="btn btn-ghost" id="btn-view-branches">查看分支</button>
+              <details class="developer-tools">
+                <summary class="btn btn-secondary">开发者工具</summary>
+                <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap;">
+                  <button class="btn btn-ghost" id="btn-open-action" type="button" data-i="btnInjectEvent">注入事件</button>
+                  <button class="btn btn-ghost" id="btn-open-causal" type="button" data-i="btnCausalGraph">因果图</button>
+                  <button class="btn btn-ghost" id="btn-open-report" type="button" data-i="btnWorldState">世界状态</button>
+                  <button class="btn btn-ghost" id="btn-open-replay" type="button" data-i="btnDebug">调试</button>
+                  <button class="btn btn-ghost" id="btn-open-eval" type="button" data-i="btnEvalBranches">分支评估</button>
+                  <button class="btn btn-ghost" id="btn-fork-branch" type="button" data-i="btnForkBranch">创建分支</button>
+                  <button class="btn btn-danger" id="btn-delete-world" type="button">删除世界</button>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <div class="live-layout" style="margin-top:14px;">
+            <!-- LEFT: CAUSAL TIMELINE FEED -->
+            <div class="chat-shell">
+              <div class="row-between" style="padding:16px 20px 10px;border-bottom:1px solid var(--border-soft);">
+                <strong data-i="causalTimeline">因果时间线 (Causal DAG Timeline)</strong>
+                <span class="meta num" id="world-event-count">0 events</span>
+              </div>
+              <div class="chat-feed" id="world-timeline-feed"></div>
+            </div>
+
+            <!-- RIGHT: WORLD STATE & ACTORS INSPECTOR -->
+            <aside class="inspector">
+              <div class="inspector-tabs">
+                <button type="button" class="is-active" data-wpanel="projects" data-i="inspProjects">战略项目</button>
+                <button type="button" data-wpanel="orgs" data-i="inspOrgs">组织与资本</button>
+                <button type="button" data-wpanel="tech" data-i="inspTech">技术与市场</button>
+                <button type="button" data-wpanel="actors" data-i="inspActors">世界 Actor</button>
+              </div>
+              <div class="inspector-body">
+                <div id="world-insp-projects"></div>
+                <div id="world-insp-orgs" hidden></div>
+                <div id="world-insp-tech" hidden></div>
+                <div id="world-insp-actors" hidden></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div style="height:32px;"></div>
+      </div>
+    </section>
+
+    <!-- 3. AGENTS VIEW -->
+    <section class="view" id="view-agents" data-od-id="agents">
+      <div class="chapter">
+        <div class="container row-between panel-head" style="align-items:flex-end;">
+          <div>
+            <p class="eyebrow" data-i="agentsEyebrow">Discovery</p>
+            <h1 data-i="agentsTitle">本地智能体发现</h1>
+            <p class="lead" style="margin-top:12px;" data-i="agentsLead">探测 CLI、App Server、桌面宿主与协议能力。不调用云端密钥。</p>
+          </div>
+          <button class="btn btn-primary" id="btn-rescan" data-od-id="cta-rescan" data-i="rescan">重新扫描</button>
+        </div>
+      </div>
+      <div class="workspace">
+        <div class="container">
+          <div class="seg" id="agent-filter" style="margin-bottom:20px;">
+            <button type="button" class="is-active" data-afilter="all" data-i="filterAll">全部</button>
+            <button type="button" data-afilter="ready" data-i="ready">就绪</button>
+            <button type="button" data-afilter="auth_required" data-i="authNeeded">需要认证</button>
+          </div>
+          <div class="agent-grid" id="agents-grid">
+            <div class="empty" style="grid-column:1/-1">
+              <h3 data-i="scanning">正在重新扫描本地宿主…</h3>
+              <p data-i="agentsLead">探测 CLI、App Server、桌面宿主与协议能力。不调用云端密钥。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. API VIEW -->
+    <section class="view" id="view-api" data-od-id="api">
+      <div class="chapter">
+        <div class="container row-between panel-head" style="align-items:flex-end;">
+          <div>
+            <p class="eyebrow" data-i="apiEyebrow">OpenAI-compatible</p>
+            <h1 data-i="apiTitle">API 提供方</h1>
+            <p class="lead" style="margin-top:12px;">密钥由 CredentialManager 加密保存，前端永不回传完整密钥。</p>
+          </div>
+          <button class="btn btn-primary" id="btn-add-api" data-od-id="cta-add-api" data-i="addApi">添加提供方</button>
+        </div>
+      </div>
+      <div class="workspace">
+        <div class="container">
+          <div class="api-grid" id="api-grid">
+            <div class="empty" style="grid-column:1/-1">
+              <h3 data-i="emptyApi">尚未配置提供方</h3>
+              <p data-i="emptyApiHint">可添加本地 Ollama 或其它兼容端点。</p>
+              <button class="btn btn-primary" id="empty-add-api" type="button" data-i="addApi">添加提供方</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. AGENT / PROFILE LIBRARY VIEW -->
+    <section class="view" id="view-personas" data-od-id="personas">
+      <div class="chapter">
+        <div class="container row-between" style="align-items:flex-end;gap:20px;">
+          <div>
+            <p class="eyebrow" data-i="personaEyebrow">Compiled artifacts</p>
+            <h1 data-i="personaTitle">人物 / 档案库</h1>
+            <p class="lead" style="margin-top:12px;" data-i="personaLead">统一管理人物、组织、机构与群体 Agent 档案；Persona 仍由正式证据、记忆与编译链路提供权威内容。</p>
+          </div>
+          <div class="row" style="gap:8px;">
+            <button class="btn btn-secondary" id="btn-create-profile" type="button">创建档案</button>
+            <button class="btn btn-primary" id="btn-create-persona" type="button">创建人格</button>
+          </div>
+        </div>
+      </div>
+      <div class="workspace">
+        <div class="container">
+          <div class="grid-2" style="gap:10px;margin-bottom:20px;max-width:900px;">
+            <div class="field">
+              <label for="persona-q" data-i="searchPersona">搜索档案</label>
+              <input class="input" id="persona-q" placeholder="输入名称、slug 或简介过滤..." />
+            </div>
+            <div class="field">
+              <label for="profile-type-filter">类型</label>
+              <select class="input" id="profile-type-filter">
+                <option value="">全部类型</option>
+                <option value="persona">人格</option>
+                <option value="organization">组织</option>
+                <option value="institution">机构</option>
+                <option value="collective">群体</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="profile-status-filter">状态</label>
+              <select class="input" id="profile-status-filter">
+                <option value="">全部状态</option>
+                <option value="compiled" data-i="optCompiled">已编译</option>
+                <option value="completed_with_gaps" data-i="optCompletedGaps">已完成（有缺口）</option>
+                <option value="researching" data-i="optResearching">研究中</option>
+                <option value="ready" data-i="optReady">就绪</option>
+                <option value="draft" data-i="optDraft">草稿</option>
+                <option value="error" data-i="optError">错误</option>
+                <option value="archived" data-i="optArchived">已归档</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="profile-sort">排序</label>
+              <select class="input" id="profile-sort">
+                <option value="updated_at">最近更新</option>
+                <option value="source_count">来源数量</option>
+                <option value="evidence_count">证据数量</option>
+                <option value="display_name">名称</option>
+              </select>
+            </div>
+          </div>
+          <section class="card" id="profile-task-center" style="margin-bottom:20px;padding:14px;background:var(--surface);">
+            <div class="row-between" style="align-items:flex-start;gap:12px;">
+              <div>
+                <strong>后台任务中心</strong>
+                <p class="meta" style="margin-top:4px;">页面关闭或刷新不会丢失人格创建 / 档案升级任务。</p>
+                <div class="task-center-counts" style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;">
+                  <span class="tag" id="profile-task-active-count">进行中：0</span>
+                  <span class="tag" id="profile-task-failed-count">失败：0</span>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <select class="input" id="profile-task-cleanup-status" aria-label="清理范围" style="width:auto;min-width:126px;padding:5px 8px;font-size:12px;">
+                  <option value="all">清理所有已结束</option>
+                  <option value="failed">清理失败任务</option>
+                  <option value="completed">清理已完成任务</option>
+                  <option value="cancelled">清理已取消任务</option>
+                </select>
+                <button type="button" class="btn btn-sm btn-ghost" id="profile-task-cleanup">清理已结束</button>
+                <button type="button" class="btn btn-sm btn-ghost" id="profile-task-refresh">刷新</button>
+              </div>
+            </div>
+            <div class="task-center-tabs" style="display:flex;gap:6px;margin-top:14px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-sm btn-ghost is-active" data-background-filter="all">全部</button>
+              <button type="button" class="btn btn-sm btn-ghost" data-background-filter="active">进行中</button>
+              <button type="button" class="btn btn-sm btn-ghost" data-background-filter="failed">失败</button>
+              <button type="button" class="btn btn-sm btn-ghost" data-background-filter="completed">已完成</button>
+            </div>
+            <div id="profile-task-list" class="stack" style="margin-top:10px;gap:8px;"><p class="meta">暂无后台任务</p></div>
+            <div class="row-between" style="margin-top:12px;gap:10px;">
+              <span class="meta" id="profile-task-page-label">结束任务历史：第 1 页</span>
+              <div style="display:flex;gap:6px;">
+                <button type="button" class="btn btn-sm btn-ghost" id="profile-task-prev">上一页</button>
+                <button type="button" class="btn btn-sm btn-ghost" id="profile-task-next">下一页</button>
+              </div>
+            </div>
+          </section>
+          <div class="persona-grid" id="personas-grid">
+            <div class="empty" style="grid-column:1/-1">
+              <h3 data-i="emptyPersona">没有匹配的人物</h3>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="pagefoot" data-od-id="footer" style="padding:28px 0 40px;color:var(--muted);font-size:12px;border-top:1px solid var(--border);">
+    <div class="container row-between">
+      <span data-i="footerNote">本地优先 · 真实协议与因果推演系统</span>
+      <span class="meta" data-i="footerNote">本地优先 · 真实协议与因果推演系统</span>
+    </div>
+  </footer>
+
+  <!-- MODALS -->
+  <dialog class="sheet" id="dlg-api">
+    <form class="sheet-body" id="form-api">
+      <h3 data-i="addApi">添加提供方</h3>
+      <div class="stack" style="margin-top:16px;">
+        <div class="field">
+          <label for="api-name" data-i="apiName">名称</label>
+          <input class="input" id="api-name" required />
+        </div>
+        <div class="field">
+          <label for="api-url" data-i="apiUrl">Base URL</label>
+          <input class="input" id="api-url" placeholder="http://localhost:11434/v1" required />
+        </div>
+        <div class="field">
+          <label for="api-provider" data-i="labelProvider">提供方</label>
+          <select class="input" id="api-provider">
+            <option value="openai">OpenAI</option>
+            <option value="openai_compatible" data-i="optOpenAICompatible">OpenAI 兼容</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="gemini">Gemini / Google</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="grok">Grok</option>
+            <option value="custom" data-i="optCustomEndpoint">自定义端点</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="api-env">API Key</label>
+          <input class="input" id="api-env" type="password" autocomplete="new-password" placeholder="仅在保存时提交" />
+        </div>
+          <div class="field">
+            <label for="api-model" data-i="apiModel">默认模型（可选）</label>
+            <input class="input" id="api-model" />
+          </div>
+          <div class="field">
+            <label for="api-reasoning-mode">Reasoning 能力</label>
+            <select class="input" id="api-reasoning-mode">
+              <option value="auto" selected>自动检测（未知时保持默认）</option>
+              <option value="default">使用 Provider 默认</option>
+              <option value="manual">手动配置已确认选项</option>
+            </select>
+          </div>
+          <div class="field" id="api-reasoning-manual-wrap" hidden>
+            <label for="api-reasoning-efforts">支持选项（逗号分隔）</label>
+            <input class="input" id="api-reasoning-efforts" placeholder="none, low, medium, high, xhigh, max, ultra" />
+            <label for="api-reasoning-default" class="meta" style="display:block;margin-top:6px;">默认选项（可选）</label>
+            <input class="input" id="api-reasoning-default" placeholder="例如 medium" />
+            <p class="meta" style="margin-top:5px;">优先读取 Provider 的模型能力元数据；元数据缺失时可填写已确认值，也支持 Provider 新增的 effort 名称。</p>
+          </div>
+          <p class="error" id="api-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;">
+          <button type="button" class="btn btn-ghost" id="api-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" data-i="save">保存</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-confirm">
+    <div class="sheet-body">
+      <h3 id="confirm-title"></h3>
+      <p class="lead" id="confirm-body" style="margin:12px 0 22px;"></p>
+      <div class="row" style="justify-content:flex-end;">
+        <button type="button" class="btn btn-ghost" id="confirm-no" data-i="cancel">取消</button>
+        <button type="button" class="btn btn-secondary" id="confirm-yes"></button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-persona" style="width:min(560px, calc(100% - 32px));">
+    <div class="sheet-body" id="persona-detail"></div>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-persona-create" style="width:min(760px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-persona-create">
+      <div class="row-between" style="align-items:flex-start;gap:16px;">
+        <div>
+          <h3>创建人格</h3>
+          <p class="meta" style="margin-top:6px;">所有输出都会进入 Evidence → ResearchArtifact → 八维 Compilation 正式链路。</p>
+        </div>
+        <button type="button" class="btn btn-text" id="persona-create-close">关闭</button>
+      </div>
+      <div class="stack" style="margin-top:18px;">
+        <div class="grid-2">
+          <div class="field">
+            <label for="pc-display-name">名称</label>
+            <input class="input" id="pc-display-name" required placeholder="例如：Steve Jobs" />
+          </div>
+          <div class="field">
+            <label for="pc-aliases">别名（逗号分隔）</label>
+            <input class="input" id="pc-aliases" placeholder="Jobs, Steven Paul Jobs" />
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="pc-persona-type">人物类型</label>
+            <select class="input" id="pc-persona-type">
+              <option value="public_living_person">公开在世人物</option>
+              <option value="public_historical_person">公开历史人物</option>
+              <option value="private_living_person">私人在世人物</option>
+              <option value="private_deceased_person">私人已故人物</option>
+              <option value="fictional_or_synthetic_person">虚构 / 原创人物</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pc-creation-mode">创建方式</label>
+            <select class="input" id="pc-creation-mode">
+              <option value="public_research">联网深度研究</option>
+              <option value="private_materials">本地资料</option>
+              <option value="guided_interview">本地资料 + 引导访谈</option>
+              <option value="fictional">作品 / 手工设定</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="pc-birth-date">出生日期（可选）</label>
+            <input class="input" id="pc-birth-date" type="date" />
+          </div>
+          <div class="field">
+            <label for="pc-death-date">去世日期（可选）</label>
+            <input class="input" id="pc-death-date" type="date" />
+          </div>
+          <div class="field">
+            <label for="pc-data-cutoff-date">知识截止日期（可选）</label>
+            <input class="input" id="pc-data-cutoff-date" type="date" />
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="pc-runtime-source">运行来源</label>
+            <select class="input" id="pc-runtime-source">
+              <option value="local_cli">本地 CLI</option>
+              <option value="api" data-i="optApiProvider">API 提供方</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pc-agent" data-i="labelAgentProvider">智能体 / 提供方</label>
+            <select class="input" id="pc-agent"></select>
+          </div>
+          <div class="field">
+            <label for="pc-model" data-i="labelModel">模型</label>
+            <select class="input" id="pc-model"></select>
+          </div>
+          <div class="field">
+            <label for="pc-reasoning" data-i="labelReasoning">思考强度</label>
+            <select class="input" id="pc-reasoning"></select>
+          </div>
+        </div>
+        <p class="meta" id="pc-reasoning-capability" style="margin-top:6px;"></p>
+        <div class="field" id="pc-policy-wrap">
+          <label for="pc-policy">公开研究策略</label>
+          <select class="input" id="pc-policy">
+            <option value="deep">Deep（自适应，至少 30，目标 60+，推荐）</option>
+            <option value="standard">Standard（约 25 个独立高质量来源）</option>
+            <option value="exhaustive">Exhaustive（通常 100+，持续扩展）</option>
+            <option value="custom">Custom（高级）</option>
+          </select>
+          <div id="pc-custom-policy" hidden class="grid-2" style="margin-top:8px;gap:8px;">
+            <label class="meta">最低独立来源<input class="input" id="pc-custom-min" type="number" min="1" value="30" /></label>
+            <label class="meta">目标来源<input class="input" id="pc-custom-target" type="number" min="1" value="60" /></label>
+            <label class="meta">软预算<input class="input" id="pc-custom-soft" type="number" min="1" value="100" /></label>
+            <label class="meta">硬预算<input class="input" id="pc-custom-hard" type="number" min="1" value="150" /></label>
+            <label class="meta">来源类别<input class="input" id="pc-custom-categories" type="number" min="1" value="6" /></label>
+            <label class="meta">每维证据<input class="input" id="pc-custom-dimension" type="number" min="1" value="4" /></label>
+          </div>
+          <p class="meta" id="pc-research-capability" style="margin-top:6px;"></p>
+        </div>
+        <div class="field" id="pc-materials-wrap" hidden>
+          <label for="pc-materials">本地资料（每行一段文本；文件可通过 API materials 上传）</label>
+          <textarea class="input" id="pc-materials" rows="5" placeholder="聊天记录、日记、访谈文字或角色设定…"></textarea>
+          <input class="input" id="pc-material-files" type="file" multiple accept=".txt,.md,.json,.jsonl,.csv,.html,.htm,.pdf,.docx" style="margin-top:8px;" />
+          <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;">
+            <input type="checkbox" id="pc-remote-consent" /> 允许将私人资料发送给远程模型 Provider
+          </label>
+        </div>
+        <div class="card" id="pc-progress" hidden style="background:var(--surface);padding:14px;">
+          <div class="row-between"><strong id="pc-stage">准备中</strong><span class="meta" id="pc-job-status"></span></div>
+          <div class="progress" style="margin-top:10px;"><div id="pc-progress-bar" class="progress-bar" style="width:0%"></div></div>
+          <div class="row" style="gap:14px;margin-top:10px;flex-wrap:wrap;">
+            <span class="tag" id="pc-sources">Sources: 0 / —</span>
+            <span class="tag" id="pc-independent-sources">Independent: 0 / —</span>
+            <span class="tag" id="pc-research-budget">Budget: —</span>
+            <span class="tag" id="pc-dimensions">Dimensions: 0 / 8</span>
+            <span class="tag" id="pc-artifacts">Artifacts: 0 / 8</span>
+            <span class="tag" id="pc-life-stages">Life stages: 0 / —</span>
+            <span class="tag" id="pc-primary-secondary">Primary / secondary: —</span>
+            <span class="tag" id="pc-information-gain">Recent gain: —</span>
+            <span class="tag" id="pc-evidence-units">Evidence units: 0</span>
+            <span class="tag" id="pc-fused-evidence">Fused: 0</span>
+            <span class="tag" id="pc-material-contradictions">Contradictions: 0</span>
+          </div>
+          <p class="meta" id="pc-stop-reason" style="margin-top:8px;"></p>
+          <details id="pc-coverage-details" style="margin-top:8px;">
+            <summary class="meta">查看覆盖缺口</summary>
+            <pre id="pc-gaps" class="meta" style="white-space:pre-wrap;margin-top:8px;"></pre>
+          </details>
+          <details id="pc-material-inspector" style="margin-top:8px;">
+            <summary class="meta">查看私有材料 Evidence Layer</summary>
+            <pre id="pc-material-stats" class="meta" style="white-space:pre-wrap;margin-top:8px;"></pre>
+          </details>
+          <p class="meta" id="pc-error" style="margin-top:10px;color:var(--danger);"></p>
+          <div class="row" id="pc-runtime-tags" style="gap:8px;margin-top:8px;flex-wrap:wrap;">
+            <span class="tag" id="pc-runtime-agent">Agent: —</span>
+            <span class="tag" id="pc-runtime-model">Model: —</span>
+            <span class="tag" id="pc-runtime-reasoning">Reasoning: —</span>
+            <span class="tag" id="pc-runtime-effective">Effective: —</span>
+            <span class="tag" id="pc-runtime-context">Context: —</span>
+          </div>
+          <details id="pc-context-details" style="margin-top:8px;">
+            <summary class="meta">Context 能力详情（Native / Requested / Effective / Usable）</summary>
+            <pre id="pc-runtime-context-detail" class="meta" style="white-space:pre-wrap;margin-top:8px;"></pre>
+          </details>
+          <p class="meta" id="pc-dimension-detail" style="margin-top:8px;"></p>
+          <details id="pc-checkpoint-details" style="margin-top:8px;">
+            <summary class="meta">最后成功检查点 / 批次复用</summary>
+            <pre id="pc-checkpoint" class="meta" style="white-space:pre-wrap;margin-top:8px;"></pre>
+          </details>
+          <details id="pc-history-details" style="margin-top:8px;">
+            <summary class="meta">执行历史（含更换模型记录）</summary>
+            <pre id="pc-execution-history" class="meta" style="white-space:pre-wrap;margin-top:8px;"></pre>
+          </details>
+          <div id="pc-interview" hidden style="margin-top:12px;">
+            <p id="pc-interview-question"></p>
+            <textarea class="input" id="pc-interview-answer" rows="3" placeholder="不知道可以填写：不清楚"></textarea>
+            <button type="button" class="btn btn-secondary" id="pc-interview-submit" style="margin-top:8px;">提交回答</button>
+          </div>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px;">
+            <button type="button" class="btn btn-ghost" id="pc-pause">暂停</button>
+            <button type="button" class="btn btn-ghost" id="pc-resume" hidden>继续</button>
+            <button type="button" class="btn btn-secondary" id="pc-resume-model" hidden>更换模型并继续</button>
+            <button type="button" class="btn btn-secondary" id="pc-continue" hidden>继续研究</button>
+            <button type="button" class="btn btn-secondary" id="pc-retry" hidden>重试当前阶段</button>
+            <button type="button" class="btn btn-secondary" id="pc-retry-model" hidden>更换模型后重试</button>
+            <button type="button" class="btn btn-danger" id="pc-cancel">取消任务</button>
+          </div>
+          <div id="pc-events" class="stack" style="margin-top:12px;max-height:160px;overflow:auto;font-size:12px;"></div>
+        </div>
+        <p class="error" id="pc-error-form" hidden></p>
+        <div class="row" style="justify-content:flex-end;gap:8px;">
+          <button type="button" class="btn btn-ghost" id="pc-cancel-create">取消</button>
+          <button type="submit" class="btn btn-primary" id="pc-start">开始创建</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-persona-creation-progress" style="width:min(760px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <div class="row-between" style="align-items:flex-start;gap:12px;">
+        <div><h3>Persona Creation 进度</h3><p class="meta">关闭此窗口不会取消后台任务，可在“人物 / 档案库”的任务中心恢复。</p></div>
+        <button type="button" class="btn btn-text" id="persona-creation-progress-close">关闭</button>
+      </div>
+      <div id="pc-progress-host" style="margin-top:14px;"></div>
+    </div>
+  </dialog>
+
+  <!-- UNIFIED PROFILE CREATION DIALOG (non-Persona profiles) -->
+  <dialog class="sheet" id="dlg-profile-create" style="width:min(680px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-profile-create">
+      <h3>创建 Agent 档案</h3>
+      <p class="meta" style="margin:6px 0 16px;">组织、机构与群体使用统一 Profile 抽象；人物 Persona 请使用“创建人格”以进入正式证据与八维编译链路。</p>
+      <div class="stack">
+        <div class="field">
+          <label for="profile-create-name">名称</label>
+          <input class="input" id="profile-create-name" required placeholder="例如：Apple、美国联邦政府、开发者社区" />
+        </div>
+        <div class="field">
+          <label for="profile-create-type">档案类型</label>
+          <select class="input" id="profile-create-type" required>
+            <option value="organization">组织</option>
+            <option value="institution">机构</option>
+            <option value="collective">群体</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="profile-create-summary">初始简介（可选，完成研究后会重新生成）</label>
+          <textarea class="input" id="profile-create-summary" rows="3" placeholder="仅作为初始草稿；正式简介由 Profile Summary Generator 生成。"></textarea>
+        </div>
+        <div class="grid-2" style="gap:10px;">
+          <div class="field">
+            <label for="profile-create-source">运行来源</label>
+            <select class="input" id="profile-create-source">
+              <option value="local_cli">本地 CLI</option>
+              <option value="api">API 提供方</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="profile-create-agent" data-i="labelAgentProvider">智能体 / 提供方</label>
+            <select class="input" id="profile-create-agent"></select>
+          </div>
+          <div class="field">
+            <label for="profile-create-model" data-i="labelModel">模型</label>
+            <select class="input" id="profile-create-model"></select>
+          </div>
+          <div class="field">
+            <label for="profile-create-reasoning" data-i="labelReasoning">思考强度</label>
+            <select class="input" id="profile-create-reasoning"></select>
+          </div>
+        </div>
+        <p class="meta" id="profile-create-reasoning-capability" style="margin-top:6px;"></p>
+        <p class="meta" id="profile-create-capability"></p>
+        <p class="error" id="profile-create-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;gap:8px;">
+          <button type="button" class="btn btn-ghost" id="profile-create-close">取消</button>
+          <button type="submit" class="btn btn-primary" id="profile-create-submit">创建并研究</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- PROFILE ENRICHMENT DIALOG -->
+  <dialog class="sheet" id="dlg-profile-enrich" style="width:min(680px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-profile-enrich">
+      <h3 id="profile-enrich-title">升级档案</h3>
+      <p class="meta" id="profile-enrich-target" style="margin:6px 0 16px;"></p>
+      <input type="hidden" id="profile-enrich-id" />
+      <div class="stack">
+        <div class="field">
+          <label for="profile-enrich-scope">升级目标</label>
+          <select class="input" id="profile-enrich-scope">
+            <option value="full_refresh">全面升级</option>
+            <option value="more_sources">补充来源</option>
+            <option value="fill_dimension_gaps">填补覆盖缺口</option>
+            <option value="fill_life_stage_gaps">补充人生阶段 / 历史阶段</option>
+            <option value="enrich_relationships">强化关系与情感</option>
+            <option value="enrich_expression">强化表达 DNA</option>
+            <option value="enrich_decision_style">强化决策风格</option>
+            <option value="add_user_materials">使用新上传材料</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="profile-enrich-input-mode">输入来源</label>
+          <select class="input" id="profile-enrich-input-mode">
+            <option value="local_materials">仅使用本地材料（仍调用选定 Agent）</option>
+            <option value="web_research">联网继续研究</option>
+            <option value="hybrid">本地材料 + 联网研究</option>
+          </select>
+        </div>
+        <div class="grid-2" style="gap:10px;">
+          <div class="field">
+            <label for="profile-enrich-source">运行来源</label>
+            <select class="input" id="profile-enrich-source">
+              <option value="local_cli">本地 CLI</option>
+              <option value="api">API 提供方</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="profile-enrich-agent" data-i="labelAgentProvider">智能体 / 提供方</label>
+            <select class="input" id="profile-enrich-agent"></select>
+          </div>
+          <div class="field">
+            <label for="profile-enrich-model" data-i="labelModel">模型</label>
+            <select class="input" id="profile-enrich-model"></select>
+          </div>
+          <div class="field">
+            <label for="profile-enrich-reasoning" data-i="labelReasoning">思考强度</label>
+            <select class="input" id="profile-enrich-reasoning"></select>
+          </div>
+        </div>
+        <p class="meta" id="profile-enrich-reasoning-capability" style="margin-top:6px;"></p>
+        <p class="meta" id="profile-enrich-capability"></p>
+        <textarea class="input" id="profile-enrich-materials" rows="4" placeholder="可选：新增聊天记录、访谈、文件摘录或研究线索。"></textarea>
+        <input class="input" id="profile-enrich-files" type="file" multiple accept=".txt,.md,.json,.jsonl,.csv,.html,.htm,.pdf,.docx" />
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+          <input type="checkbox" id="profile-enrich-remote-consent" /> 允许将新增私人资料发送给远程模型 Provider
+        </label>
+        <p class="meta" id="profile-enrich-submit-status" role="status" aria-live="polite" hidden></p>
+        <p class="error" id="profile-enrich-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;gap:8px;">
+          <button type="button" class="btn btn-ghost" id="profile-enrich-close">取消</button>
+          <button type="submit" class="btn btn-primary" id="profile-enrich-submit">开始升级</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-profile-enrich-progress" style="width:min(680px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <div class="row-between"><h3 id="profile-enrich-progress-title">升级人格进度</h3><button class="btn btn-text" id="profile-enrich-progress-close">关闭</button></div>
+      <p class="meta" id="profile-enrich-progress-runtime"></p>
+      <p id="profile-enrich-progress-stage" style="margin:14px 0 8px;">任务已创建</p>
+      <div class="progress"><div id="profile-enrich-progress-bar" class="progress-bar" style="width:0%"></div></div>
+      <div class="row-between meta" style="margin-top:10px;"><span id="profile-enrich-progress-materials">材料：0</span><span id="profile-enrich-progress-agents">Agent 调用：0</span><span id="profile-enrich-progress-dimensions">八维：0 / 8</span></div>
+      <p class="meta" id="profile-enrich-progress-result" style="margin-top:14px;"></p>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:12px;">
+        <button type="button" class="btn btn-ghost" id="profile-enrich-progress-pause" hidden>暂停</button>
+        <button type="button" class="btn btn-ghost" id="profile-enrich-progress-resume" hidden>继续</button>
+        <button type="button" class="btn btn-secondary" id="profile-enrich-progress-retry" hidden>重试当前阶段</button>
+        <button type="button" class="btn btn-danger" id="profile-enrich-progress-cancel" hidden>取消任务</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- ACTION INJECTION MODAL -->
+  <dialog class="sheet" id="dlg-world-action">
+    <form class="sheet-body" id="form-world-action">
+      <h3 data-i="injectActionTitle">注入 Actor 战略动作</h3>
+      <div class="stack" style="margin-top:16px;">
+        <div class="field">
+          <label for="action-actor" data-i="actionActorLabel">行动主体 (Actor)</label>
+          <select class="input" id="action-actor" required></select>
+        </div>
+        <div class="field">
+          <label for="action-type" data-i="actionTypeLabel">动作类型</label>
+          <select class="input" id="action-type" required>
+            <option value="launch_project">启动战略项目 (Launch Project)</option>
+            <option value="invest">资本投入 (Invest)</option>
+            <option value="hire">团队扩张与招聘 (Hire)</option>
+            <option value="research">技术研发 (Research Breakthrough)</option>
+            <option value="negotiate">商业谈判与结盟 (Negotiate)</option>
+            <option value="decide">行政裁决 (Executive Decision)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="action-desc" data-i="actionDescLabel">动作描述</label>
+          <input class="input" id="action-desc" placeholder="例如：投入 40 亿美元启动专用数据中心 TPU 计划" required />
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="action-target" data-i="actionTargetLabel">目标/标的</label>
+            <input class="input" id="action-target" placeholder="tsmc_dedicated_line / datacenter" />
+          </div>
+          <div class="field">
+            <label for="action-amount" data-i="actionAmountLabel">资金规模 ($B)</label>
+            <input class="input" id="action-amount" type="number" step="0.1" value="2.0" />
+          </div>
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button type="button" class="btn btn-ghost" id="action-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" data-i="execute">执行动作并生效</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- SCENE DIALOGUE MODAL -->
+  <dialog class="sheet" id="dlg-world-scene">
+    <form class="sheet-body" id="form-world-scene">
+      <h3 data-i="sceneTitle">触发 Actor 面对面场景会话</h3>
+      <p class="meta" style="margin:6px 0 16px;" data-i="sceneLead">跨 Actor 对话将复用 Tavern Multi-Agent Room 运行，会后自动回写记忆与好感度。</p>
+      <div class="stack">
+        <div class="field">
+          <label data-i="sceneActorsLabel">参与 Actor (选择 2 个或以上)</label>
+          <div id="scene-actors-checkboxes" class="stack" style="gap:8px;max-height:160px;overflow-y:auto;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);"></div>
+        </div>
+        <div class="field">
+          <label for="scene-topic" data-i="sceneTopicLabel">会谈议题</label>
+          <input class="input" id="scene-topic" placeholder="例如：商讨先进制程产能独占与 CUDA 互通协议" required />
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button type="button" class="btn btn-ghost" id="scene-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" data-i="startScene">进入场景讨论</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- EVALUATION MODAL -->
+  <dialog class="sheet" id="dlg-world-eval" style="width:min(640px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <h3 data-i="evalTitle">多分支情景评估 (Scenario Distribution)</h3>
+      <p class="meta" style="margin:6px 0 16px;" data-i="evalHelp">定义评估问题并在多个独立分支中进行多维加权推演打分（不产生虚假真实概率）。</p>
+      <div class="stack" id="eval-form-view">
+        <div class="field">
+          <label for="eval-question" data-i="evalQuestionLabel">推演评估命题</label>
+          <input class="input" id="eval-question" value="Apple 是否能在自研 AI 芯片领域超越 NVIDIA 的生态统治？" />
+        </div>
+        <div class="field">
+          <label for="eval-branches" data-i="evalBranchesLabel">模拟分支采样数 (N)</label>
+          <input class="input" id="eval-branches" type="number" min="2" max="10" value="3" />
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:12px;">
+          <button type="button" class="btn btn-ghost" id="eval-cancel" data-i="cancel">关闭</button>
+          <button type="button" class="btn btn-primary" id="btn-run-eval" data-i="runEval">运行多分支评估</button>
+        </div>
+      </div>
+      <div id="eval-result-view" hidden class="stack" style="margin-top:16px;"></div>
+    </div>
+  </dialog>
+
+  <!-- CAUSAL GRAPH MODAL -->
+  <dialog class="sheet" id="dlg-world-causal" style="width:min(680px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <h3 data-i="causalTitle">因果图谱溯源 (Causal DAG Query)</h3>
+      <p class="meta" style="margin:6px 0 16px;" data-i="causalLead">输入任意目标节点或终局结果，逆向提取从根因分歧到最终局面的完整因果链条。</p>
+      <div class="row" style="gap:8px;margin-bottom:16px;">
+        <input class="input" id="causal-target-input" placeholder="例如：NVIDIA 2030 生态统治 / Apple 芯片延迟 / divergence" value="divergence" />
+        <button class="btn btn-primary" id="btn-query-causal" data-i="query">回溯推导</button>
+      </div>
+      <div id="causal-chain-results" class="stack" style="max-height:360px;overflow-y:auto;"></div>
+      <div class="row" style="justify-content:flex-end;margin-top:16px;">
+        <button type="button" class="btn btn-secondary" id="causal-close" data-i="close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- REPLAY TIMELINE MODAL -->
+  <dialog class="sheet" id="dlg-world-replay" style="width:min(720px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <h3 data-i="replayTitle">世界历史轨迹回放 (World Historical Scrub)</h3>
+      <p class="meta" style="margin:6px 0 16px;" data-i="replayLead">沿时间轴双向拖拽回放，审查历史关键分水岭与状态演进。</p>
+      <div class="stack" style="gap:16px;">
+        <div class="row-between">
+          <span class="tag solid" id="replay-time-display">2011-10-05</span>
+          <span class="meta num" id="replay-step-display">Step 0 / 0</span>
+        </div>
+        <input type="range" id="replay-slider" min="0" max="0" value="0" style="width:100%;cursor:pointer;" />
+        <div class="card" style="padding:16px;background:var(--surface);">
+          <h4 id="replay-step-title" data-i="snapshotState">快照状态</h4>
+          <p class="meta" id="replay-step-diff" style="margin:4px 0 10px;"></p>
+          <div id="replay-step-events" class="stack" style="gap:8px;max-height:180px;overflow-y:auto;"></div>
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:16px;">
+        <button type="button" class="btn btn-secondary" id="replay-close" data-i="close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- SIMULATION REPORT MODAL -->
+  <dialog class="sheet" id="dlg-world-report" style="width:min(800px, calc(100% - 32px));">
+    <div class="sheet-body">
+      <div class="row-between" style="margin-bottom:12px;">
+        <h3 data-i="reportTitle">平行世界推演分析报告 (Simulation Report)</h3>
+        <button class="btn btn-sm btn-ghost" id="btn-copy-report" data-i="copy">复制报告</button>
+      </div>
+      <div id="report-content-view" style="max-height:480px;overflow-y:auto;background:var(--surface);padding:18px;border-radius:var(--radius-md);font-size:13px;line-height:1.6;white-space:pre-wrap;font-family:var(--font-mono);"></div>
+      <div class="row" style="justify-content:flex-end;margin-top:16px;">
+        <button type="button" class="btn btn-secondary" id="report-close" data-i="close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-narr-new" style="width:min(720px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-narr-new">
+      <h3 data-i="narrNew">新建作品</h3>
+      <p class="meta" style="margin-top:6px;" data-i="narrNewHelp">填写完整作品设定后再开始。默认微短剧 60 集、90–120 秒，可随时修改。</p>
+      <div class="stack" style="margin-top:16px;gap:12px;">
+        <div class="grid-2 narr-form-grid">
+          <div class="field">
+            <label for="narr-new-title">标题 *</label>
+            <input class="input" id="narr-new-title" required />
+          </div>
+          <div class="field">
+            <label for="narr-new-format">作品类型</label>
+            <select class="input" id="narr-new-format">
+              <option value="micro_drama" selected>微短剧</option>
+              <option value="series">剧集</option>
+              <option value="novel">长篇</option>
+              <option value="interactive_story">互动故事</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="narr-new-logline">Logline *</label>
+          <textarea class="textarea" id="narr-new-logline" rows="2" required></textarea>
+        </div>
+        <div class="field">
+          <label for="narr-new-description">完整故事简介</label>
+          <textarea class="textarea" id="narr-new-description" rows="3"></textarea>
+        </div>
+        <div class="grid-2 narr-form-grid">
+          <div class="field">
+            <label for="narr-new-genre">Genre（逗号分隔）</label>
+            <input class="input" id="narr-new-genre" />
+          </div>
+          <div class="field">
+            <label for="narr-new-tone">Tone（逗号分隔）</label>
+            <input class="input" id="narr-new-tone" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="narr-new-audience">目标受众</label>
+          <input class="input" id="narr-new-audience" />
+        </div>
+        <div class="grid-3 narr-form-grid">
+          <div class="field">
+            <label for="narr-new-episodes">计划集数</label>
+            <input class="input" id="narr-new-episodes" type="number" min="1" value="60" />
+          </div>
+          <div class="field">
+            <label for="narr-new-dur-min">最短时长（秒）</label>
+            <input class="input" id="narr-new-dur-min" type="number" min="1" value="90" />
+          </div>
+          <div class="field">
+            <label for="narr-new-dur-max">最长时长（秒）</label>
+            <input class="input" id="narr-new-dur-max" type="number" min="1" value="120" />
+          </div>
+        </div>
+        <p class="error" id="narr-new-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;">
+          <button type="button" class="btn btn-ghost" id="narr-new-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" data-i="narrCreate">创建</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-narr-runtime" style="width:min(760px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-narr-runtime">
+      <div class="row-between" style="gap:10px;flex-wrap:wrap;">
+        <h3 data-i="narrRuntimeTitle">创作模型</h3>
+        <button type="button" class="btn btn-sm btn-secondary" id="btn-narr-runtime-refresh">↻ 刷新 Runtime</button>
+      </div>
+      <p class="meta" style="margin-top:6px;" data-i="narrRuntimeHelp">默认只设置一个创作模型。AI Agent 失败将直接报错，不会静默使用规则模式。</p>
+      <div class="stack" style="margin-top:16px;gap:14px;">
+        <section class="narr-runtime-default">
+          <h4 data-i="narrRuntimeDefault">默认创作模型</h4>
+          <div class="field">
+            <label>来源</label>
+            <div class="row" style="gap:12px;margin-top:4px;flex-wrap:wrap;">
+              <label class="narr-radio"><input type="radio" name="narr-default-source" value="local_cli" checked /> 本地 CLI</label>
+              <label class="narr-radio"><input type="radio" name="narr-default-source" value="api" /> API</label>
+            </div>
+          </div>
+          <div class="grid-3 narr-form-grid">
+            <div class="field">
+              <label for="narr-default-agent" data-i="labelAgent">智能体</label>
+              <select class="input" id="narr-default-agent"></select>
+            </div>
+            <div class="field">
+              <label for="narr-default-model" data-i="labelModel">模型</label>
+              <select class="input" id="narr-default-model"></select>
+            </div>
+            <div class="field">
+              <label for="narr-default-reasoning" data-i="labelReasoning">思考强度</label>
+              <select class="input" id="narr-default-reasoning"></select>
+            </div>
+          </div>
+          <p class="meta" id="narr-default-reasoning-notice"></p>
+        </section>
+        <details class="narr-advanced-block" id="narr-runtime-overrides">
+          <summary data-i="narrRuntimeOverrides">高级：按阶段覆盖</summary>
+          <p class="meta" data-i="narrRuntimeOverrideHelp">每个阶段默认继承默认创作模型。打开覆盖后才单独选择。</p>
+          <div id="narr-runtime-stage-list" class="stack" style="gap:10px;margin-top:10px;"></div>
+        </details>
+        <details class="narr-advanced-block" id="narr-generation-mode-block">
+          <summary data-i="genMode">生成模式</summary>
+          <select class="input" id="narr-generation-mode" style="max-width:280px;margin-top:8px;">
+            <option value="agent" selected>AI Agent</option>
+            <option value="deterministic" data-i="optDeterministic">确定性 / 离线</option>
+            <option value="auto" class="narr-auto-option" hidden>AUTO（仅无配置时离线）</option>
+          </select>
+          <p class="meta" style="margin-top:6px;" data-i="narrGenModeHelp">AI Agent失败将直接报错，不会静默使用规则模式。</p>
+        </details>
+        <details class="narr-advanced-block" id="narr-writer-config-block">
+          <summary data-i="narrWriterAdvanced">高级创作工具 · Writer Room</summary>
+          <p class="meta" data-i="narrWriterHelp">不会默认使用故事人物当编剧。请选择独立的编剧 Persona 与角色。</p>
+          <div id="narr-writer-setup" class="stack" style="gap:8px;margin-top:8px;"></div>
+        </details>
+        <label class="narr-check">
+          <input type="checkbox" id="narr-advanced-mode" />
+          <span data-i="narrAdvancedMode">显示技术详情（Runtime / World / Branch / JSON）</span>
+        </label>
+        <p class="error" id="narr-runtime-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;">
+          <button type="button" class="btn btn-ghost" id="narr-runtime-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" id="btn-narr-runtime-save" data-i="save">保存</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="sheet" id="dlg-narr-char" style="width:min(640px, calc(100% - 32px));">
+    <form class="sheet-body" id="form-narr-char">
+      <h3 data-i="narrCharAdd">添加角色</h3>
+      <div class="stack" style="margin-top:16px;gap:12px;">
+        <fieldset class="narr-char-mode">
+          <legend>添加方式</legend>
+          <label class="narr-radio"><input type="radio" name="narr-char-mode" value="library" checked /> 从人格库添加</label>
+          <label class="narr-radio"><input type="radio" name="narr-char-mode" value="extra" /> 创建普通剧情角色</label>
+        </fieldset>
+        <div id="narr-char-library-panel">
+          <div class="field">
+            <label for="narr-char-search">搜索人格</label>
+            <input class="input" id="narr-char-search" placeholder="名称 / 简介" />
+          </div>
+          <div id="narr-char-persona-list" class="narr-persona-picker"></div>
+          <div id="narr-char-persona-preview" class="narr-persona-preview" hidden></div>
+          <div class="field">
+            <label for="narr-char-role">剧情身份 / role</label>
+            <input class="input" id="narr-char-role" placeholder="主角 / 对手 / 证人" />
+          </div>
+          <div class="field">
+            <label for="narr-char-desc">故事内简介</label>
+            <textarea class="textarea" id="narr-char-desc" rows="3" placeholder="这个人物在当前作品中的剧情身份，不会覆盖人格库内容。"></textarea>
+          </div>
+        </div>
+        <div id="narr-char-extra-panel" hidden>
+          <p class="meta">未绑定 Persona。该角色由剧情 / Screenwriter 控制，不参与完整 Persona Runtime。</p>
+          <div class="field">
+            <label for="narr-char-name">名称 *</label>
+            <input class="input" id="narr-char-name" />
+          </div>
+          <div class="field">
+            <label for="narr-char-extra-role">剧情作用</label>
+            <input class="input" id="narr-char-extra-role" placeholder="HR / 司机 / 前台" />
+          </div>
+          <div class="field">
+            <label for="narr-char-extra-desc">简介</label>
+            <textarea class="textarea" id="narr-char-extra-desc" rows="3"></textarea>
+          </div>
+        </div>
+        <p class="error" id="narr-char-error" hidden></p>
+        <div class="row" style="justify-content:flex-end;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-ghost" id="narr-char-cancel" data-i="cancel">取消</button>
+          <button type="submit" class="btn btn-primary" id="narr-char-submit">添加并绑定</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+
+  <script src="/static/room_ui_state.js?v=1.0.1"></script>
+  <script src="/static/safe_markdown.js?v=1.0.0"></script>
+  <script src="/static/app.js?v=2.7.4"></script>
+</body>
+</html>
