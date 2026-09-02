@@ -121,12 +121,6 @@ Persona Continuum 未复制 Nuwa Skill、MiroFish 或 OASIS 的代码、提示�
 领域模型、SQLite 持久层、Persona 运行时、记忆系统、情绪与关系引擎、分支隔离、产物 Schema
 及 MCP 实现均为原创。其他设计依据记录在 [`docs/`](docs/) 下的相关文档中。
 
-### 性能原则
-
-Persona Continuum 只优化执行策略，不降低研究深度、证据标准、模型选择、推理级别、
-来源追踪、矛盾处理和质量门槛。能力缓存、持久运行时池、增量研究、优先级调度和上下文增量
-传输都必须保持同一质量策略与失败契约。只读性能摘要位于 `GET /api/performance/summary`。
-
 ---
 
 ## English
@@ -416,30 +410,6 @@ Private Persona material intelligence is documented in
 raw EvidenceSource records remain authoritative while message/paragraph-level
 evidence, deduplication, fusion, contradictions, episodes and full-corpus
 retrieval feed the existing eight-dimensional compiler.
-
-## Performance
-
-Persona Continuum keeps local-first and never lowers quality to go faster: the
-**Quality Policy is fixed** (research depth, evidence standards, dimensions,
-reasoning level, model choice, provenance, lifecycle/contradiction/negative
-evidence, compile + validate, parallel-world actor fidelity). Only the
-**Execution Strategy** is optimized — repeated model discovery, per-call process
-spawning, full re-analysis each round, serial research/room/world waits,
-duplicate memory retrieval, and per-event full-row rewrites.
-
-- `src/persona_continuum/performance/` — capability cache, persistent runtime
-  pool, research source/query caches, priority execution scheduler, tracer.
-- Room transcript cursor + `RoomContextManager` + `StaticPersonaKernel` send a
-  persistent Agent only the dialogue delta (rehydrating after a runtime restart)
-  instead of re-uploading the whole history.
-- Persona Creation analyzes only new evidence each round and still runs one
-  Final Global Audit over all evidence before compile/validate.
-- Config: `[performance]` keys default to `Automatic`;
-  `Config.legacy_execution()` reproduces the pre-optimization execution path
-  under the same Quality Policy for A/B comparison.
-- Read-only observability: `GET /api/performance/summary`, or
-  `uv run python scripts/performance_benchmark.py` for a before/after table.
-- Full write-up: [`docs/reports/acceptance/PERFORMANCE_OPTIMIZATION_ACCEPTANCE.md`](docs/reports/acceptance/PERFORMANCE_OPTIMIZATION_ACCEPTANCE.md).
 
 ## Acknowledgements and Inspirations
 
