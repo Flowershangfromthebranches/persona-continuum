@@ -1085,23 +1085,7 @@ class WebAPIHandler:
             for p in participants_data:
                 participants.append(ParticipantSlot.model_validate(p))
             if not participants:
-                personas = self.continuum.personas.list()
-                selected = list(personas)
-                participants = [
-                    ParticipantSlot(
-                        participant_id=f"slot_{index}",
-                        persona_id=persona.id,
-                        display_name=persona.display_name,
-                        runtime_selection="default",
-                        model_selection="default",
-                    )
-                    for index, persona in enumerate(selected[:4])
-                ]
-                if len(participants) < 2:
-                    return json_err(
-                        "Autonomous room requires at least two compiled personas",
-                        status_code=400,
-                    )
+                return json_err("请至少添加并配置一个参与者席位。", status_code=400)
 
             dir_cfg_data = body.get("director_config", {})
             dir_cfg = DirectorConfig.model_validate(dir_cfg_data) if dir_cfg_data else None

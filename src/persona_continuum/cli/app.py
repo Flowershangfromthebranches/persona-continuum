@@ -203,11 +203,33 @@ def continuation_list(persona_id: str) -> None:
 
 
 @app.command()
-def export(persona_id: str, output: Path | None = None) -> None:
+def export(
+    persona_id: str,
+    output: Path | None = None,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="full, identity_only, redacted, or public_compiled",
+        ),
+    ] = "full",
+) -> None:
     continuum = build()
-    path = continuum.personas.export_persona(persona_id, output)
+    path = continuum.personas.export_persona(persona_id, output, mode=mode)
     continuum.close()
     typer.echo(str(path))
+
+
+@app.command("import")
+def import_package(package: Path) -> None:
+    """Import a validated Persona package into the local repository."""
+
+    continuum = build()
+    try:
+        persona = continuum.personas.import_persona(package)
+        typer.echo(persona.id)
+    finally:
+        continuum.close()
 
 
 @app.command("web")

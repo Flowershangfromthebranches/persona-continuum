@@ -72,23 +72,21 @@ def test_builtin_divination_template_v3_shared_context(app: Any) -> None:
     background = template.shared_context.background
     assert "Taibu" not in background
     assert "MCP" not in background
-    assert "排盘" not in background
-    assert "知识解释" not in background
     assert "工具" not in background
     # The V3 principle: experts own their own computation skills.
-    assert "每位专家本身掌握自己的专业计算、推演与解释方法" in background
+    assert "每位专家本身掌握所属体系的理论、计算、排盘、推演和判读方法" in background
 
 
 def test_builtin_divination_template_v3_specialties_are_real_tags(app: Any) -> None:
     template = _builtin_template(app)
     experts = {item.display_name: item for item in template.participants[1:]}
-    assert set(experts) == {"八字专家", "紫微专家", "易卦专家", "三式专家", "西学专家"}
+    assert set(experts) == {"子平先生", "紫薇先生", "易卦先生", "三式先生", "西学占测师"}
     expected_head_tags = {
-        "八字专家": ["四柱八字", "子平命理", "十神", "大运", "流年"],
-        "紫微专家": ["紫微斗数", "四化", "宫位", "大限"],
-        "易卦专家": ["六爻", "梅花易数", "卦象", "应期"],
-        "三式专家": ["奇门遁甲", "大六壬", "太乙神数"],
-        "西学专家": ["西方占星", "塔罗", "行运", "推运"],
+        "子平先生": ["四柱八字", "子平命理", "十神", "大运", "流年"],
+        "紫薇先生": ["紫微斗数", "四化", "宫位", "大限"],
+        "易卦先生": ["六爻", "梅花易数", "卦象", "应期"],
+        "三式先生": ["奇门遁甲", "大六壬", "太乙神数"],
+        "西学占测师": ["西方占星", "塔罗", "行运", "推运"],
     }
     for display_name, head_tags in expected_head_tags.items():
         expert = experts[display_name]
@@ -104,7 +102,24 @@ def test_builtin_divination_template_v3_declares_topic(app: Any) -> None:
     template = _builtin_template(app)
     dumped = template.model_dump(mode="json")
     # RoomTemplate is extra="allow", so the topic survives the round-trip.
-    assert dumped.get("topic") == "综合命理会诊：人生关键决策的多视角研判"
+    assert "多体系联合会诊" in dumped.get("topic", "")
+
+
+def test_builtin_divination_template_names_taibuge_roles_and_discloses_risk(app: Any) -> None:
+    template = _builtin_template(app)
+    assert template.name == "太卜阁 · 术数综合会诊"
+    assert [item.display_name for item in template.participants] == [
+        "玄衡先生",
+        "子平先生",
+        "紫薇先生",
+        "易卦先生",
+        "三式先生",
+        "西学占测师",
+    ]
+    rules = "\n".join(template.shared_context.rules)
+    assert "仅供娱乐" in rules
+    assert "请勿过度迷信" in rules
+    assert "不构成投资" in rules
 
 
 def _persona(app: Any, persona_id: str) -> None:

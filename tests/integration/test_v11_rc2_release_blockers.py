@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from persona_continuum.application.container import PersonaContinuum
+from persona_continuum.config import Config
 from persona_continuum.domain.memory import MemoryType
 from persona_continuum.domain.persona import PersonaType, RunMode
 from persona_continuum.security.validation import PersonaContinuumError, SecurityError
@@ -188,6 +189,56 @@ def test_redacted_export_scans_entire_zip_for_source_content_and_paths(app, tmp_
     assert secret not in payload
     assert str(source_path) not in payload
     assert "redaction_manifest" in payload
+
+
+def test_public_compiled_export_is_runtime_ready_without_private_state(app, tmp_path) -> None:
+    raw_secret = "RC2_PRIVATE_SOURCE_ONLY_8871"
+    persona = _create_persona(app, persona_id="rc2-public-compiled")
+    source_path = _write_source(tmp_path, raw_secret)
+    source = app.personas.add_sources(persona.id, [source_path])[0]
+    _compile_dimensions(app, persona.id, source.id, tag="PUBLIC_COMPILED_PERSONA")
+    session = app.sessions.start_session(persona.id, "private conversation")
+    app.sessions.commit_turn(
+        persona.id,
+        session.id,
+        user_message="RC2_PRIVATE_DIALOGUE_9912",
+        persona_response="private response",
+    )
+
+    export_path = app.personas.export_persona(
+        persona.id,
+        tmp_path / "public.persona.zip",
+        mode="public_compiled",
+    )
+    payload = _zip_text(export_path)
+    with zipfile.ZipFile(export_path) as archive:
+        names = set(archive.namelist())
+
+    assert "data/compiled_components.jsonl" in names
+    assert "privacy_manifest.json" in names
+    assert not any(
+        name.startswith(("data/sources", "data/memories", "data/sessions", "data/rooms"))
+        for name in names
+    )
+    assert raw_secret not in payload
+    assert str(source_path) not in payload
+    assert "RC2_PRIVATE_DIALOGUE_9912" not in payload
+    assert "PUBLIC_COMPILED_PERSONA" in payload
+
+    imported_app = PersonaContinuum(Config(data_dir=tmp_path / "public-import"))
+    try:
+        imported_app.init()
+        imported = imported_app.personas.import_persona(export_path)
+        compiled_count = imported_app.database.conn.execute(
+            "SELECT COUNT(*) AS count FROM compiled_components WHERE persona_id = ?",
+            (imported.id,),
+        ).fetchone()["count"]
+        assert compiled_count > 0
+        assert imported_app.database.conn.execute(
+            "SELECT COUNT(*) AS count FROM sessions WHERE persona_id = ?", (imported.id,)
+        ).fetchone()["count"] == 0
+    finally:
+        imported_app.close()
 
 
 def test_delete_source_recursively_removes_derived_artifacts_components_files_and_exports(

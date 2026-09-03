@@ -954,8 +954,9 @@
 
     const dir = $("#lobby-director");
     if (dir) {
-      const v = dir.value || "director";
+      const v = dir.value;
       dir.innerHTML = `
+        <option value="">— ${state.lang === "zh-CN" ? "请选择 Director 模式" : "Select Director mode"} —</option>
         <option value="director">${t("dirDirector")}</option>
         <option value="natural">${t("dirNatural")}</option>
         <option value="round_robin">${t("dirRR")}</option>
@@ -1111,13 +1112,14 @@
   }
 
   function openRoomLobby() {
-    $("#lobby-title").value = state.lang === "zh-CN" ? "多人哲学与技术探索" : "Multi-Persona Exploration";
-    $("#lobby-topic").value = "Discussing artificial intelligence, human cognition, and long-term computing paradigms.";
-    $("#lobby-director").value = "director";
-    $("#lobby-mode").value = "autonomous";
-    $("#lobby-speaker-selection").value = "intelligent";
+    $("#lobby-title").value = "";
+    $("#lobby-topic").value = "";
+    $("#lobby-template").value = "";
+    $("#lobby-director").value = "";
+    $("#lobby-mode").value = "";
+    $("#lobby-speaker-selection").value = "";
     $("#lobby-description").value = "";
-    $("#lobby-protocol").value = "free_discussion";
+    $("#lobby-protocol").value = "";
     $("#room-shared-background").value = "";
     $("#room-shared-rules").value = "";
     $("#room-custom-instructions").value = "";
@@ -1127,6 +1129,7 @@
     if (errBox) errBox.style.display = "none";
     showRoomSub("lobby");
     applyLobbyMode(state.lobbyAdvanced ? "advanced" : "simple");
+    state.lobbySlots = [];
     buildLobbyDefaults();
     renderProtocolSettings();
   }
@@ -1196,7 +1199,7 @@
 
   function selectedProtocol() {
     const select = $("#lobby-protocol");
-    return select && select.value ? select.value : "free_discussion";
+    return select ? select.value : "";
   }
 
   function applyLobbyMode(mode) {
@@ -1250,6 +1253,11 @@
     if (help) help.textContent = (protocolMeta[protocol] || {}).help || "";
     const box = $("#protocol-settings");
     if (!box) return;
+    if (!protocol) {
+      box.innerHTML = "";
+      renderSlots();
+      return;
+    }
     const common = `<div class="field"><label>最大轮数</label><input class="input" id="protocol-max-rounds" type="number" min="1" max="100" value="6" /></div>`;
     if (protocol === "expert_consultation") {
       box.innerHTML = `${common}<div class="field"><label>路由方式</label><select class="input" id="protocol-routing"><option value="host_decides">主持人决定</option><option value="rule_based">规则匹配</option><option value="all">全部专家</option><option value="manual">手动</option></select></div><div class="field"><label>最少专家数</label><input class="input" id="protocol-min-experts" type="number" min="1" value="1" /></div><div class="field"><label>最多专家数</label><input class="input" id="protocol-max-experts" type="number" min="1" value="3" /></div><label><input id="protocol-independent" type="checkbox" checked /> 独立首轮</label><label><input id="protocol-review" type="checkbox" checked /> 交叉评审</label><div class="field"><label>最大评审轮数</label><input class="input" id="protocol-review-rounds" type="number" min="0" max="20" value="1" /></div>`;
@@ -1288,7 +1296,18 @@
       return;
     }
     const label = (protocolMeta[template.protocol] || {}).label || template.protocol || "";
-    hint.textContent = `协作模式：${label} · ${base}`;
+    const risk = template.id === "room_template_divination_consultation"
+      ? " 本模板及演示中的术数/算命演算仅供娱乐与传统文化研究，请勿过度迷信；不构成投资、医疗、法律或其他专业建议。"
+      : "";
+    hint.textContent = `协作模式：${label} · ${base}${risk}`;
+  }
+
+  function normalizePersonaLabel(value) {
+    return String(value || "")
+      .replace(/[（(]\s*主持\s*[）)]/g, "")
+      .replace(/[-—_]主持$/g, "")
+      .replace(/\s+/g, "")
+      .trim();
   }
 
   function applyRoomTemplate(templateId) {
@@ -1315,9 +1334,13 @@
     state.lobbySlots = template.participants.map((participant, index) => {
       const role = participant.role || defaultRole(template.protocol, index);
       const fallbackBinding = state.defaultBinding || {};
+      const recommendedLabel = normalizePersonaLabel(participant.display_name);
+      const matchedPersona = state.personas.find((persona) =>
+        [persona.id, persona.display_name].some((value) => normalizePersonaLabel(value) === recommendedLabel)
+      );
       return {
         slot_label: participant.display_name || participant.slot_label || ROLE_LABELS[role] || `席位 ${index + 1}`,
-        persona_id: participant.persona_id || "",
+        persona_id: participant.persona_id || (matchedPersona ? matchedPersona.id : ""),
         role,
         specialties: (participant.specialties && participant.specialties.length)
           ? participant.specialties.slice()
@@ -1371,21 +1394,9 @@
       return;
     }
 
-    const protocol = selectedProtocol();
-    // Default slots: roles are assigned automatically per protocol; the
-    // user only picks personas, runtime, model and reasoning.
-    state.lobbySlots = state.personas.slice(0, 2).map((persona, index) => ({
-      persona_id: persona.id,
-      runtime_source: defaultSource,
-      runtime_selection: defaultAgent,
-      model_selection: defaultModel,
-      reasoning_selection: "none",
-      role: defaultRole(protocol, index),
-      specialties: personaSpecialties(persona),
-      authority: authorityForRole(defaultRole(protocol, index)),
-      tool_permissions: []
-    }));
-
+    // A fresh Room is intentionally blank. Personas and runtime bindings are
+    // only populated after the user chooses a template or adds a slot.
+    state.lobbySlots = [];
     renderSlots();
     renderBindingPreview();
   }
@@ -1658,6 +1669,14 @@
       toast("请选择房间协作模式。", "error");
       return;
     }
+    if (protocol === "free_discussion" && (!$("#lobby-mode").value || !$("#lobby-speaker-selection").value)) {
+      if (errBox && errDetails) {
+        errBox.style.display = "block";
+        errDetails.textContent = "自由讨论需要明确选择讨论方式与发言方式。";
+      }
+      toast("请选择讨论方式与发言方式。", "error");
+      return;
+    }
     const validRoles = PROTOCOL_ROLES[protocol] || [];
 
     // Validation: runtime exists, status == ready, source matches, model valid, reasoning valid
@@ -1741,10 +1760,10 @@
         rules: $("#room-shared-rules").value.split("\n").map(x => x.trim()).filter(Boolean),
         custom_instructions: $("#room-custom-instructions").value.trim()
       },
-      mode: $("#lobby-mode").value || "autonomous",
+      mode: protocol === "free_discussion" ? $("#lobby-mode").value : "autonomous",
       request_id: requestId,
       initialize_async: true,
-      director_config: { mode: $("#lobby-director").value || "director" },
+      director_config: $("#lobby-director").value ? { mode: $("#lobby-director").value } : null,
       host_participant_id: (state.lobbySlots.find((s) => ["host", "chair"].includes(s.role)) || {}).participant_id || null,
       participants: state.lobbySlots.map((s, i) => {
         // No silent role fallback: a role invalid for the chosen protocol is

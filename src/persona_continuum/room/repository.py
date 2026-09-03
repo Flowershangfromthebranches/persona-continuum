@@ -30,8 +30,11 @@ class RoomProtocolRepository:
         template = RoomTemplate.model_validate(
             {
                 "id": DIVINATION_TEMPLATE_ID,
-                "name": "术数综合会诊",
-                "description": "通用专家会诊协议的示例模板；术数规则不属于 Room Engine。",
+                "name": "太卜阁 · 术数综合会诊",
+                "description": (
+                    "由玄衡先生主持的多体系术数联合会诊空间。根据用户当前问题选择最少且"
+                    "最相关的专家进行独立分析，必要时交叉评审，最后由玄衡先生综合判断。"
+                ),
                 "protocol": "expert_consultation",
                 # Role slots: persona_id stays empty so the user maps each
                 # slot (host / experts) to real personas at room creation.
@@ -41,14 +44,14 @@ class RoomProtocolRepository:
                     {
                         "participant_id": "slot_host",
                         "persona_id": "",
-                        "display_name": "主持人",
+                        "display_name": "玄衡先生",
                         "role": "host",
                         "authority": 100,
                     },
                     {
                         "participant_id": "slot_expert_bazi",
                         "persona_id": "",
-                        "display_name": "八字专家",
+                        "display_name": "子平先生",
                         "role": "expert",
                         "authority": 70,
                         "specialties": [
@@ -71,7 +74,7 @@ class RoomProtocolRepository:
                     {
                         "participant_id": "slot_expert_ziwei",
                         "persona_id": "",
-                        "display_name": "紫微专家",
+                        "display_name": "紫薇先生",
                         "role": "expert",
                         "authority": 70,
                         "specialties": [
@@ -90,7 +93,7 @@ class RoomProtocolRepository:
                     {
                         "participant_id": "slot_expert_yigua",
                         "persona_id": "",
-                        "display_name": "易卦专家",
+                        "display_name": "易卦先生",
                         "role": "expert",
                         "authority": 70,
                         "specialties": [
@@ -109,7 +112,7 @@ class RoomProtocolRepository:
                     {
                         "participant_id": "slot_expert_sanshi",
                         "persona_id": "",
-                        "display_name": "三式专家",
+                        "display_name": "三式先生",
                         "role": "expert",
                         "authority": 70,
                         "specialties": [
@@ -126,7 +129,7 @@ class RoomProtocolRepository:
                     {
                         "participant_id": "slot_expert_western",
                         "persona_id": "",
-                        "display_name": "西学专家",
+                        "display_name": "西学占测师",
                         "role": "expert",
                         "authority": 70,
                         "specialties": [
@@ -140,17 +143,45 @@ class RoomProtocolRepository:
                         ],
                     },
                 ],
-                "topic": "综合命理会诊：人生关键决策的多视角研判",
+                "topic": (
+                    "围绕用户提出的命理、人生趋势、事业学业、关系、具体事件、行动时机与"
+                    "心理发展等问题进行多体系联合会诊。"
+                ),
                 "shared_context": {
                     "background": (
-                        "这是一个多术数体系联合会诊房间。主持人负责判断问题适合使用哪一种或"
-                        "哪几种体系。专家只对自己的专业体系负责。不同体系先独立判断，再进行"
-                        "交叉比较。不能为了制造一致性强行统一不同体系。每位专家本身掌握自己"
-                        "的专业计算、推演与解释方法。最终由主持人解释共同点、冲突点、不确定性"
-                        "与现实建议。"
-                    )
+                        "太卜阁由玄衡先生与五位专精术师组成。玄衡先生负责理解用户真正的"
+                        "问题、判断时间尺度、选择最少必要专家，并形成最终综合判断。子平先生"
+                        "专精四柱八字与岁运；紫薇先生专精紫微斗数；易卦先生专精六爻、梅花"
+                        "易数与小六壬；三式先生专精奇门遁甲、大六壬与太乙；西学占测师专精"
+                        "西方占星与塔罗。每位专家本身掌握所属体系的理论、计算、排盘、推演和"
+                        "判读方法，应亲自完成专业分析。一门体系足以回答时，不为了制造会诊感"
+                        "而召集所有成员。不同体系允许得出不同结论。最终由玄衡先生区分共识、"
+                        "分歧、时间尺度、不确定性和现实行动建议。"
+                    ),
+                    "rules": [
+                        "只要现有信息足以形成有意义的判断，就立即开始分析。",
+                        "同一个问题最多允许一次阻塞式集中追问，且只有玄衡先生可以发起。",
+                        "可以由专家自行计算、推导或合理默认的信息，不得要求用户提供。",
+                        "用户说“最近”而未说明范围时，默认先按未来三至六个月分析，并明确说明该默认。",
+                        "普通问题优先选择一名专家，复杂问题通常选择两名，确有必要时最多三名。",
+                        "专家首轮独立分析；交叉评审只检查依据、逻辑、时间尺度、遗漏和冲突。",
+                        "最终由玄衡先生明确给出总体判断、时间窗口、风险和可执行建议。",
+                        (
+                            "本模板及演示中的术数/算命演算仅供娱乐与传统文化研究，请勿过度"
+                            "迷信；不构成投资、医疗、法律或其他专业建议。投资有风险，请依据"
+                            "可靠信息独立判断，必要时咨询持牌专业人士。"
+                        ),
+                    ],
+                    "custom_instructions": (
+                        "每轮优先完成用户真正提出的问题。主持人先判断信息是否足够、哪些事实"
+                        "不可替代、哪些内容可自行计算或采用透明默认。若确实必须追问，只允许"
+                        "玄衡先生进行一次集中追问。专家分析优先输出：一句话判断、实际计算或"
+                        "推演结果、主要依据、时间窗口、风险、用户现在可采取的行动。不得以"
+                        "接口、路由、输入包、启动条件、数据结构或内部协作流程作为正常咨询内容。"
+                    ),
                 },
                 "protocol_config": {
+                    "max_rounds": 6,
                     "routing_mode": "host_decides",
                     "min_experts": 1,
                     "max_experts": 3,
