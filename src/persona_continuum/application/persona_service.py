@@ -101,6 +101,7 @@ DATA_FILES = {
 }
 
 BUNDLE_PERSONAS_FILE = "data/personas.jsonl"
+PUBLIC_COMPILED_FILE_ROOTS = ("identity", "cognition", "expression", "affect")
 
 
 class PersonaService:
@@ -742,7 +743,7 @@ class PersonaService:
         mode: str = "full",
         room_export_mode: str = "omit",
     ) -> Path:
-        if mode not in {"full", "identity_only", "redacted"}:
+        if mode not in {"full", "identity_only", "redacted", "public_compiled"}:
             raise CodedError("invalid_export_mode", mode)
         if room_export_mode not in {"omit", "transcript_only", "bundle"}:
             raise CodedError("invalid_room_export_mode", room_export_mode)
@@ -845,7 +846,7 @@ class PersonaService:
                     "schema_version": "1.1",
                     "data_record_shape": {"schema_version": "1.1", "data": "sqlite row"},
                     "required_files": ["manifest.yaml", "package_schema.json", "checksums.json"],
-                    "modes": ["full", "identity_only", "redacted"],
+                    "modes": ["full", "identity_only", "redacted", "public_compiled"],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -887,6 +888,36 @@ class PersonaService:
                 ),
                 encoding="utf-8",
             )
+        elif mode == "public_compiled":
+            self._stage_public_compiled_files(persona, package_root, files_root)
+            (staging / "privacy_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.1",
+                        "mode": "public_compiled",
+                        "included": [
+                            "manifest",
+                            "compiled_components",
+                            *PUBLIC_COMPILED_FILE_ROOTS,
+                        ],
+                        "excluded": [
+                            "raw_sources",
+                            "claims_and_evidence",
+                            "memories",
+                            "sessions_and_turns",
+                            "rooms_and_transcripts",
+                            "continuations",
+                            "relationships",
+                            "runtime_state",
+                            "evaluation_results",
+                            "local_paths",
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         else:
             for path in sorted(package_root.rglob("*")):
                 if not path.is_file():
@@ -907,6 +938,8 @@ class PersonaService:
         )
 
     def _tables_for_mode(self, mode: str) -> builtins.list[str]:
+        if mode == "public_compiled":
+            return ["compiled_components"]
         if mode == "identity_only":
             return [
                 "sources",
@@ -918,6 +951,32 @@ class PersonaService:
                 "compile_snapshots",
             ]
         return DATA_TABLES
+
+    def _stage_public_compiled_files(
+        self, persona: PersonaRecord, package_root: Path, files_root: Path
+    ) -> None:
+        """Stage runtime-ready identity files without private evidence or conversation state."""
+
+        for root_name in PUBLIC_COMPILED_FILE_ROOTS:
+            source_root = package_root / root_name
+            if not source_root.exists():
+                continue
+            for path in sorted(source_root.rglob("*")):
+                if not path.is_file() or any(part.startswith("__pycache__") for part in path.parts):
+                    continue
+                relative = path.relative_to(package_root)
+                target = files_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+        manifest_target = files_root / "manifest.yaml"
+        manifest_target.write_text(
+            yaml.safe_dump(
+                json.loads(dumps(persona.manifest.model_dump())),
+                sort_keys=False,
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
 
     def _skip_export_row(self, table: str, data: dict[str, Any]) -> bool:
         metadata = {}

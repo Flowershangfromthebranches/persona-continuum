@@ -111,13 +111,8 @@ console 错误、无其他 4xx。
 responder，零外网）；种子链 project→outline→draft→audit→commit→production package（canon，
 location_visual_bible 与 clip locations 匹配）→ prompt package ready。走查步骤：三层渲染与空态
 → 点 [生成完整制作手册] → 捕获 POST 202 → job 完成紧轮询 → 摘要卡 → [打开完整手册] 抽屉 →
-导出下载 → Clip 工单截图 → 关抽屉 → 回归抽查。截图位于 `docs/reports/acceptance/screenshots/`：
-
-| 截图 | 验证点 |
-| --- | --- |
-| `07_production_guide_block.png` | 第三块「完整制作手册 · EP01」摘要卡：**EP01 AI视频完整制作手册** + `目标视频模型：Generic Video Model` `16:9` + `需要准备：1 人物参考 · 1 场景参考 · 0 道具参考 · 1 其他参考` + `视频片段：1 · 预计总时长：5s` + [打开完整手册] / [重新生成手册] |
-| `08_guide_drawer.png` | 全页 Drawer 顶部：标题 + [复制完整手册] [导出 Markdown] [✕ 关闭] + 「每条 Prompt 独立复制」提示 + 连续 markdown（制作目标 → 二、目标视频模型与基础参数 → 三、永久参考素材 → 3.1 `@CHAR_FANG_MASTER · 角色母图（身份锚点）`…） |
-| `09_guide_clip_workorder.png` | Clip 工单卡：`Clip 1 · 5s` + 用途/生成模式（文生视频）/连续性 + **copy-ready prompt 块（172 字符自包含）** + 推荐设置 + [复制视频Prompt] |
+导出下载 → Clip 工单检查 → 关抽屉 → 回归抽查。为遵守当前版本“不发布叙事创作演示”
+的分发边界，走查截图未随仓库发布；以下只保留可复验的断言摘要。
 
 断言结果（19/19 PASS）：
 
@@ -131,8 +126,7 @@ location_visual_bible 与 clip locations 匹配）→ prompt package ready。走
   **download 事件**（16090 字节 .md，内容含一/十三节）；
 - 页面内 fetch 复核导出响应头：200 + `text/markdown; charset=utf-8`；
 - 回归抽查：方案层 Clip 编辑器完好（select ×6、复制 Prompt 按钮 ×1）、用户 export-zip 按钮 ×1 原样；
-- 清理：服务器关闭（8793 进程终止）、scratch 数据目录与全部临时脚本删除——**截图是唯一痕迹**；
-  截图 01–06（上一验收报告）原样保留，本轮仅新增 07–09。
+- 清理：服务器关闭（8793 进程终止）、scratch 数据目录与全部临时脚本删除；公开仓库不保留演示截图。
 
 ## 11. 测试与质量门
 

@@ -49,3 +49,15 @@ def test_role_options_free_discussion_excludes_expert() -> None:
 
 def test_create_payload_has_no_silent_protocol_fallback() -> None:
     assert 'value || "free_discussion"' not in _app_js_text()
+
+
+def test_opening_room_lobby_keeps_configuration_blank() -> None:
+    text = _app_js_text()
+    start = text.index("function openRoomLobby()")
+    end = text.index("// ─── Lobby: simple vs advanced mode", start)
+    block = text[start:end]
+    assert '$("#lobby-title").value = ""' in block
+    assert '$("#lobby-protocol").value = ""' in block
+    assert "state.lobbySlots = []" in block
+    assert "多人哲学与技术探索" not in block
+    assert "Multi-Persona Exploration" not in block

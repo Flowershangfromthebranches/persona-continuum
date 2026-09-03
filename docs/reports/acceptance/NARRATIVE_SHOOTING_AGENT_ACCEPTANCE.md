@@ -106,19 +106,9 @@ turn-scoped lease：轮结束后 service `__dict__` 仅 4 个固定属性、无 
 
 ## 10. 人工 Walkthrough（真实浏览器 E2E）
 
-Chromium（Playwright）对运行中的服务器执行端到端走查，截图位于
-`docs/reports/acceptance/screenshots/`：
-
-| 截图 | 验证点 |
-| --- | --- |
-| `01_home.png` | 首页加载 |
-| `02_production_master_layer.png` | **两层结构**：左「制作母版」（EP01 + micro_drama + **CANON ✓**、Screenplay/Shot List/Image Prompt/Dialogue Timing/Subtitle/SFX/BGM、**高级 → 基础运动描述** legacy 折叠）+ 右「视频生成方案 · EP01」+ [创建视频生成方案]；方案卡 **Google Veo 3.1 · Profile 版本 v1 · 16:9 · 就绪**；Clip 1 · 4s 卡（用途/生成模式 文生视频/参考素材 ○ 未准备/连续性 same phone/修改时长/切换生成模式）；左下 **拍摄 Agent + 导演 Agent** 双 FAB |
-| `03_production_plan_layer.png` | 全页两层（4 个 clip 卡全部渲染） |
-| `04_shooting_panel.png` | 拍摄 Agent 抽屉：讨论/建议/**代理** 三模式、「目标视频模型」与「拍摄模型（CLI 工具/模型/思考强度）」分离、权限说明（只操作视频生成方案与参考素材，不会改动正史）、就绪状态 |
-
-断言通过：两层容器与标题、CANON 徽章、方案卡与 4 个 clip、Profile 版本标签、面板打开。
-注：首轮运行偶发一次 404 资源加载（不可复现：受控重跑 ×5，含往返与面板打开，均无 4xx；
-所有 API 端点无缺失，无功能影响）。
+Chromium（Playwright）曾完成两层容器、CANON 徽章、方案卡、Clip 编辑器与拍摄 Agent
+面板的端到端走查。为遵守当前版本“不发布叙事创作演示”的分发边界，演示截图未随仓库发布；
+本节只保留验收结论，不能替代在使用者环境中的重新验证。
 
 ## 11. 测试与质量门
 

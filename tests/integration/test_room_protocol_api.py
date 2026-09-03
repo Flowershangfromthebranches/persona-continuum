@@ -56,7 +56,9 @@ def test_room_protocol_template_and_run_api(app) -> None:
 
         templates = client.get("/api/room-templates")
         assert templates.status_code == 200
-        assert any(item["name"] == "术数综合会诊" for item in templates.json()["data"])
+        assert any(
+            item["name"] == "太卜阁 · 术数综合会诊" for item in templates.json()["data"]
+        )
 
         created_template = client.post(
             "/api/room-templates",
@@ -263,6 +265,22 @@ def test_create_room_without_explicit_protocol_is_rejected(app) -> None:
         )
         assert res.status_code == 400
         assert res.json()["error"] == "请选择房间协作模式。"
+
+
+def test_create_room_without_participants_is_rejected_instead_of_auto_binding(app) -> None:
+    _create_manifest_persona(app, "must_not_auto_bind")
+    with TestClient(create_web_app(app)) as client:
+        res = client.post(
+            "/api/rooms",
+            json={
+                "title": "Blank participant list",
+                "protocol": "free_discussion",
+                "initialize_async": False,
+                "participants": [],
+            },
+        )
+    assert res.status_code == 400
+    assert res.json()["error"] == "请至少添加并配置一个参与者席位。"
 
 
 def test_create_room_missing_expert_role_returns_friendly_error(app) -> None:

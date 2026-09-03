@@ -84,6 +84,16 @@ Web UI 与平行世界共用 `PersonaCreationOrchestrator`。创建任务可暂�
 - **Narrative Studio**：分离作者真相、角色知识和观众知识；预测分支在显式提交前不进入正史，
   并可生成面向 AI 视频制作的 Production Package。
 
+### 太卜阁可下载示例
+
+[`examples/taibuge/`](examples/taibuge/) 提供六个可导入的编译 Persona 包、内置
+“太卜阁 · 术数综合会诊”房间模板的使用说明，以及一次经过选择的房间对话演示。新建房间
+现在默认完全空白；选择模板后会按名称匹配这六位 Persona，使用者只需选择本机 Agent Host、
+模型和 Reasoning Effort。
+
+本版本不提供平行世界或叙事创作的用户演示与模板。术数/算命演算仅供娱乐与传统文化研究，
+请勿过度迷信；不构成投资、医疗、法律或其他专业建议。
+
 更多设计说明见 [`docs/README.md`](docs/README.md)、
 [`docs/WEB_ROOM.md`](docs/WEB_ROOM.md) 和
 [`docs/NARRATIVE_STUDIO.md`](docs/NARRATIVE_STUDIO.md)。
@@ -95,6 +105,9 @@ Web UI 与平行世界共用 `PersonaCreationOrchestrator`。创建任务可暂�
 仓库忽略 `.env*`、密钥文件、本地 Persona 数据、数据库、缓存以及本机 Agent 工作目录。
 请勿把真实 API Key、个人材料或生产凭据放入 Git。为真实私人个体创建 Persona 前，请确认
 已获得适当同意，并评估身份、隐私、肖像、声音和分发风险。
+
+公开分享编译 Persona 时，建议使用 `--mode public_compiled`。该模式仅导出 Manifest、编译人格
+组件与运行所需身份文件，明确排除原始资料、证据/声明、记忆、会话、房间记录、关系与运行时状态。
 
 所有房间状态、日志、WebSocket 帧和前端载荷都应经过密钥脱敏。删除来源会递归失效其派生
 声明、记忆和编译结果；删除 Persona 会移除数据库记录、索引、运行时状态、包目录和相关会话。
@@ -153,6 +166,19 @@ OpenAI-compatible, cloud embedding, Zep Cloud, or other paid model APIs. The
 running Agent host performs natural-language research and reasoning, then
 submits structured artifacts to the local MCP server.
 
+## Downloadable Taibuge Demo
+
+[`examples/taibuge/`](examples/taibuge/) contains six importable compiled Persona
+archives, instructions for the built-in `太卜阁 · 术数综合会诊` Room template,
+and one selected Room conversation demo. A new Room now opens completely blank.
+After selecting the template, the UI matches the six Personas by name; users
+only need to select a local Agent Host, model, and Reasoning Effort.
+
+This release provides no end-user demo or template for Parallel World or
+Narrative Studio. Divination output is for entertainment and traditional-culture
+research only, must not be treated as investment, medical, legal, or other
+professional advice, and should not be relied on superstitiously.
+
 ## Install
 
 ```bash
@@ -160,6 +186,11 @@ uv sync
 uv run persona-continuum init
 uv run persona-continuum doctor --json
 ```
+
+For public sharing, `persona-continuum export <id> --mode public_compiled`
+exports only the manifest, compiled persona components, and runtime identity
+files. Raw sources, evidence/claims, memories, sessions, Room records,
+relationships, and runtime state are excluded.
 
 ## MCP Configuration
 
