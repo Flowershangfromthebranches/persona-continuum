@@ -826,8 +826,11 @@ class PersonaEvidenceIndex:
                     ],
                 }
             )
+        # Every unique supporting unit stays retrievable, including the
+        # canonical (first) one: dropping it would hide the full unit text
+        # behind the fused one-line claim and starve extraction/repair.
         distinct_unit_ids = {
-            evidence_id for item in fused for evidence_id in item.unique_evidence_ids[1:]
+            evidence_id for item in fused for evidence_id in item.unique_evidence_ids
         }
         if not candidates:
             unit_candidates = units

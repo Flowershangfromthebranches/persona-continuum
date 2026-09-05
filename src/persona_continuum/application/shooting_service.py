@@ -838,7 +838,9 @@ class NarrativeShootingService:
                         "duration_seconds": duration,
                         "recommended_settings": {
                             **clip.recommended_settings,
-                            "duration_seconds": duration,
+                            # Keep the single duration source of truth (task
+                            # #29); the legacy duration_seconds key is dropped.
+                            "actual_generation_duration": duration,
                         },
                     }
                 )

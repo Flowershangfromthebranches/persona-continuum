@@ -113,11 +113,17 @@ workspace. Return the requested answer directly, following the expected output s
         turn: AgentTurn,
         prompt: str,
     ) -> str:
-        """Keep no-tool Persona work from triggering headless permission prompts."""
+        """Keep no-tool Persona work from triggering headless permission prompts.
+
+        ``config.tools`` is only an auditable description here: the plain-CLI
+        protocol cannot round-trip broker tool calls, so a room participant
+        with ``allow_agent_tools`` still gets the policy and must answer
+        directly instead of reaching for the CLI's native tools (which
+        headless mode auto-denies, producing an empty response).
+        """
 
         if (
             config.permission_profile == PermissionProfile.CHAT_SAFE
-            and not config.tools
             and not turn.tools
         ):
             return f"{self._HEADLESS_NO_TOOL_POLICY}\n\n{prompt}"

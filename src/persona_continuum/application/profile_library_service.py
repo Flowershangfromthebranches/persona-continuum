@@ -718,13 +718,14 @@ class ProfileLibraryService:
               research_policy_json, requested_scope, status, progress_json, error,
               failure_json, agent_call_audits_json,
               source_count, new_version, persona_creation_job_id, enrichment_input_mode,
+              research_focus,
               parent_job_id, base_persona_version, input_material_ids_json,
               input_material_count, new_source_ids_json, visibility, dismissed_at,
               superseded_by, worker_state, worker_started_at, worker_heartbeat_at,
               worker_finished_at, agent_call_count, created_at, updated_at
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET status=excluded.status,
               selected_runtime_json=excluded.selected_runtime_json,
@@ -736,6 +737,7 @@ class ProfileLibraryService:
               new_version=excluded.new_version,
               persona_creation_job_id=excluded.persona_creation_job_id,
               enrichment_input_mode=excluded.enrichment_input_mode,
+              research_focus=excluded.research_focus,
               parent_job_id=excluded.parent_job_id,
               base_persona_version=excluded.base_persona_version,
               input_material_ids_json=excluded.input_material_ids_json,
@@ -767,6 +769,7 @@ class ProfileLibraryService:
                 job.new_version,
                 job.persona_creation_job_id,
                 job.enrichment_input_mode.value,
+                job.research_focus,
                 job.parent_job_id,
                 job.base_persona_version,
                 dumps(job.input_material_ids),
@@ -802,6 +805,7 @@ class ProfileLibraryService:
             selected_runtime=dict(loads(row["selected_runtime_json"] or "{}")),
             research_policy=dict(loads(row["research_policy_json"] or "{}")),
             requested_scope=str(row["requested_scope"]),
+            research_focus=row["research_focus"] if "research_focus" in row_keys else None,
             enrichment_input_mode=EnrichmentInputMode(
                 str(row["enrichment_input_mode"] or "local_materials")
             ),

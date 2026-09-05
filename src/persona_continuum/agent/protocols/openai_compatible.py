@@ -3,6 +3,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -32,6 +33,7 @@ from persona_continuum.agent.models import (
 )
 from persona_continuum.agent.prompt import AgentPromptRenderer
 from persona_continuum.agent.response_collector import (
+    AgentRuntimeError,
     AgentTransportError,
     ReasoningBindingRejectedError,
     agent_error_event,
@@ -408,7 +410,25 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
             return
         headers["Content-Type"] = "application/json"
 
+        try:
+            self._prepare_inline_attachments(turn)
+        except AgentRuntimeError as exc:
+            yield agent_error_event(exc, protocol="openai_compatible_http")
+            return
+        try:
+            wire_messages: list[dict[str, Any]] = AgentPromptRenderer.render_for_native_roles(
+                turn
+            )
+            self._apply_provider_image_parts(wire_messages, turn)
+            wire_bytes = len(
+                json.dumps(wire_messages, ensure_ascii=False, default=str).encode("utf-8")
+            )
+        except AgentRuntimeError as exc:
+            yield agent_error_event(exc, protocol="openai_compatible_http")
+            return
+        turn.metadata["estimated_wire_bytes"] = wire_bytes
         messages: list[dict[str, Any]] = AgentPromptRenderer.render_for_native_roles(turn)
+        self._apply_provider_image_parts(messages, turn)
 
         model = session.config.model_id or self.default_model
         payload: dict[str, Any] = {
@@ -714,13 +734,14 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
         headers["Content-Type"] = "application/json"
         model = session.config.model_id or self.default_model
         envelope = AgentPromptRenderer.envelope(turn)
+        native = AgentPromptRenderer.render_for_native_roles(turn)
         payload: dict[str, Any] = {
             "model": model,
             "max_tokens": 2048,
             "stream": True,
             "messages": [
-                message
-                for message in AgentPromptRenderer.render_for_native_roles(turn)
+                self._anthropic_message(message, turn)
+                for message in native
                 if message.get("role") != "system"
             ],
         }
@@ -816,9 +837,30 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
         headers["Content-Type"] = "application/json"
         model = session.config.model_id or self.default_model
         envelope = AgentPromptRenderer.envelope(turn)
+        native = AgentPromptRenderer.render_for_native_roles(turn)
+        google_parts: list[dict[str, Any]] = []
+        for message in native:
+            if message.get("role") != "user":
+                continue
+            google_parts.extend(self._google_parts(message, turn))
         prompt = AgentPromptRenderer.render_for_single_prompt(turn, include_system=False)
+        if google_parts:
+            text_idx = next(
+                (
+                    idx
+                    for idx, part in enumerate(google_parts)
+                    if part.get("text") is not None
+                ),
+                None,
+            )
+            if text_idx is not None:
+                google_parts[text_idx] = {"text": prompt}
+            else:
+                google_parts.insert(0, {"text": prompt})
+        else:
+            google_parts = [{"text": prompt}]
         payload: dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": google_parts}],
         }
         if envelope.system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": envelope.system_prompt}]}
@@ -899,6 +941,193 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
 
     async def close(self, session: AgentSession) -> None:
         session.mark_closed()
+
+    def _prepare_inline_attachments(self, turn: AgentTurn) -> None:
+        """Materialise canonical attachments into inline base64 at the boundary.
+
+        This is the ONLY place where room attachments become base64: the HTTP
+        provider boundary.  Bytes are read lazily here (never in the Room
+        layer), validated against the inline media budget, and appended to
+        ``metadata["inline_images"]`` for the renderer/converters below.
+        CLI transports never reach this code path.
+        """
+
+        from persona_continuum.agent.media_transport import (
+            check_inline_budget,
+            media_input_mode_for,
+            read_attachment_base64,
+            require_consumable_or_raise,
+        )
+        from persona_continuum.agent.models import AgentAttachment, MediaInputMode
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        if not attachments:
+            return
+        uploads_root = self._attachments_root()
+        inline = list(self._inline_images(turn))
+        seen = {item["data"] for item in inline}
+        inline_texts: list[str] = []
+        for attachment in attachments:
+            mode = media_input_mode_for(
+                self._media_capabilities(), attachment.kind
+            )
+            if mode == MediaInputMode.EXTRACTED_CONTENT.value:
+                from persona_continuum.agent.media_transport import extract_attachment_text
+
+                extracted = attachment.extracted_text or extract_attachment_text(
+                    attachment, uploads_root
+                )
+                if extracted:
+                    inline_texts.append(
+                        f"[附件 {attachment.filename}（{attachment.mime_type}）提取内容]\n"
+                        f"{extracted}"
+                    )
+                    continue
+            if mode != MediaInputMode.INLINE_BASE64.value:
+                require_consumable_or_raise(
+                    attachment, mode, adapter_id=self.adapter_id
+                )
+                continue
+            check_inline_budget(attachment)
+            data = read_attachment_base64(attachment, uploads_root)
+            if data in seen:
+                continue
+            seen.add(data)
+            inline.append(
+                {"media_type": attachment.mime_type.lower(), "data": data}
+            )
+        if inline_texts:
+            turn.user_message = (
+                f"{turn.user_message}\n\n" + "\n\n".join(inline_texts)
+                if turn.user_message
+                else "\n\n".join(inline_texts)
+            )
+        metadata = dict(turn.metadata or {})
+        metadata["inline_images"] = inline
+        turn.metadata = metadata
+
+    def _attachments_root(self) -> Path:
+        from persona_continuum.config import Config
+
+        override = getattr(self, "_session_uploads_root", None)
+        if override:
+            return Path(str(override))
+        return Config().room_uploads_dir
+
+    def _media_capabilities(self) -> AgentCapabilityFlags:
+        from persona_continuum.agent.models import AgentCapabilityFlags
+
+        return AgentCapabilityFlags(
+            images=True,
+            media_input_modes={
+                "image": "inline_base64",
+                "video": "inline_base64",
+                "audio": "inline_base64",
+                "file": "extracted_content",
+            },
+        )
+
+    @staticmethod
+    def _inline_images(turn: AgentTurn) -> list[dict[str, str]]:
+        """Inline image payloads carried on this turn (validated, deduped)."""
+
+        raw = (turn.metadata or {}).get("inline_images")
+        if not isinstance(raw, list):
+            return []
+        images: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            media_type = str(item.get("media_type") or "").strip().lower()
+            data = "".join(str(item.get("data") or "").split())
+            if not media_type.startswith("image/") or not data:
+                continue
+            if data in seen:
+                continue
+            seen.add(data)
+            images.append({"media_type": media_type, "data": data})
+        return images
+
+    def _apply_provider_image_parts(
+        self, messages: list[dict[str, Any]], turn: AgentTurn
+    ) -> None:
+        """Attach OpenAI-style image parts to the last user message in place.
+
+        The renderer already emits the canonical ``image_url`` content blocks;
+        this only keeps provider-specific follow-ups (Google/Anthropic use
+        their own converters below) from seeing a shape they cannot parse.
+        Plain-text content stays untouched, so CLI transports are unaffected.
+        """
+
+    @staticmethod
+    def _split_text_and_images(
+        message: dict[str, Any],
+    ) -> tuple[str, list[dict[str, str]]]:
+        """Split one native-role message into text plus inline image parts."""
+
+        content = message.get("content")
+        texts: list[str] = []
+        images: list[dict[str, str]] = []
+        items = content if isinstance(content, list) else [content]
+        for item in items:
+            if isinstance(item, str):
+                if item:
+                    texts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    texts.append(str(item["text"]))
+                elif item.get("type") == "image_url":
+                    url = item.get("image_url") or {}
+                    data_url = str(url.get("url") or "")
+                    if data_url.startswith("data:"):
+                        header, _, data = data_url[5:].partition(";base64,")
+                        if header.startswith("image/") and data:
+                            images.append(
+                                {"media_type": header, "data": "".join(data.split())}
+                            )
+        return "\n".join(texts), images
+
+    def _anthropic_message(
+        self, message: dict[str, Any], turn: AgentTurn
+    ) -> dict[str, Any]:
+        text, images = self._split_text_and_images(message)
+        if not images:
+            return message
+        # Re-derive from the split images so the Anthropic block always
+        # matches the canonical renderer output part-for-part.
+        content: list[dict[str, Any]] = ([{"type": "text", "text": text}] if text else []) + [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image["media_type"],
+                    "data": image["data"],
+                },
+            }
+            for image in images
+        ]
+        return {"role": message.get("role", "user"), "content": content}
+
+    def _google_parts(
+        self, message: dict[str, Any], turn: AgentTurn
+    ) -> list[dict[str, Any]]:
+        _text, images = self._split_text_and_images(message)
+        parts: list[dict[str, Any]] = []
+        for image in images:
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": image["media_type"],
+                        "data": image["data"],
+                    }
+                }
+            )
+        return parts
 
     def _add_structured_output_request(
         self, payload: dict[str, Any], turn: AgentTurn

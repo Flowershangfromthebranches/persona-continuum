@@ -40,6 +40,7 @@ from persona_continuum.agent.models import (
     AgentEvent,
     AgentEventType,
     AgentSessionConfig,
+    AgentStatus,
     AgentTurn,
     ModelCapability,
     PromptEnvelope,
@@ -47,6 +48,7 @@ from persona_continuum.agent.models import (
     StructuredOutputMode,
 )
 from persona_continuum.agent.prompt import AgentPromptRenderer
+from persona_continuum.agent.protocols.plain_cli import PlainCliAdapter
 from persona_continuum.agent.response_collector import (
     AgentTransportError,
     ContextBudgetExceededError,
@@ -450,3 +452,56 @@ async def test_runtime_transport_failure_is_not_relabelled_as_structured_repair(
         assert len(adapter.sent_turns) == 1
     finally:
         await executor.close(binding)
+
+
+def test_plain_cli_classifies_auth_and_quota_errors() -> None:
+    adapter = PlainCliAdapter("test_cli", "Test CLI", ["test"])
+    session = AgentSession(config=_config())
+
+    msg, _ = adapter.classify_process_failure(
+        session,
+        returncode=0,
+        stderr_text="Authentication required. Please use /login command to sign in",
+        diagnostics={},
+    )
+    assert msg is not None
+    assert "CLI authentication required" in msg
+
+    msg, _ = adapter.classify_process_failure(
+        session,
+        returncode=1,
+        stderr_text="You've reached your credit usage limit.",
+        diagnostics={},
+    )
+    assert msg is not None
+    assert "credit usage limit" in msg
+
+
+@pytest.mark.anyio
+async def test_codebuddy_probe_marks_auth_required_when_unauthenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = CodeBuddyAdapter()
+    monkeypatch.setattr(adapter, "_find_binary", lambda: "/usr/local/bin/codebuddy")
+
+    async def mock_exec(cmd: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
+        if "--version" in cmd:
+            return 0, "2.137.1", ""
+        if "status" in cmd:
+            return (
+                0,
+                "",
+                "Authentication required. Please use /login command to sign in to your account",
+            )
+        if "--help" in cmd:
+            return 0, "Currently supported: (hy3)", ""
+        return 0, "", ""
+
+    monkeypatch.setattr("persona_continuum.agent.adapters.other_vendors.safe_exec_cmd", mock_exec)
+    monkeypatch.setattr("persona_continuum.agent.protocols.plain_cli.safe_exec_cmd", mock_exec)
+
+    probe = await adapter.probe()
+    assert probe.status == AgentStatus.AUTH_REQUIRED
+    assert probe.auth_status == "auth_required"
+    assert "Authentication required" in str(probe.status_detail)
+

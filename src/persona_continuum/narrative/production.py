@@ -101,7 +101,12 @@ class ProductionPackageBuilder:
                 for c in bible.characters
             ],
             location_list=[
-                {"id": loc.id, "name": loc.name, "visual": loc.visual}
+                {
+                    "id": loc.id,
+                    "name": loc.name,
+                    "description": loc.description,
+                    "visual": loc.visual,
+                }
                 for loc in bible.locations
             ],
             prop_list=prop_bible["props"],
@@ -133,7 +138,10 @@ class ProductionPackageBuilder:
         for loc in bible.locations:
             visual = dict(loc.visual or {})
             visual.setdefault("forbidden_variations", [])
-            locations.append({"id": loc.id, "name": loc.name, **visual})
+            entry = {"id": loc.id, "name": loc.name, **visual}
+            if loc.description and not entry.get("description"):
+                entry["description"] = loc.description
+            locations.append(entry)
         return {"locations": locations}
 
     def _prop_visual_bible(self, bible: StoryBible, version: EpisodeVersion) -> dict[str, Any]:

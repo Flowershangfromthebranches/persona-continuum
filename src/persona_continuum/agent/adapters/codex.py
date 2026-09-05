@@ -15,6 +15,7 @@ from persona_continuum.agent.adapter import (
     safe_exec_cmd,
 )
 from persona_continuum.agent.models import (
+    AgentAttachment,
     AgentCapabilityFlags,
     AgentEvent,
     AgentEventType,
@@ -22,6 +23,7 @@ from persona_continuum.agent.models import (
     AgentSessionConfig,
     AgentStatus,
     AgentTurn,
+    MediaInputMode,
     ModelCapability,
     OutputStreamingMode,
     PromptMode,
@@ -150,6 +152,54 @@ class CodexAdapter(AgentAdapter):
         """Last observed CLI version; lets caches detect binary upgrades."""
 
         return self._cached_version
+
+    def _attachment_inputs(self, turn: AgentTurn) -> list[dict[str, Any]]:
+        """Native app-server input items for this turn's attachments.
+
+        Shapes follow the installed CLI's generated protocol schema
+        (``codex app-server generate-json-schema``): image items are
+        ``{"type": "localImage", "path": ...}`` -- a path reference, never
+        base64.  Kinds without a native carrier fail loudly instead of
+        being silently dropped into the text prompt.
+        """
+
+        from persona_continuum.agent.media_transport import (
+            require_consumable_or_raise,
+        )
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        items: list[dict[str, Any]] = []
+        for attachment in attachments:
+            if attachment.kind == "image":
+                require_consumable_or_raise(
+                    attachment,
+                    MediaInputMode.NATIVE_PROTOCOL.value,
+                    adapter_id=self.adapter_id,
+                )
+                items.append({"type": "localImage", "path": attachment.local_path})
+            else:
+                require_consumable_or_raise(
+                    attachment, MediaInputMode.UNSUPPORTED.value
+                )
+        return items
+
+    def _exec_attachment_block(self, turn: AgentTurn) -> str:
+        """Text pointer for the exec fallback: images ride `--image` flags."""
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        images = [a for a in attachments if a.kind == "image"]
+        if not images:
+            return ""
+        names = ", ".join(a.filename or "image" for a in images)
+        return f"用户本轮上传了以下图片（已通过 --image 附带，请直接查看）：{names}。"
 
     async def probe(self) -> AgentProbeResult:
         binary = self._find_binary()
@@ -754,9 +804,11 @@ class CodexAdapter(AgentAdapter):
             session.session_data["msg_id"] = msg_id + 1
 
             prompt_text = AgentPromptRenderer.render_for_single_prompt(turn)
+            codex_inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+            codex_inputs.extend(self._attachment_inputs(turn))
             params: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt_text}],
+                "input": codex_inputs,
             }
             if session.config.model_id:
                 params["model"] = session.config.model_id
@@ -1020,6 +1072,36 @@ class CodexAdapter(AgentAdapter):
         cmd = [binary, "exec", "--json"]
         if session.config.model_id and session.config.model_id != "default":
             cmd.extend(["-c", f"model={session.config.model_id}"])
+        # The exec fallback takes `-i/--image <FILE>` path references (see
+        # `codex exec --help`); local paths travel on argv, never base64.
+        image_paths = [
+            str(a.local_path)
+            for a in (
+                AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+                for a in (turn.attachments or [])
+                if isinstance(a, (dict, AgentAttachment))
+            )
+            if a.kind == "image" and str(a.local_path or "").strip()
+        ]
+        unsupported = [
+            a
+            for a in (
+                AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+                for a in (turn.attachments or [])
+                if isinstance(a, (dict, AgentAttachment))
+            )
+            if a.kind != "image"
+        ]
+        if unsupported:
+            from persona_continuum.agent.media_transport import require_consumable_or_raise
+
+            require_consumable_or_raise(
+                unsupported[0],
+                MediaInputMode.UNSUPPORTED.value,
+                adapter_id=self.adapter_id,
+            )
+        for image_path in image_paths:
+            cmd.extend(["--image", image_path])
 
         env = build_runtime_environment(
             credential_manager=getattr(self, "credential_manager", None),
@@ -1029,6 +1111,9 @@ class CodexAdapter(AgentAdapter):
         )
 
         prompt = AgentPromptRenderer.render_for_single_prompt(turn)
+        media_block = self._exec_attachment_block(turn)
+        if media_block:
+            prompt = f"{prompt}\n\n{media_block}"
         exec_transport: SubprocessAgentTransport | None = None
         exec_proc: asyncio.subprocess.Process | None = None
         try:

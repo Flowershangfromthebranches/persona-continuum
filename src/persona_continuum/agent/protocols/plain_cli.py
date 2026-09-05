@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from persona_continuum.agent.adapter import (
@@ -84,6 +85,87 @@ class PlainCliAdapter(AgentAdapter):
         del config
         return []
 
+    def media_input_mode(self, kind: str) -> str:
+        """How this CLI consumes one attachment kind.
+
+        Plain CLIs cannot receive binary payloads: the model runtime reads
+        the file from disk instead.  Concrete adapters override this hook
+        when they verified a different carrier (native protocol items).
+        """
+
+        from persona_continuum.agent.models import MediaInputMode
+
+        if str(kind or "").lower() in {"image", "video", "audio", "file"}:
+            return MediaInputMode.LOCAL_PATH.value
+        return MediaInputMode.UNSUPPORTED.value
+
+    def attachment_prompt_block(self, turn: AgentTurn) -> str:
+        """Wire-text reference block for this turn's attachments.
+
+        Only short path references travel here -- never file bytes.  The CLI
+        runtime opens the file itself, so the argv/stdin budget sees ~100
+        bytes per file instead of megabytes of base64.
+        """
+
+        from persona_continuum.agent.media_transport import (
+            describe_unconsumed_attachment,
+            extract_attachment_text,
+            local_path_reference,
+            require_consumable_or_raise,
+        )
+        from persona_continuum.agent.models import AgentAttachment, MediaInputMode
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        if not attachments:
+            return ""
+        uploads_root = self._cli_attachments_root()
+        lines = ["用户本轮上传了以下附件："]
+        for attachment in attachments:
+            mode = self.media_input_mode(attachment.kind)
+            if mode == MediaInputMode.LOCAL_PATH.value:
+                lines.append(
+                    f"- {attachment.kind} {attachment.filename}："
+                    f"{local_path_reference(attachment)} "
+                    "请读取该文件并将文件内容作为本轮用户输入的一部分，"
+                    "结合房间上下文完成回答。"
+                )
+                continue
+            if mode == MediaInputMode.EXTRACTED_CONTENT.value:
+                extracted = (
+                    attachment.extracted_text
+                    or (
+                        extract_attachment_text(attachment, uploads_root)
+                        if uploads_root is not None
+                        else None
+                    )
+                )
+                if extracted:
+                    lines.append(
+                        f"- {attachment.kind} {attachment.filename} "
+                        f"（{attachment.mime_type}）提取内容：\n{extracted}"
+                    )
+                    continue
+            require_consumable_or_raise(
+                attachment, mode, adapter_id=getattr(self, "adapter_id", "")
+            )
+            lines.append(describe_unconsumed_attachment(attachment, mode))
+        return "\n".join(lines)
+
+    def _cli_attachments_root(self) -> Path | None:
+        from persona_continuum.config import Config
+
+        override = getattr(self, "_session_uploads_root", None)
+        if override:
+            return Path(str(override))
+        try:
+            return Config().room_uploads_dir
+        except Exception:
+            return None
+
     def prepare_prompt(
         self,
         config: AgentSessionConfig,
@@ -124,7 +206,17 @@ class PlainCliAdapter(AgentAdapter):
     ) -> tuple[str | None, dict[str, Any]]:
         """Return a user-facing CLI failure detail without leaking secrets."""
 
-        del session, returncode, stderr_text
+        del session, returncode
+        stderr_lower = (stderr_text or "").lower()
+        if "authentication required" in stderr_lower or "use /login" in stderr_lower:
+            return (
+                "CLI authentication required. Please log in using the CLI /login command.",
+                diagnostics,
+            )
+        if "credit usage limit" in stderr_lower or "upgrade your subscription" in stderr_lower:
+            return "Quota exceeded: CLI account credit usage limit reached.", diagnostics
+        if stderr_text and stderr_text.strip():
+            return sanitize_diagnostic(stderr_text.strip(), limit=200), diagnostics
         return None, diagnostics
 
     def cleanup_cli_artifacts(self, session: AgentSession) -> None:
@@ -302,6 +394,9 @@ class PlainCliAdapter(AgentAdapter):
             turn,
             AgentPromptRenderer.render_for_single_prompt(turn),
         )
+        media_block = self.attachment_prompt_block(turn)
+        if media_block:
+            prompt = f"{prompt}\n\n{media_block}"
         pass_via_arg = bool(prompt_flags)
         if pass_via_arg:
             # Print-mode flags consume or govern the prompt on several CLIs.

@@ -463,6 +463,11 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
             methods=["GET"],
         ),
         Route(
+            "/api/personas/{persona_id}/runtime/reset",
+            endpoint=handler.reset_persona_runtime,
+            methods=["POST"],
+        ),
+        Route(
             "/api/personas/{persona_id}/evidence-index",
             endpoint=handler.get_persona_evidence_index,
             methods=["GET"],
@@ -561,6 +566,11 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
             endpoint=handler.resolve_preview,
             methods=["POST"],
         ),
+        Route(
+            "/api/rooms/{room_id}/bindings",
+            endpoint=handler.update_room_bindings,
+            methods=["PUT"],
+        ),
         Route("/api/rooms/{room_id}/start", endpoint=handler.start_room, methods=["POST"]),
         Route("/api/rooms/{room_id}/step", endpoint=handler.step_turn, methods=["POST"]),
         Route(
@@ -576,6 +586,21 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
             methods=["POST"],
         ),
         Route("/api/rooms/{room_id}/pause", endpoint=handler.pause_room, methods=["POST"]),
+        Route(
+            "/api/rooms/{room_id}/attachments",
+            endpoint=handler.upload_room_attachment,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/rooms/{room_id}/attachments/{stored_name}",
+            endpoint=handler.download_room_attachment,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/room-attachments/{attachment_id}",
+            endpoint=handler.download_room_attachment_by_id,
+            methods=["GET"],
+        ),
         Route(
             "/api/rooms/{room_id}/inject",
             endpoint=handler.inject_room_message,
@@ -1047,6 +1072,11 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
         Route(
             "/api/narratives/{project_id}/production/{package_id}/production-guide",
             endpoint=handler.create_production_guide_job,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/narratives/{project_id}/production/{package_id}/complete-plan",
+            endpoint=handler.create_complete_video_production_job,
             methods=["POST"],
         ),
         Route(

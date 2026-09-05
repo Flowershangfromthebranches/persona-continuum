@@ -45,6 +45,7 @@ class DirectorMode(StrEnum):
 class RoomMode(StrEnum):
     MANUAL = "manual"
     AUTONOMOUS = "autonomous"
+    DIRECT_CHAT = "direct_chat"
 
 
 class RoomProtocolType(StrEnum):

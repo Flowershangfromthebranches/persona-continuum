@@ -30,6 +30,11 @@ from persona_continuum.agent.response_collector import (
 from persona_continuum.agent.runtime_executor import RuntimeSessionBinding
 from persona_continuum.application._utils import dumps, loads, new_id, parse_dt
 from persona_continuum.auth.profiles import AuthProfileService
+from persona_continuum.room.attachments import (
+    attachment_public_url,
+    decode_base64_payload,
+    store_room_attachment,
+)
 from persona_continuum.room.case_state import RoomCaseState, merge_case_state
 
 if TYPE_CHECKING:
@@ -48,6 +53,7 @@ from persona_continuum.room.models import (
     BindingPreflightError,
     DirectorConfig,
     ParticipantSlot,
+    ProtocolTaskStatus,
     RoomMode,
     RoomProtocolConfig,
     RoomProtocolEvent,
@@ -246,6 +252,7 @@ class MultiAgentOrchestrator:
         self._initialization_locks: dict[str, asyncio.Lock] = {}
         self._initialization_tasks: dict[str, asyncio.Task[RoomSessionState]] = {}
         self._autonomous_tasks: dict[str, asyncio.Task[None]] = {}
+        self._direct_reply_tasks: dict[str, asyncio.Task[None]] = {}
         self._protocol_tasks: dict[str, asyncio.Task[RoomSessionState]] = {}
         # Single-flight guards for protocol runs and conversions.  The lock
         # serialises synchronous run_protocol callers (background starts
@@ -258,6 +265,11 @@ class MultiAgentOrchestrator:
         self._event_replay: dict[str, list[dict[str, Any]]] = {}
         # Single-flight background summary refresh per room (room_id -> task).
         self._summary_tasks: dict[str, asyncio.Task[None]] = {}
+        # Uploaded room attachments: attachment_id -> attachment metadata
+        # (room_id, stored_name, filename, mime, size, kind).  Files live
+        # under config.room_uploads_dir/{room_id}/; the registry only maps
+        # ids so download routes can resolve them without scanning the disk.
+        self._room_attachments: dict[str, dict[str, Any]] = {}
 
     async def _run_tool_preflight(self, room_id: str, state: RoomSessionState) -> None:
         """Snapshot generic provider health for the room without failing startup.
@@ -346,6 +358,11 @@ class MultiAgentOrchestrator:
                 if existing:
                     return existing
         room_participants = participants or []
+        if mode == RoomMode.DIRECT_CHAT:
+            if protocol != RoomProtocolType.FREE_DISCUSSION:
+                raise ValueError("direct_chat_requires_free_discussion_protocol")
+            if len(room_participants) != 1:
+                raise ValueError("direct_chat_requires_exactly_one_participant")
         self._validate_persona_bindings(room_participants)
         definition = self.protocol_registry.get(protocol, protocol_config)
         self.protocol_registry.validate_participants(definition, room_participants)
@@ -579,33 +596,7 @@ class MultiAgentOrchestrator:
                         code="session_inactive",
                     )
 
-            host_slot = next(
-                (
-                    slot
-                    for slot in state.participants
-                    if slot.participant_id == state.host_participant_id
-                ),
-                state.participants[0],
-            )
-            host_snapshot = snapshots[host_slot.participant_id]
-            host_adapter = self.registry.get_adapter(host_snapshot.agent_runtime_id)
-            if host_adapter and self.runtime_executor:
-                host_binding = await self.runtime_executor.open_session(
-                    host_adapter,
-                    AgentSessionConfig(
-                        session_id=f"{room_id}_host",
-                        room_id=room_id,
-                        participant_id="host",
-                        persona_id="room_host",
-                        model_id=host_snapshot.model_id,
-                        reasoning_effort=host_snapshot.reasoning_effort,
-                        permission_profile=PermissionProfile.CHAT_SAFE,
-                        allow_mcp=False,
-                        tools=[],
-                    )
-                )
-                self._host_agent_sessions[room_id] = host_binding.session
-                self._host_agent_bindings[room_id] = host_binding
+            await self._open_host_session(room_id, state)
 
             state.status = RoomStatus.READY
             state.updated_at = datetime.now(UTC)
@@ -655,6 +646,48 @@ class MultiAgentOrchestrator:
 
         task = asyncio.create_task(_runner())
         self._autonomous_tasks[room_id] = task
+        return task
+
+    def start_direct_reply(self, room_id: str, user_message: str) -> asyncio.Task[None]:
+        """Run exactly one persona turn for a user message in direct-chat mode."""
+
+        existing = self._direct_reply_tasks.get(room_id)
+        if existing and not existing.done():
+            return existing
+        state = self.get_room(room_id)
+        if state is None:
+            raise KeyError(room_id)
+        if state.mode != RoomMode.DIRECT_CHAT:
+            raise ValueError("Room is not in direct chat mode")
+        if state.protocol != RoomProtocolType.FREE_DISCUSSION:
+            raise ValueError("direct_chat_requires_free_discussion_protocol")
+        if len(state.participants) != 1:
+            raise ValueError("direct_chat_requires_exactly_one_participant")
+
+        participant_id = state.participants[0].participant_id
+        state.status = RoomStatus.DISCUSSING
+        state.last_error = None
+        self._save_room_state(state, force=True)
+
+        async def _runner() -> None:
+            try:
+                async for _event in self.step_turn(
+                    room_id,
+                    manual_speaker_id=participant_id,
+                    user_message=user_message,
+                ):
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self.mark_background_turn_failed(room_id, exc)
+            finally:
+                current = asyncio.current_task()
+                if self._direct_reply_tasks.get(room_id) is current:
+                    self._direct_reply_tasks.pop(room_id, None)
+
+        task = asyncio.create_task(_runner())
+        self._direct_reply_tasks[room_id] = task
         return task
 
     def initialize_room_background(self, room_id: str) -> asyncio.Task[RoomSessionState]:
@@ -1200,6 +1233,7 @@ class MultiAgentOrchestrator:
 
             stream_started = time.monotonic()
             first_token_at: float | None = None
+            turn_attachments = self._turn_attachments(state)
             try:
                 stream_events_agen = self.runtime_executor.stream_events(
                     agent_binding,
@@ -1210,9 +1244,13 @@ class MultiAgentOrchestrator:
                         or state.topic
                         or "Continue conversation"
                     ),
+                    attachments=turn_attachments or None,
                     tools=tools_for_turn if use_tools else [],
                     phase="room_agent_turn",
-                    metadata={"turn_id": turn_id, "tool_executor": _execute_tool_cb},
+                    metadata={
+                        "turn_id": turn_id,
+                        "tool_executor": _execute_tool_cb,
+                    },
                 )
                 async with aclosing(stream_events_agen):
                     async for event in stream_events_agen:
@@ -1777,12 +1815,20 @@ class MultiAgentOrchestrator:
         # waiting_clarification is the host asking the user one indispensable
         # question: a finished, successful outcome -- never a room error.
         settled = {"success", "partial_success", "cancelled", "waiting_clarification"}
-        state.status = (
-            RoomStatus.READY if protocol_state.status.value in settled else RoomStatus.ERROR
-        )
-        state.last_error = (
-            None if protocol_state.status.value in settled else "room_protocol_run_failed"
-        )
+        if protocol_state.status.value in settled:
+            state.status = RoomStatus.READY
+            state.last_error = None
+        else:
+            state.status = RoomStatus.ERROR
+            detail = ""
+            for task in getattr(protocol_state, "tasks", []):
+                if (
+                    getattr(task, "status", None) == ProtocolTaskStatus.FAILED
+                    and getattr(task, "error", None)
+                ):
+                    detail = f": {task.error}"
+                    break
+            state.last_error = f"room_protocol_run_failed{detail}"
         self._save_room_state(state, force=True)
         return state
 
@@ -2305,12 +2351,14 @@ class MultiAgentOrchestrator:
             current_binding: RuntimeSessionBinding,
             user_message: str | None = None,
         ) -> Any:
+            protocol_attachments = self._turn_attachments(state)
             return await runtime_executor.execute_structured(
                 current_binding,
                 system_prompt=system_prompt,
                 user_message=user_message if user_message is not None else user_prompt,
                 schema=self._protocol_output_schema(request.action, request.protocol),
                 phase=f"room_protocol_{request.action}",
+                attachments=protocol_attachments or None,
                 metadata={
                     "room_id": state.id,
                     "run_id": request.run_id,
@@ -2777,6 +2825,7 @@ class MultiAgentOrchestrator:
         content: str,
         injection_type: str = "external_information",
         client_message_id: str | None = None,
+        attachment_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         state = self.get_room(room_id)
         if not state:
@@ -2785,8 +2834,9 @@ class MultiAgentOrchestrator:
             raise RuntimeError(
                 f"Room injection requires ready/discussing/paused status, got {state.status.value}"
             )
+        attachments = self._resolve_inject_attachments(room_id, attachment_ids or [])
         message = content.strip()
-        if not message:
+        if not message and not attachments:
             raise ValueError("Injected room message cannot be empty")
 
         # Transactional semantics: the user message is the unit of work.  A
@@ -2826,7 +2876,7 @@ class MultiAgentOrchestrator:
                     "duplicate": True,
                 }
 
-        entry = {
+        entry: dict[str, Any] = {
             "turn_id": turn_id,
             "participant_id": "user",
             "persona_id": "user",
@@ -2836,6 +2886,9 @@ class MultiAgentOrchestrator:
             "commit_status": "user_injected",
             "created_at": datetime.now(UTC).isoformat(),
         }
+        if attachments:
+            entry["attachments"] = attachments
+            entry["metadata"] = {"injection_type": injection_type, "attachments": attachments}
         state.transcript.append(entry)
         state.metadata.setdefault("injections", []).append(entry)
         state.updated_at = datetime.now(UTC)
@@ -2853,7 +2906,11 @@ class MultiAgentOrchestrator:
                     agent_runtime_id="",
                     content=message,
                     commit_status="user_injected",
-                    metadata={"injection_type": injection_type},
+                    metadata=(
+                        {"injection_type": injection_type, "attachments": attachments}
+                        if attachments
+                        else {"injection_type": injection_type}
+                    ),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -2870,11 +2927,230 @@ class MultiAgentOrchestrator:
                 if state.mode == RoomMode.AUTONOMOUS:
                     with contextlib.suppress(Exception):
                         self.start_autonomous_discussion(room_id, max_turns=6)
+                elif state.mode == RoomMode.DIRECT_CHAT:
+                    with contextlib.suppress(Exception):
+                        self.start_direct_reply(room_id, message)
             else:
                 with contextlib.suppress(Exception):
                     self.start_protocol_background(room_id, message)
 
         return event
+
+    def upload_room_attachment(
+        self,
+        room_id: str,
+        filename: str,
+        mime: str,
+        content_base64: str,
+    ) -> dict[str, Any]:
+        """Persist one uploaded file for a room and register its metadata.
+
+        No type or size gate by design (per product decision); the only hard
+        rules are valid base64 and path-traversal safety via
+        ``ensure_child_path``.  The returned dict is the transcript-facing
+        attachment record (no ``stored_name`` leak).
+        """
+
+        state = self.get_room(room_id)
+        if state is None:
+            raise KeyError(room_id)
+        raw_bytes = decode_base64_payload(content_base64)
+        uploads_root = self.continuum.config.room_uploads_dir
+        record = store_room_attachment(
+            uploads_root, room_id, filename, mime, raw_bytes
+        )
+        full = {
+            **record,
+            "room_id": room_id,
+            "url": attachment_public_url(record["id"]),
+        }
+        self._room_attachments[record["id"]] = full
+        return self._public_attachment(full)
+
+    def get_room_attachment(self, attachment_id: str) -> dict[str, Any] | None:
+        full = self._room_attachments.get(attachment_id)
+        if full is not None:
+            return full
+        return self._scan_room_attachment(attachment_id)
+
+    def get_room_attachment_by_stored_name(
+        self, room_id: str, stored_name: str
+    ) -> dict[str, Any] | None:
+        for full in self._room_attachments.values():
+            if str(full.get("room_id")) == room_id and full.get("stored_name") == stored_name:
+                return full
+        return None
+
+    def _scan_room_attachment(self, attachment_id: str) -> dict[str, Any] | None:
+        """Recover an attachment record after a process restart.
+
+        The in-memory registry is rebuilt lazily: transcript metadata and the
+        upload directory are the authority, so a restart never orphans files.
+        """
+
+        uploads_root = self.continuum.config.room_uploads_dir
+        if not uploads_root.exists():
+            return None
+        for room_dir in uploads_root.iterdir():
+            if not room_dir.is_dir():
+                continue
+            for path in room_dir.iterdir():
+                name = path.name
+                if "_" not in name:
+                    continue
+                prefix, _, _original = name.partition("_")
+                if len(prefix) != 32:
+                    continue
+                rows = self.continuum.database.conn.execute(
+                    "SELECT metadata_json FROM room_transcripts "
+                    "WHERE room_id = ? AND metadata_json LIKE ? LIMIT 20",
+                    (room_dir.name, f"%{attachment_id}%"),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        metadata = loads(str(row["metadata_json"]))
+                    except Exception:
+                        continue
+                    for item in metadata.get("attachments") or []:
+                        if (
+                            isinstance(item, dict)
+                            and item.get("id") == attachment_id
+                            and item.get("stored_name") == name
+                            and room_dir.name == str(item.get("room_id") or room_dir.name)
+                        ):
+                            full = {**item, "room_id": room_dir.name}
+                            self._room_attachments[attachment_id] = full
+                            return full
+        return None
+
+    @staticmethod
+    def _public_attachment(full: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: full[key]
+            for key in ("id", "filename", "mime", "size", "kind", "room_id", "url")
+            if key in full
+        }
+
+    def _resolve_inject_attachments(
+        self, room_id: str, attachment_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        resolved: list[dict[str, Any]] = []
+        for attachment_id in attachment_ids:
+            full = self.get_room_attachment(str(attachment_id))
+            if full is None or str(full.get("room_id")) != room_id:
+                raise ValueError(f"attachment_not_found:{attachment_id}")
+            resolved.append(self._public_attachment(full))
+        return resolved
+
+    @staticmethod
+    def latest_user_attachments(
+        transcript: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Newest user message's attachments (text + files travel together)."""
+
+        for item in reversed(transcript or []):
+            if item.get("participant_id") != "user":
+                continue
+            attachments = item.get("attachments") or (item.get("metadata") or {}).get(
+                "attachments"
+            )
+            if attachments:
+                return [dict(a) for a in attachments if isinstance(a, dict)]
+            if str(item.get("content") or "").strip():
+                return []
+        return []
+
+    def _turn_attachments(self, state: RoomSessionState) -> list[dict[str, Any]]:
+        """Canonical attachments for the current turn (metadata only).
+
+        Returns the newest user message's attachments as ``AgentAttachment``
+        dicts: id/kind/mime/filename/size + the store-local path.  No bytes
+        are read here -- each adapter materialises the carrier (local path
+        reference, native protocol item, inline base64) at its own boundary.
+        Only the current turn's attachments travel; history keeps the
+        transcript reference without re-sending binaries.
+        """
+
+        from persona_continuum.agent.models import AgentAttachment
+
+        attachments = self.latest_user_attachments(state.transcript)
+        canonical: list[dict[str, Any]] = []
+        for item in attachments:
+            full = self.get_room_attachment(str(item.get("id") or ""))
+            if full is None:
+                continue
+            stored = str(full.get("stored_name") or "")
+            if not stored:
+                continue
+            room_id = str(full.get("room_id") or state.id)
+            record = AgentAttachment(
+                id=str(item.get("id")),
+                kind=str(item.get("kind") or "file"),
+                mime_type=str(item.get("mime") or "application/octet-stream"),
+                filename=str(item.get("filename") or "attachment"),
+                size_bytes=int(item.get("size") or 0),
+                local_path=str(
+                    self.continuum.config.room_uploads_dir / room_id / stored
+                ),
+                url=str(item.get("url") or ""),
+            )
+            canonical.append(record.model_dump(mode="python"))
+        return canonical
+
+    def _turn_image_messages(
+        self, state: RoomSessionState
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """Legacy inline-image builder (kept for backward compatibility).
+
+        The canonical path is now ``_turn_attachments`` + adapter-side
+        carriers.  This helper is retained so existing callers/tests keep
+        working; new code must not build data-URL messages in the Room layer.
+        """
+
+        from persona_continuum.room.attachments import attachment_supports_inline_vision
+
+        attachments = self.latest_user_attachments(state.transcript)
+        inline: list[dict[str, str]] = []
+        for item in attachments:
+            mime = str(item.get("mime") or "")
+            if not attachment_supports_inline_vision(mime):
+                continue
+            full = self.get_room_attachment(str(item.get("id") or ""))
+            stored = (full or {}).get("stored_name")
+            if not full or not stored:
+                continue
+            try:
+                path = self.continuum.config.room_uploads_dir / str(
+                    full.get("room_id") or state.id
+                ) / str(stored)
+                from persona_continuum.security.paths import ensure_child_path
+
+                data = ensure_child_path(
+                    self.continuum.config.room_uploads_dir, path
+                ).read_bytes()
+            except Exception:
+                continue
+            import base64
+
+            inline.append(
+                {
+                    "media_type": mime.lower().split(";")[0].strip(),
+                    "data": base64.b64encode(data).decode("ascii"),
+                }
+            )
+        if not inline:
+            return [], []
+        content: list[dict[str, Any]] = [{"type": "text", "text": ""}]
+        for image in inline:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image['media_type']};base64,{image['data']}"
+                    },
+                }
+            )
+        return [{"role": "user", "content": content}], inline
 
     async def pause_room(self, room_id: str) -> RoomSessionState:
         state = self.get_room(room_id)
@@ -2922,14 +3198,17 @@ class MultiAgentOrchestrator:
         call_data = call if isinstance(call, dict) else {}
         call_status = str(call_data.get("status") or "")
         autonomous_task = self._autonomous_tasks.get(room_id)
+        direct_reply_task = self._direct_reply_tasks.get(room_id)
         protocol_task = self._protocol_tasks.get(room_id)
         autonomous_active = bool(autonomous_task and not autonomous_task.done())
+        direct_reply_active = bool(direct_reply_task and not direct_reply_task.done())
         protocol_active = bool(protocol_task and not protocol_task.done())
         protocol_running = state.protocol_state.status == RoomRunStatus.RUNNING
         turn_active = (
             state.status == RoomStatus.DISCUSSING
             or call_status == "calling"
             or autonomous_active
+            or direct_reply_active
             or protocol_active
             or protocol_running
         )
@@ -2948,6 +3227,7 @@ class MultiAgentOrchestrator:
             not target_ids
             and not autonomous_active
             and not protocol_active
+            and not direct_reply_active
             and state.current_speaker_id
         ):
             # Direct/manual step during recall has not written model_call yet.
@@ -2970,6 +3250,8 @@ class MultiAgentOrchestrator:
         # autonomous task propagates cancellation through the host runtime.
         if autonomous_active and not target_ids and autonomous_task is not None:
             autonomous_task.cancel()
+        if direct_reply_active and not target_ids and direct_reply_task is not None:
+            direct_reply_task.cancel()
 
         now = datetime.now(UTC)
         state.metadata["model_call"] = {
@@ -3108,6 +3390,190 @@ class MultiAgentOrchestrator:
                 self._active_agent_bindings.setdefault(room_id, {})[participant_id] = binding
         return True
 
+    async def _open_host_session(self, room_id: str, state: RoomSessionState) -> bool:
+        """(Re)open the host agent session from the current binding snapshot.
+
+        Shared by start_room, resume_from_storage and update_room_bindings:
+        the host session is separate from participant sessions and must be
+        rebuilt whenever the host binding changes, because the reasoning
+        effort / model are consumed when the session opens.
+        """
+        host_slot = next(
+            (
+                slot
+                for slot in state.participants
+                if slot.participant_id == state.host_participant_id
+            ),
+            state.participants[0] if state.participants else None,
+        )
+        if host_slot is None or not self.runtime_executor:
+            return False
+        host_snapshot = state.binding_snapshots.get(host_slot.participant_id)
+        host_adapter = (
+            self.registry.get_adapter(host_snapshot.agent_runtime_id)
+            if host_snapshot
+            else None
+        )
+        if not (host_snapshot and host_adapter):
+            return False
+        stale_session = self._host_agent_sessions.pop(room_id, None)
+        if stale_session is not None:
+            with contextlib.suppress(Exception):
+                stale_binding = self._host_agent_bindings.pop(room_id, None)
+                if stale_binding and self.runtime_executor:
+                    await self.runtime_executor.close(stale_binding)
+                else:
+                    await host_adapter.close(stale_session)
+        host_binding = await self.runtime_executor.open_session(
+            host_adapter,
+            AgentSessionConfig(
+                session_id=f"{room_id}_host",
+                room_id=room_id,
+                participant_id="host",
+                persona_id="room_host",
+                model_id=host_snapshot.model_id,
+                reasoning_effort=host_snapshot.reasoning_effort,
+                permission_profile=PermissionProfile.CHAT_SAFE,
+                allow_mcp=False,
+                tools=[],
+            ),
+        )
+        self._host_agent_sessions[room_id] = host_binding.session
+        self._host_agent_bindings[room_id] = host_binding
+        return True
+
+    async def update_room_bindings(
+        self,
+        room_id: str,
+        bindings: dict[str, dict[str, Any]],
+    ) -> RoomSessionState:
+        """Re-resolve and apply explicit provider/model/reasoning bindings.
+
+        Allowed only while the room is not generating (no protocol run, no
+        autonomous discussion, no conversion in flight, no turn generating).
+        Each entry replaces a slot's random pools with explicit selections,
+        re-resolves the binding snapshot through the resolver (which validates
+        runtime readiness, model membership and reasoning-effort support) and
+        reopens any live agent session for that slot so the new binding takes
+        effect on the next turn.
+        """
+        state = self.get_room(room_id)
+        if state is None:
+            raise KeyError(room_id)
+        if room_id in self._converting_rooms:
+            raise RoomBusyError(
+                "room_converting",
+                "房间正在进行协议迁移，请等待迁移完成后重试。",
+            )
+        if state.protocol_state.status.value == "running":
+            raise RoomBusyError(
+                "room_bindings_locked_during_run",
+                "房间正在运行协议流程，不能修改模型绑定；请先停止当前运行。",
+            )
+        tasks_in_flight = [
+            task
+            for task in (
+                self._protocol_tasks.get(room_id),
+                self._autonomous_tasks.get(room_id),
+                self._direct_reply_tasks.get(room_id),
+            )
+            if task is not None and not task.done()
+        ]
+        if tasks_in_flight or state.status == RoomStatus.DISCUSSING:
+            raise RoomBusyError(
+                "room_bindings_locked_during_run",
+                "房间正在生成回合，不能修改模型绑定；请先暂停或停止房间。",
+            )
+        if not bindings:
+            return state
+
+        known = {slot.participant_id: slot for slot in state.participants}
+        unknown = sorted(set(bindings) - known.keys())
+        if unknown:
+            raise BindingPreflightError(
+                reason=f"房间中不存在以下席位: {', '.join(unknown)}",
+                participant_id=unknown[0],
+                code="participant_not_found",
+            )
+
+        # Serialize against step_turn so a live turn can never observe a
+        # half-updated binding set.
+        lock = self._room_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            probes = await self.discovery.scan(force_refresh=False)
+            for participant_id, binding in bindings.items():
+                slot = known[participant_id]
+                runtime_id = str(binding.get("agent_runtime_id") or "").strip() or "default"
+                model_id = str(binding.get("model_id") or "").strip() or "default"
+                effort = str(binding.get("reasoning_effort") or "").strip() or "default"
+                slot_data = slot.model_dump(mode="python")
+                slot_data.update(
+                    {
+                        "runtime_selection": runtime_id,
+                        "model_selection": model_id,
+                        "reasoning_selection": effort,
+                        "runtime_pool": [],
+                        "model_pool": [],
+                        "reasoning_pool": [],
+                        "runtime_candidate_pool": [],
+                        "model_candidate_pool": [],
+                        "reasoning_candidate_pool": [],
+                    }
+                )
+                edited = ParticipantSlot.model_validate(slot_data)
+                # resolve_participant validates the runtime, the model
+                # membership and the reasoning-effort support; failures raise
+                # coded resolver errors before any state mutation.
+                snapshot = await self.resolver.resolve_participant(edited, probes)
+                slot.runtime_selection = runtime_id
+                slot.model_selection = model_id
+                slot.reasoning_selection = effort
+                slot.runtime_pool = []
+                slot.model_pool = []
+                slot.reasoning_pool = []
+                slot.runtime_candidate_pool = []
+                slot.model_candidate_pool = []
+                slot.reasoning_candidate_pool = []
+                state.binding_snapshots[participant_id] = snapshot
+
+            state.updated_at = datetime.now(UTC)
+            self._save_room_state(state, force=True)
+
+            # Reopen only sessions that are currently live; a room that has
+            # not started yet simply picks the new snapshots up at
+            # start/resume time.
+            live_sessions = self._active_agent_sessions.get(room_id) or {}
+            host_slot_id = next(
+                (
+                    slot.participant_id
+                    for slot in state.participants
+                    if slot.participant_id == state.host_participant_id
+                ),
+                state.participants[0].participant_id if state.participants else None,
+            )
+            reopened: list[str] = []
+            for participant_id in bindings:
+                if participant_id in live_sessions:
+                    await self.restart_session(room_id, participant_id)
+                    reopened.append(participant_id)
+                if participant_id == host_slot_id and self._host_agent_sessions.get(room_id):
+                    await self._open_host_session(room_id, state)
+                    reopened.append(f"{participant_id}:host")
+
+        await self._broadcast_event(
+            room_id,
+            {
+                "event": "room_bindings_updated",
+                "room_id": room_id,
+                "binding_snapshots": {
+                    key: value.model_dump(mode="json")
+                    for key, value in state.binding_snapshots.items()
+                },
+                "reopened": reopened,
+            },
+        )
+        return self.get_room(room_id) or state
+
     async def stop_room(self, room_id: str) -> RoomSessionState:
         state = self.get_room(room_id)
         if not state:
@@ -3131,6 +3597,9 @@ class MultiAgentOrchestrator:
         autonomous_task = self._autonomous_tasks.pop(room_id, None)
         if autonomous_task and autonomous_task is not asyncio.current_task():
             autonomous_task.cancel()
+        direct_reply_task = self._direct_reply_tasks.pop(room_id, None)
+        if direct_reply_task and direct_reply_task is not asyncio.current_task():
+            direct_reply_task.cancel()
 
         warmup_task = self._tool_warmup_tasks.pop(room_id, None)
         if warmup_task and not warmup_task.done():
@@ -3243,38 +3712,7 @@ class MultiAgentOrchestrator:
                 )
                 self._persona_session_ids[room_id][slot.participant_id] = new_sess.id
 
-        host_slot = next(
-            (
-                slot
-                for slot in state.participants
-                if slot.participant_id == state.host_participant_id
-            ),
-            state.participants[0] if state.participants else None,
-        )
-        if host_slot is not None:
-            host_snapshot = state.binding_snapshots.get(host_slot.participant_id)
-            host_adapter = (
-                self.registry.get_adapter(host_snapshot.agent_runtime_id)
-                if host_snapshot
-                else None
-            )
-            if host_snapshot and host_adapter and self.runtime_executor:
-                host_binding = await self.runtime_executor.open_session(
-                    host_adapter,
-                    AgentSessionConfig(
-                        session_id=f"{room_id}_host",
-                        room_id=room_id,
-                        participant_id="host",
-                        persona_id="room_host",
-                        model_id=host_snapshot.model_id,
-                        reasoning_effort=host_snapshot.reasoning_effort,
-                        permission_profile=PermissionProfile.CHAT_SAFE,
-                        allow_mcp=False,
-                        tools=[],
-                    ),
-                )
-                self._host_agent_sessions[room_id] = host_binding.session
-                self._host_agent_bindings[room_id] = host_binding
+        await self._open_host_session(room_id, state)
 
         state.status = RoomStatus.READY
         self._save_room_state(state)
@@ -3380,6 +3818,9 @@ class MultiAgentOrchestrator:
         autonomous_task = self._autonomous_tasks.pop(room_id, None)
         if autonomous_task:
             autonomous_task.cancel()
+        direct_reply_task = self._direct_reply_tasks.pop(room_id, None)
+        if direct_reply_task:
+            direct_reply_task.cancel()
         summary_task = self._summary_tasks.pop(room_id, None)
         if summary_task and not summary_task.done():
             summary_task.cancel()
@@ -3397,6 +3838,10 @@ class MultiAgentOrchestrator:
         would outlive the application.
         """
 
+        for task in list(self._direct_reply_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._direct_reply_tasks.clear()
         for task in list(self._tool_warmup_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -3407,6 +3852,10 @@ class MultiAgentOrchestrator:
     def shutdown_sync(self) -> None:
         """Best-effort teardown when no event loop is running."""
 
+        for task in list(self._direct_reply_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._direct_reply_tasks.clear()
         for task in list(self._tool_warmup_tasks.values()):
             if not task.done():
                 task.cancel()

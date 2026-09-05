@@ -39,6 +39,7 @@ class Database:
         self._ensure_world_binding_profile_columns()
         self._ensure_profile_enrichment_columns()
         self._ensure_job_center_columns()
+        self._ensure_identity_spec_v2_columns()
         self._ensure_research_capability_cache_columns()
         self._ensure_room_protocol_state()
         self._ensure_room_transcript_identity()
@@ -135,6 +136,7 @@ class Database:
         columns = self._table_columns("profile_enrichment_jobs")
         additions = {
             "enrichment_input_mode": "TEXT NOT NULL DEFAULT 'local_materials'",
+            "research_focus": "TEXT",
             "parent_job_id": "TEXT",
             "base_persona_version": "INTEGER",
             "input_material_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -231,6 +233,30 @@ class Database:
                     self.conn.execute(
                         "UPDATE persona_creation_jobs SET visibility = 'internal' WHERE id = ?",
                         (str(row["id"]),),
+                    )
+
+    def _ensure_identity_spec_v2_columns(self) -> None:
+        """Add V2 identity and research strategy columns to persona_creation_jobs."""
+        if "persona_creation_jobs" not in self._all_tables():
+            return
+        columns = self._table_columns("persona_creation_jobs")
+        additions = {
+            "subject_kind": "TEXT NOT NULL DEFAULT 'real_person'",
+            "work_or_universe": "TEXT",
+            "life_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "privacy_scope": "TEXT NOT NULL DEFAULT 'public'",
+            "identity_context": "TEXT",
+            "user_defined_facts": "TEXT",
+            "research_mode": "TEXT NOT NULL DEFAULT 'auto'",
+            "web_scope": "TEXT",
+            "research_instructions": "TEXT",
+            "resolved_identity_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, col_def in additions.items():
+            if name not in columns:
+                with contextlib.suppress(Exception):
+                    self.conn.execute(
+                        f"ALTER TABLE persona_creation_jobs ADD COLUMN {name} {col_def};"
                     )
 
     def _ensure_research_capability_cache_columns(self) -> None:

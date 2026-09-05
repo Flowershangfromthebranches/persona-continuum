@@ -12,6 +12,7 @@ from persona_continuum.agent.adapter import (
     safe_exec_cmd,
 )
 from persona_continuum.agent.models import (
+    AgentAttachment,
     AgentCapabilityFlags,
     AgentEvent,
     AgentEventType,
@@ -19,6 +20,7 @@ from persona_continuum.agent.models import (
     AgentSessionConfig,
     AgentStatus,
     AgentTurn,
+    MediaInputMode,
     ModelCapability,
     OutputStreamingMode,
     PromptMode,
@@ -35,6 +37,10 @@ from persona_continuum.auth.credentials import CredentialManager, build_runtime_
 class CommandCodeAdapter(AgentAdapter):
     adapter_id = "command_code"
     name = "Command Code"
+    # The headless invocation below is `command-code -p <prompt>`: the prompt
+    # travels as a single argv element, so the transport diagnostics must say
+    # argv.  (stdin is opened but immediately closed; nothing is written.)
+    prompt_transport_mode = "argv"
 
     def __init__(self) -> None:
         self.binary_candidates = [
@@ -199,7 +205,16 @@ class CommandCodeAdapter(AgentAdapter):
                 )
                 # Command Code's --effort contract exposes low, medium and
                 # high. "none" means omit the flag and use the model default.
-                supported_efforts = ["none", "low", "medium", "high"]
+                model_lower = model_id.lower()
+                if "glm-5.3-flash" in model_lower:
+                    supported_efforts = ["none", "low", "high", "max"]
+                    default_effort = "high"
+                elif "deepseek-v4-pro" in model_lower:
+                    supported_efforts = ["none", "high", "max"]
+                    default_effort = "high"
+                else:
+                    supported_efforts = ["none", "low", "medium", "high"]
+                    default_effort = "medium" if has_reasoning else "none"
 
                 models.append(
                     ModelCapability(
@@ -207,7 +222,7 @@ class CommandCodeAdapter(AgentAdapter):
                         display_name=f"{model_id} ({desc})" if desc != model_id else model_id,
                         provider=provider,
                         supported_reasoning_efforts=supported_efforts,
-                        default_reasoning_effort="medium" if has_reasoning else "none",
+                        default_reasoning_effort=default_effort,
                         # The CLI exposes --effort and this adapter binds it
                         # directly in build_exec_argv.
                         source="official_cli",
@@ -270,8 +285,14 @@ class CommandCodeAdapter(AgentAdapter):
         cmd = [binary, "-p", prompt, "--yolo", "--output-format", "text"]
         if config.model_id:
             cmd.extend(["-m", config.model_id])
-        if config.reasoning_effort and config.reasoning_effort not in {"none", "default"}:
-            cmd.extend(["--effort", config.reasoning_effort])
+        effort = (config.reasoning_effort or "").strip().lower()
+        if effort and effort not in {"none", "default", "auto"}:
+            model_id = (config.model_id or "").lower()
+            if ("glm-5.3-flash" in model_id and effort == "medium") or (
+                "deepseek-v4-pro" in model_id and effort in {"low", "medium"}
+            ):
+                effort = "high"
+            cmd.extend(["--effort", effort])
         return cmd
 
     async def create_session(self, config: AgentSessionConfig) -> AgentSession:
@@ -303,9 +324,51 @@ class CommandCodeAdapter(AgentAdapter):
             verification_method="cli_invocation_flags",
         )
 
+    def _attachment_prompt_block(self, turn: AgentTurn) -> str:
+        """Wire-text reference block for this turn's attachments.
+
+        Verified against the installed CLI (v1.49.0): headless `-p` reads a
+        plain filesystem path in the prompt and returns real vision content
+        (`@path` form also works, but the plain path is the stable carrier).
+        Only short path references travel here -- never file bytes.
+        """
+
+        from persona_continuum.agent.media_transport import (
+            describe_unconsumed_attachment,
+            require_consumable_or_raise,
+        )
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        if not attachments:
+            return ""
+        lines = ["用户本轮上传了以下附件："]
+        for attachment in attachments:
+            mode = MediaInputMode.LOCAL_PATH.value
+            if attachment.kind not in {"image", "video", "audio", "file"}:
+                mode = MediaInputMode.UNSUPPORTED.value
+            if mode == MediaInputMode.LOCAL_PATH.value:
+                lines.append(
+                    f"- {attachment.kind} {attachment.filename}：{attachment.local_path} "
+                    "请读取该文件并将文件内容作为本轮用户输入的一部分，"
+                    "结合房间上下文完成回答。"
+                )
+            else:
+                require_consumable_or_raise(
+                    attachment, mode, adapter_id=self.adapter_id
+                )
+                lines.append(describe_unconsumed_attachment(attachment, mode))
+        return "\n".join(lines)
+
     async def send(self, session: AgentSession, turn: AgentTurn) -> AsyncIterator[AgentEvent]:
         binary = session.session_data.get("binary") or self._find_binary() or "command-code"
         prompt = AgentPromptRenderer.render_for_single_prompt(turn)
+        media_block = self._attachment_prompt_block(turn)
+        if media_block:
+            prompt = f"{prompt}\n\n{media_block}"
         cmd = self.build_exec_argv(binary, session.config, prompt)
 
         env = build_runtime_environment(
@@ -348,14 +411,20 @@ class CommandCodeAdapter(AgentAdapter):
             diagnostics = {
                 "returncode": returncode,
                 "stderr_tail": transport.stderr_tail,
+                "cli_failure": transport.stderr_tail,
                 "output_streaming_mode": self.output_streaming_mode.value,
             }
             if returncode and not full_content:
+                err_msg = (
+                    transport.stderr_tail.strip()
+                    if transport.stderr_tail and transport.stderr_tail.strip()
+                    else "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT"
+                )
                 yield AgentEvent(
                     type=AgentEventType.ERROR,
-                    error="AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                    error=err_msg,
                     metadata={
-                        "failure_code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                        "failure_code": err_msg,
                         **diagnostics,
                     },
                 )

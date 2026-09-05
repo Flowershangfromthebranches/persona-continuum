@@ -75,10 +75,44 @@ def adapter_output_streaming_mode(adapter: Any) -> OutputStreamingMode:
         return OutputStreamingMode.UNKNOWN
 
 
+def adapter_wire_text(adapter: Any, turn: AgentTurn) -> str:
+    """Best-effort rendering of what this adapter actually puts on the wire.
+
+    The Prompt Transport Guard must measure the real carrier text, not the
+    canonical turn: an image that travels as ``@/path`` costs ~100 bytes on
+    a CLI transport, while the same image inlined as base64 costs megabytes
+    on an HTTP transport.  Adapters that append an attachment block expose
+    it through ``attachment_prompt_block`` (plain CLI family) or consume
+    attachments natively (app-server / HTTP family, no extra wire text).
+    """
+
+    from persona_continuum.agent.prompt import AgentPromptRenderer
+
+    base = AgentPromptRenderer.render_for_single_prompt(turn)
+    block_fn = getattr(adapter, "attachment_prompt_block", None)
+    if callable(block_fn):
+        try:
+            block = block_fn(turn)
+        except Exception:
+            block = ""
+        if block:
+            return f"{base}\n\n{block}"
+    block_fn = getattr(adapter, "_attachment_prompt_block", None)
+    if callable(block_fn):
+        try:
+            block = block_fn(turn)
+        except Exception:
+            block = ""
+        if block:
+            return f"{base}\n\n{block}"
+    return base
+
+
 __all__ = [
     "AgentAdapterContract",
     "AgentAdapterContractError",
     "adapter_prompt_mode",
     "adapter_structured_output_mode",
     "adapter_output_streaming_mode",
+    "adapter_wire_text",
 ]

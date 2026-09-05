@@ -48,6 +48,15 @@ class PersonaManifest(BaseModel):
     current_main_branch: str | None = None
     sensitivity: str = "normal"
     archived: bool = False
+    # Identity & Research Strategy V2 extensions (optional for backwards compatibility)
+    subject_kind: str | None = None
+    work_or_universe: str | None = None
+    life_status: str | None = None
+    privacy_scope: str | None = None
+    identity_context: str | None = None
+    user_defined_facts: str | None = None
+    research_mode: str | None = None
+    resolved_identity_json: dict[str, Any] | None = None
 
 
 class PersonaRecord(BaseModel):

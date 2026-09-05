@@ -102,7 +102,11 @@ def test_each_clip_carries_settings_and_rationale() -> None:
     clips = plan_clips(_sixteen_shot_fixture(), get_profile("generic"))
     assert clips
     for clip in clips:
-        assert clip.recommended_settings["duration_seconds"] == clip.duration_seconds
+        # Single duration source of truth (task #29): no target_duration_seconds.
+        assert clip.recommended_settings["actual_generation_duration"] == (
+            clip.duration_seconds
+        )
+        assert "target_duration_seconds" not in clip.recommended_settings
         assert clip.recommended_settings["aspect_ratio"] == clip.aspect_ratio
         assert clip.planning_rationale
         assert clip.target_profile_id == "generic"

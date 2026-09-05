@@ -340,6 +340,41 @@ async def test_inject_free_discussion_autonomous_still_starts(app: Any) -> None:
 
 
 @pytest.mark.anyio
+async def test_direct_chat_accepts_one_persona_and_starts_one_reply(app: Any) -> None:
+    app.personas.create_from_manifest(_manifest("direct_persona"))
+    room = app.orchestrator.create_room(
+        title="direct chat",
+        participants=[_slot("direct_persona", "member")],
+        protocol=RoomProtocolType.FREE_DISCUSSION,
+        mode=RoomMode.DIRECT_CHAT,
+    )
+    _mark_ready(app, room.id)
+    calls: list[tuple[str, str]] = []
+
+    def fake_direct_reply(room_id: str, user_message: str) -> None:
+        calls.append((room_id, user_message))
+
+    app.orchestrator.start_direct_reply = fake_direct_reply  # type: ignore[method-assign]
+    event = await app.orchestrator.inject_message(room.id, "你好")
+
+    assert event["message"]["participant_id"] == "user"
+    assert calls == [(room.id, "你好")]
+
+
+def test_direct_chat_rejects_multiple_personas(app: Any) -> None:
+    for persona_id in ("direct_a", "direct_b"):
+        app.personas.create_from_manifest(_manifest(persona_id))
+
+    with pytest.raises(ValueError, match="direct_chat_requires_exactly_one_participant"):
+        app.orchestrator.create_room(
+            title="invalid direct chat",
+            participants=[_slot("direct_a", "member"), _slot("direct_b", "member")],
+            protocol=RoomProtocolType.FREE_DISCUSSION,
+            mode=RoomMode.DIRECT_CHAT,
+        )
+
+
+@pytest.mark.anyio
 async def test_final_answer_appears_exactly_once(app: Any) -> None:
     """Synthesis produces the final answer; the terminal event never doubles it."""
     for persona_id in ("once_host", "once_expert"):

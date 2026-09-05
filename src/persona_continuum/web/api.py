@@ -7,6 +7,7 @@ import json
 import re
 import zipfile
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from starlette.requests import Request
@@ -51,6 +52,7 @@ from persona_continuum.room.models import (
     RoomSharedContext,
 )
 from persona_continuum.room.orchestrator import RoomBusyError, RoomProtocolConversionError
+from persona_continuum.room.random_resolver import ResolverError
 from persona_continuum.security.validation import ConflictError
 
 
@@ -369,6 +371,7 @@ class WebAPIHandler:
                 materials=list(body.get("materials") or []),
                 remote_material_consent=bool(body.get("remote_material_consent")),
                 enrichment_input_mode=body.get("enrichment_input_mode"),
+                research_focus=body.get("research_focus") or body.get("research_instructions"),
             )
             return json_ok(self._public_profile_job(job), status_code=202)
         except Exception as exc:
@@ -456,6 +459,30 @@ class WebAPIHandler:
         try:
             state = self.continuum.runtime_state(persona_id, branch_id)
             return json_ok(state)
+        except Exception as exc:
+            return json_err(str(exc), status_code=404)
+
+    async def reset_persona_runtime(self, request: Request) -> Response:
+        persona_id = request.path_params.get("persona_id", "")
+        try:
+            body = await request.json() if request.method == "POST" else {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        branch_id = (
+            str(body.get("branch_id") or request.query_params.get("branch_id") or "main")
+        ).strip() or "main"
+        include_memories = bool(
+            body.get("include_memories")
+            or body.get("full_reset")
+            or request.query_params.get("include_memories") in {"1", "true", "yes"}
+        )
+        try:
+            result = self.continuum.reset_runtime_state(
+                persona_id, branch_id=branch_id, include_memories=include_memories
+            )
+            return json_ok(result)
         except Exception as exc:
             return json_err(str(exc), status_code=404)
 
@@ -598,6 +625,15 @@ class WebAPIHandler:
                     body.get("remote_material_consent") or body.get("privacy_consent")
                 ),
                 job_config=job_config,
+                subject_kind=body.get("subject_kind"),
+                work_or_universe=body.get("work_or_universe"),
+                life_status=body.get("life_status"),
+                privacy_scope=body.get("privacy_scope"),
+                identity_context=body.get("identity_context"),
+                user_defined_facts=body.get("user_defined_facts"),
+                research_mode=body.get("research_mode"),
+                web_scope=body.get("web_scope"),
+                research_instructions=body.get("research_instructions"),
             )
             payload = self._public_persona_creation_job(job)
             payload["job_id"] = job.id
@@ -1159,6 +1195,26 @@ class WebAPIHandler:
         except Exception as exc:
             return json_err(str(exc), status_code=400)
 
+    async def update_room_bindings(self, request: Request) -> Response:
+        room_id = request.path_params.get("room_id", "")
+        try:
+            body = await request.json()
+            bindings = body.get("bindings")
+            if not isinstance(bindings, dict) or not bindings:
+                return json_err("bindings is required", status_code=400)
+            room = await self.orchestrator.update_room_bindings(room_id, bindings)
+            return json_ok(room.model_dump(mode="json"))
+        except RoomBusyError as exc:
+            return json_err(exc.message, status_code=409, details={"code": exc.code})
+        except BindingPreflightError as exc:
+            return json_err(exc.reason, status_code=400, details=exc.to_dict())
+        except ResolverError as exc:
+            return json_err(str(exc), status_code=400)
+        except KeyError:
+            return json_err(f"Room not found: {room_id}", status_code=404)
+        except Exception as exc:
+            return json_err(str(exc), status_code=400)
+
     async def run_room_protocol(self, request: Request) -> Response:
         room_id = request.path_params.get("room_id", "")
         try:
@@ -1375,6 +1431,12 @@ class WebAPIHandler:
         room_id = request.path_params.get("room_id", "")
         try:
             body = await request.json()
+            raw_attachments = body.get("attachments") or body.get("attachment_ids") or []
+            attachment_ids = (
+                [str(item) for item in raw_attachments]
+                if isinstance(raw_attachments, list)
+                else []
+            )
             event = await self.orchestrator.inject_message(
                 room_id,
                 content=str(body.get("content") or body.get("message") or ""),
@@ -1382,10 +1444,84 @@ class WebAPIHandler:
                 client_message_id=str(
                     body.get("client_message_id") or body.get("request_id") or ""
                 ),
+                attachment_ids=attachment_ids,
             )
             return json_ok(event)
         except Exception as exc:
             return json_err(str(exc))
+
+    async def upload_room_attachment(self, request: Request) -> Response:
+        room_id = request.path_params.get("room_id", "")
+        try:
+            body = await request.json()
+            content_base64 = body.get("content_base64") or body.get("content")
+            if not isinstance(content_base64, str) or not content_base64.strip():
+                return json_err("content_base64 is required", status_code=400)
+            attachment = self.orchestrator.upload_room_attachment(
+                room_id,
+                filename=str(body.get("filename") or "attachment"),
+                mime=str(body.get("mime") or body.get("content_type") or ""),
+                content_base64=content_base64,
+            )
+            return json_ok(attachment, status_code=201)
+        except KeyError:
+            return json_err(f"Room not found: {room_id}", status_code=404)
+        except ValueError as exc:
+            return json_err(str(exc), status_code=400)
+        except Exception as exc:
+            return json_err(str(exc), status_code=400)
+
+    async def download_room_attachment(self, request: Request) -> Response:
+        from starlette.responses import FileResponse
+
+        from persona_continuum.security.paths import ensure_child_path
+
+        room_id = request.path_params.get("room_id", "")
+        stored_name = request.path_params.get("stored_name", "")
+        try:
+            uploads_root = self.continuum.config.room_uploads_dir
+            candidate = ensure_child_path(
+                uploads_root, uploads_root / room_id / Path(stored_name).name
+            )
+            if not candidate.is_file():
+                return json_err("Attachment not found", status_code=404)
+            record = self.orchestrator.get_room_attachment_by_stored_name(
+                room_id, candidate.name
+            )
+            filename = str((record or {}).get("filename") or candidate.name)
+            media_type = str((record or {}).get("mime") or "application/octet-stream")
+            return FileResponse(
+                path=str(candidate),
+                media_type=media_type,
+                filename=filename,
+            )
+        except Exception as exc:
+            return json_err(str(exc), status_code=400)
+
+    async def download_room_attachment_by_id(self, request: Request) -> Response:
+        from starlette.responses import FileResponse
+
+        from persona_continuum.security.paths import ensure_child_path
+
+        attachment_id = request.path_params.get("attachment_id", "")
+        try:
+            record = self.orchestrator.get_room_attachment(attachment_id)
+            if record is None:
+                return json_err("Attachment not found", status_code=404)
+            uploads_root = self.continuum.config.room_uploads_dir
+            candidate = ensure_child_path(
+                uploads_root,
+                uploads_root / str(record.get("room_id")) / str(record.get("stored_name")),
+            )
+            if not candidate.is_file():
+                return json_err("Attachment not found", status_code=404)
+            return FileResponse(
+                path=str(candidate),
+                media_type=str(record.get("mime") or "application/octet-stream"),
+                filename=str(record.get("filename") or candidate.name),
+            )
+        except Exception as exc:
+            return json_err(str(exc), status_code=400)
 
     async def resume_room(self, request: Request) -> Response:
         room_id = request.path_params.get("room_id", "")
@@ -3531,6 +3667,47 @@ class WebAPIHandler:
                     "project_id": project_id,
                     "prompt_package_id": source.id,
                     "options": options,
+                },
+            )
+            return json_ok(job, status_code=202)
+        except Exception as exc:
+            return shooting_json_err(exc)
+
+    async def create_complete_video_production_job(self, request: Request) -> Response:
+        """POST production/{package_id}/complete-plan → one-click job (202).
+
+        Task #5/#6: the ONLY Simple Mode action — clip plan + prompt package +
+        production guide compiled as ONE background job. Fail-fast validation
+        (canon master, non-preview package, known profile) returns 404/409/422
+        instead of a doomed background job.
+        """
+        project_id = request.path_params.get("project_id", "")
+        package_id = request.path_params.get("package_id", "")
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            body = body or {}
+            target_profile_id = str(
+                body.get("target_profile_id") or body.get("profile_id") or ""
+            )
+            if not target_profile_id:
+                return json_err("target_profile_id is required")
+            get_profile(target_profile_id)
+            self._validated_prompt_package_source(package_id)
+            job = self.continuum.narratives.create_job(
+                "complete_video_production",
+                project_id,
+                {
+                    "production_package_id": package_id,
+                    "target_profile_id": target_profile_id,
+                    "aspect_ratio": str(body.get("aspect_ratio") or "16:9"),
+                    "quality_priority": str(body.get("quality_priority") or "balanced"),
+                    "generation_strategy": str(body.get("generation_strategy") or "auto"),
+                    "continuity_strategy": str(body.get("continuity_strategy") or "auto"),
+                    "audio_strategy": str(body.get("audio_strategy") or "auto"),
+                    "prompt_language": str(body.get("prompt_language") or "auto"),
                 },
             )
             return json_ok(job, status_code=202)

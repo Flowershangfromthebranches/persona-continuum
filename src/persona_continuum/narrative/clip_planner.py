@@ -260,9 +260,12 @@ def plan_clips(
                 continuity_constraints=continuity_constraints,
                 planning_rationale=rationale,
                 recommended_settings={
-                    "duration_seconds": duration,
+                    # Single duration source of truth (task #29): the value
+                    # this clip is actually generated with. The old
+                    # target_duration_seconds key is intentionally gone — it
+                    # contradicted duration_seconds in the UI.
+                    "actual_generation_duration": duration,
                     "aspect_ratio": aspect_ratio,
-                    "target_duration_seconds": target,
                     "quality_priority": quality_priority,
                 },
             )

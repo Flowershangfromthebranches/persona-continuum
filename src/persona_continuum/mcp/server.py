@@ -116,6 +116,8 @@ TOOL_NAMES = [
     "narrative_list_video_profiles",
     "narrative_get_video_prompt_package",
     "narrative_create_video_prompt_package",
+    "narrative_get_video_production_guide",
+    "narrative_create_complete_video_production",
 ]
 
 
@@ -1326,6 +1328,70 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
                 next_actions=[
                     f"Poll narrative job {job.get('id')} for progress; stages: "
                     "planning_clips / planning_assets / compiling_prompts / validating"
+                ],
+            )
+
+        return guarded(_call)
+
+    @server.tool()
+    def narrative_get_video_production_guide(
+        project_id: str, guide_id: str, include_markdown: bool = True
+    ) -> dict[str, Any]:
+        """Reads one complete video production guide (assets, clip work
+        orders, plans, and the full markdown handbook)."""
+
+        def _call() -> dict[str, Any]:
+            guide = context.app().narratives.repo.get_video_production_guide(guide_id)
+            if guide is None or guide.project_id != project_id:
+                return fail(
+                    "VIDEO_PRODUCTION_GUIDE_NOT_FOUND",
+                    f"Production guide not found: {guide_id}",
+                )
+            data = _serialize(guide)
+            if not include_markdown:
+                data.pop("markdown_document", None)
+            return ok({"guide": data})
+
+        return guarded(_call)
+
+    @server.tool()
+    def narrative_create_complete_video_production(
+        project_id: str,
+        production_package_id: str,
+        target_profile_id: str,
+        aspect_ratio: str = "16:9",
+        quality_priority: str = "balanced",
+        generation_strategy: str = "auto",
+        continuity_strategy: str = "auto",
+        audio_strategy: str = "auto",
+        prompt_language: str = "auto",
+    ) -> dict[str, Any]:
+        """One-click job: clip plan + model prompt package + full production
+        guide (完整 AI 视频制作方案) compiled as ONE operation."""
+
+        def _call() -> dict[str, Any]:
+            # Unknown profile → structured error instead of a failed job row.
+            get_profile(target_profile_id)
+            job = context.app().narratives.create_job(
+                "complete_video_production",
+                project_id,
+                {
+                    "production_package_id": production_package_id,
+                    "target_profile_id": target_profile_id,
+                    "aspect_ratio": aspect_ratio,
+                    "quality_priority": quality_priority,
+                    "generation_strategy": generation_strategy,
+                    "continuity_strategy": continuity_strategy,
+                    "audio_strategy": audio_strategy,
+                    "prompt_language": prompt_language,
+                },
+            )
+            return ok(
+                {"job": job, "accepted": True},
+                next_actions=[
+                    f"Poll narrative job {job.get('id')} for progress; final "
+                    "result carries production_guide_id (the complete video "
+                    "production guide)"
                 ],
             )
 

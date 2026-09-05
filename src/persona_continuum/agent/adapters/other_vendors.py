@@ -5,6 +5,7 @@ import re
 from persona_continuum.agent.adapter import resolve_binary, safe_exec_cmd
 from persona_continuum.agent.models import (
     AgentProbeResult,
+    AgentStatus,
     ModelCapability,
     ResearchCapability,
     ResearchVerificationStatus,
@@ -384,6 +385,19 @@ class CodeBuddyAdapter(PlainCliAdapter):
             default_models=self._fallback_models(),
         )
 
+    async def probe(self) -> AgentProbeResult:
+        result = await super().probe()
+        if result.status == AgentStatus.READY and result.binary_path:
+            code, out, err = await safe_exec_cmd([result.binary_path, "status"], timeout=4.0)
+            combined = f"{out}\n{err}".lower()
+            if "authentication required" in combined or "use /login" in combined:
+                result.status = AgentStatus.AUTH_REQUIRED
+                result.auth_status = "auth_required"
+                result.status_detail = (
+                    "Authentication required. Please use /login command to sign in to your account"
+                )
+        return result
+
     @classmethod
     def _fallback_models(cls) -> list[ModelCapability]:
         known = [
@@ -482,9 +496,10 @@ class CodeBuddyAdapter(PlainCliAdapter):
         return models
 
 
-class WorkBuddyAdapter(PlainCliAdapter):
+class WorkBuddyAdapter(CodeBuddyAdapter):
     def __init__(self) -> None:
-        super().__init__(
+        PlainCliAdapter.__init__(
+            self,
             adapter_id="workbuddy",
             name="WorkBuddy",
             binary_candidates=[

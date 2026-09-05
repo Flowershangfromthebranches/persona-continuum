@@ -121,6 +121,15 @@ life stages，按事件时间而不是发表年份映射证据；主动执行失
 相互矛盾描述的检索，并记录没有找到负面证据这一结果。
 """.strip()
 
+FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT = """
+你的目标是为 Persona Continuum 构建具有作品正史（Canon）严格约束的已有作品角色数字人格。
+1. 首先确认作品与角色身份，区分官方正史（Canon）、官方补充资料（Official Supplement）与粉丝/社区二创解读（Fan Interpretation）。
+2. 优先检索原著剧情、官方设定集、卡面剧情、角色台词对白、创作者访谈。
+3. 研究角色在作品各主线篇章/个人线中的心理与行为变化、关系模式、防御机制、核心价值观与潜在矛盾。
+4. 绝对严禁将同人二创、玩家社区猜测当作官方设定；对 Canon 存疑或剧情未揭示内容明确标注 uncertainty。
+5. 严禁混淆现实同名人物；所有检索与提取必须紧密锚定在角色所属的作品世界观内。
+""".strip()
+
 LOCAL_MATERIAL_SYSTEM_PROMPT = """
 你是 Persona Continuum 的本地资料人格证据分析器。只能分析本次输入的 Evidence Ledger
 内容；禁止联网、搜索、WebFetch、Browser，也禁止用模型已有知识补写人物经历。所有事实、
@@ -548,6 +557,17 @@ class PersonaCreationJob(BaseModel):
     job_config: dict[str, Any] = Field(default_factory=dict)
     events: list[dict[str, Any]] = Field(default_factory=list)
     interview_questions: list[dict[str, Any]] = Field(default_factory=list)
+    # Identity & Research Strategy V2
+    subject_kind: str = "real_person"
+    work_or_universe: str | None = None
+    life_status: str = "unknown"
+    privacy_scope: str = "public"
+    identity_context: str | None = None
+    user_defined_facts: str | None = None
+    research_mode: str = "auto"
+    web_scope: str | None = None
+    research_instructions: str | None = None
+    resolved_identity: dict[str, Any] | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -1176,6 +1196,16 @@ class PersonaCreationOrchestrator:
         enrichment_input_mode: str | None = None,
         visibility: str | JobVisibility = JobVisibility.USER,
         start_worker: bool = True,
+        # V2 Identity & Research Strategy arguments
+        subject_kind: str | None = None,
+        work_or_universe: str | None = None,
+        life_status: str | None = None,
+        privacy_scope: str | None = None,
+        identity_context: str | None = None,
+        user_defined_facts: str | None = None,
+        research_mode: str | None = None,
+        web_scope: str | None = None,
+        research_instructions: str | None = None,
     ) -> PersonaCreationJob:
         name = str(display_name or "").strip()
         if not name:
@@ -1297,6 +1327,15 @@ class PersonaCreationOrchestrator:
             auth_profile_id=auth_profile_id,
             agent_version=probe.version,
             capability_snapshot=snapshot,
+            subject_kind=str(subject_kind or "real_person"),
+            work_or_universe=str(work_or_universe).strip() if work_or_universe else None,
+            life_status=str(life_status or "unknown"),
+            privacy_scope=str(privacy_scope or "public"),
+            identity_context=str(identity_context).strip() if identity_context else None,
+            user_defined_facts=str(user_defined_facts).strip() if user_defined_facts else None,
+            research_mode=str(research_mode or "auto"),
+            web_scope=str(web_scope) if web_scope else None,
+            research_instructions=str(research_instructions).strip() if research_instructions else None,
             persona_id=persona.id,
             compilation_task_id=task.id,
             research_policy=policy,
@@ -2060,6 +2099,7 @@ class PersonaCreationOrchestrator:
         research_policy: ResearchPolicy | dict[str, Any] | None = None,
         requested_scope: str | None = None,
         enrichment_input_mode: str = "local_materials",
+        research_instructions: str | None = None,
         materials: list[dict[str, Any]] | None = None,
         runtime: dict[str, Any] | None = None,
         base_persona_version: int | None = None,
@@ -2194,6 +2234,11 @@ class PersonaCreationOrchestrator:
                 else JobVisibility.USER.value
             ),
             job_config=child_config,
+            research_instructions=(
+                str(research_instructions).strip()
+                if str(research_instructions or "").strip()
+                else None
+            ),
         )
         child.touch_worker(WorkerState.STARTING, heartbeat_at=child.created_at)
         self._save(child)
@@ -2874,11 +2919,43 @@ class PersonaCreationOrchestrator:
             self._tasks.pop(job_id, None)
 
     async def _research_public(self, job: PersonaCreationJob) -> None:
+        from persona_continuum.application.identity_resolver import IdentityResolver, ResearchQueryBuilder
+        from persona_continuum.domain.identity import IdentitySpec, SubjectKind
+
+        # Phase 1: Identity Resolution
+        spec = IdentitySpec(
+            display_name=job.display_name,
+            aliases=job.aliases,
+            subject_kind=SubjectKind(getattr(job, "subject_kind", "real_person") or "real_person"),
+            work_or_universe=job.work_or_universe,
+            life_status=getattr(job, "life_status", "unknown") or "unknown",
+            privacy_scope=getattr(job, "privacy_scope", "public") or "public",
+            identity_context=job.identity_context,
+            user_defined_facts=job.user_defined_facts,
+            research_mode=getattr(job, "research_mode", "auto") or "auto",
+            web_scope=getattr(job, "web_scope", None),
+            research_instructions=job.research_instructions,
+        )
+        resolved = IdentityResolver.resolve_spec(spec)
+        job.resolved_identity = resolved.model_dump(mode="json")
+        self._save(job)
+        await self._emit(job, "persona_identity_resolved", resolved=job.resolved_identity)
+
         await self._set_stage(job, "researching", "researching")
         backend = await self._resolve_research_backend_from_job(job)
         job.job_config["research_backend"] = getattr(backend, "name", "unknown")
         self._save(job)
         plan = await self._research_plan(job)
+
+        # Transform queries with ResearchQueryBuilder to enforce canon / background scoping
+        raw_queries = list(plan.get("queries") or [])
+        raw_contradiction = list(plan.get("contradiction_search_queries") or [])
+        raw_negative = list(plan.get("negative_evidence_queries") or [])
+
+        plan["queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_queries)
+        plan["contradiction_search_queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_contradiction)
+        plan["negative_evidence_queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_negative)
+
         life_stage_model = LifeStageModel.from_plan(plan)
         job.life_stages = [stage.model_dump(mode="json") for stage in life_stage_model.life_stages]
         job.job_config["life_stage_model"] = job.life_stages
@@ -3598,28 +3675,39 @@ class PersonaCreationOrchestrator:
         return plan
 
     async def _research_plan(self, job: PersonaCreationJob) -> dict[str, Any]:
+        is_fictional = getattr(job, "subject_kind", "") == "fictional_character" or bool(job.work_or_universe)
+        system_prompt = FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT if is_fictional else PUBLIC_RESEARCH_SYSTEM_PROMPT
+
+        instructions = [
+            "跨越剧情篇章/阶段生成研究查询（原著出场、主线推进、个人支线、重大转折与高光）" if is_fictional else "跨越人物生命和事业阶段生成研究查询",
+            "包含官方设定、原著对白/剧情、官方访谈、剧情冲突、人设争议与性格转变" if is_fictional else "包含第一人称、官方、传记、长期报道、批评、失败、争议和观点变化",
+            "不要把转载同源内容或同人二创作为独立 Canon 来源",
+            "动态识别角色的重要剧情阶段（Canon stages）；每个阶段返回 id、title、start、end、significance、required_evidence",
+            "主动规划 contradiction_search_queries 和 negative_evidence_queries（如人设矛盾、谎言与真实意图、剧情挫败）",
+        ]
+        if job.work_or_universe:
+            instructions.append(f"必须明确围绕作品世界观《{job.work_or_universe}》进行检索，排除无关同名实体")
+        if job.identity_context:
+            instructions.append(f"身份消歧约束：{job.identity_context}")
+        if job.research_instructions:
+            instructions.append(f"特定研究要求：{job.research_instructions}")
+
         prompt = {
             "display_name": job.display_name,
             "persona_type": job.persona_type.value,
+            "subject_kind": getattr(job, "subject_kind", "real_person"),
+            "work_or_universe": job.work_or_universe,
             "enrichment_scope": job.job_config.get("enrichment_scope", "full_refresh"),
             "policy": job.research_policy.model_dump(mode="json"),
             "required_dimensions": REQUIRED_DIMENSIONS,
-            "instructions": [
-                "跨越人物生命和事业阶段生成研究查询",
-                "包含第一人称、官方、传记、长期报道、批评、失败、争议和观点变化",
-                "不要把转载同源新闻作为独立来源",
-                "动态识别人物的重要 life_stages；每个阶段返回 "
-                "id、title、start、end、significance、required_evidence",
-                "以事件发生时间映射 life stage，不要用来源发表年份代替事件时间",
-                "主动规划 contradiction_search_queries 和 negative_evidence_queries",
-            ],
+            "instructions": instructions,
         }
         request = json.dumps(prompt, ensure_ascii=False)
         try:
             result = await self._agent_json(
                 job,
                 user_message=request,
-                system_prompt=PUBLIC_RESEARCH_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 phase="public_research",
                 schema=self.RESEARCH_PLAN_SCHEMA,
             )
@@ -3634,7 +3722,7 @@ class PersonaCreationOrchestrator:
             result = await self._agent_json(
                 job,
                 user_message=repair_message,
-                system_prompt=PUBLIC_RESEARCH_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 phase="public_research",
                 schema=self.RESEARCH_PLAN_SCHEMA,
             )
@@ -4868,12 +4956,8 @@ class PersonaCreationOrchestrator:
                     (target_components_by_dimension or {}).get(dimension, [])
                 )
                 current_artifact = current_artifacts.get(dimension, {})
-                if target_components:
-                    evidence_items = self._targeted_repair_evidence_items(
-                        current_artifact,
-                        known_source_ids=set(source_by_id),
-                    )
-                else:
+
+                def retrieved_evidence_items() -> list[dict[str, Any]]:
                     retrieved = (
                         self.material_intelligence.get_index(job.persona_id or "").retrieve(
                             dimension, top_k=32, diversity=True
@@ -4881,7 +4965,7 @@ class PersonaCreationOrchestrator:
                         if self.material_intelligence is not None
                         else []
                     )
-                    evidence_items = [
+                    return [
                         {
                             "evidence_id": item.get("id"),
                             "source_ids": [
@@ -4896,6 +4980,19 @@ class PersonaCreationOrchestrator:
                         }
                         for item in retrieved
                     ]
+
+                if target_components:
+                    evidence_items = self._targeted_repair_evidence_items(
+                        current_artifact,
+                        known_source_ids=set(source_by_id),
+                    )
+                    if not evidence_items:
+                        # An empty or claim-less artifact has no claim slice
+                        # to repair from; without the index fallback the
+                        # targeted repair could never rebuild anything.
+                        evidence_items = retrieved_evidence_items()
+                else:
+                    evidence_items = retrieved_evidence_items()
                 if not evidence_items:
                     if target_components:
                         return {
@@ -5153,6 +5250,38 @@ class PersonaCreationOrchestrator:
             if key not in existing_claim_keys:
                 merged.setdefault("claims", []).append(claim)
                 existing_claim_keys.add(key)
+                if source_id and source_id not in merged.get("source_ids", []):
+                    merged.setdefault("source_ids", []).append(source_id)
+
+        # Handle any memories attached during targeted repair as well
+        existing_memory_keys = {
+            (str(item.get("content") or ""), str(item.get("source_id") or ""))
+            for item in merged.get("memories") or []
+            if isinstance(item, dict)
+        }
+        for memory in repaired.get("memories") or []:
+            if not isinstance(memory, dict):
+                continue
+            source_id = str(memory.get("source_id") or "")
+            content = str(memory.get("content") or "").strip()
+            if not content or source_id not in allowed_source_ids:
+                continue
+            key = (content, source_id)
+            if key not in existing_memory_keys:
+                merged.setdefault("memories", []).append(memory)
+                existing_memory_keys.add(key)
+                if source_id and source_id not in merged.get("source_ids", []):
+                    merged.setdefault("source_ids", []).append(source_id)
+
+        # Absolute guarantee: ensure all referenced source_ids in claims and memories are in source_ids
+        referenced_source_ids = {
+            str(c.get("source_id"))
+            for c in (merged.get("claims") or []) + (merged.get("memories") or [])
+            if isinstance(c, dict) and c.get("source_id")
+        }
+        current_source_ids = set(merged.get("source_ids") or [])
+        merged["source_ids"] = sorted(current_source_ids | referenced_source_ids)
+
         merged["artifact_id"] = new_id("art")
         merged["artifact_hash"] = hashlib.sha256(
             json.dumps(merged, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -5743,6 +5872,33 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         await self._emit(job, "persona_interview_question", **question)
 
     async def _ingest_configured_materials(self, job: PersonaCreationJob) -> None:
+        # If user explicitly provided user_defined_facts, ingest them as authoritative initial Evidence
+        if job.user_defined_facts and job.persona_id and not any("user_defined_facts" in str(s) for s in job.source_ids):
+            provenance_kind = "fictional_author_defined" if getattr(job, "subject_kind", "") in {"fictional_character", "original_character"} else "user_provided"
+            try:
+                source = self.continuum.personas.add_source_text(
+                    job.persona_id,
+                    title="Author Defined Facts / 人物设定",
+                    source_type=provenance_kind,
+                    canonical_url=None,
+                    publisher="user_author",
+                    author="author",
+                    published_at=None,
+                    accessed_at=datetime.now(UTC).isoformat(),
+                    content=job.user_defined_facts.strip(),
+                    metadata={
+                        "provenance": provenance_kind,
+                        "authority": "author_defined",
+                        "canon_priority": 1 if provenance_kind == "fictional_author_defined" else 0,
+                    },
+                )
+                if source.id not in job.source_ids:
+                    job.source_ids.append(source.id)
+                    job.source_ids = sorted(set(job.source_ids))
+                    job.source_count = len(job.source_ids)
+            except Exception:
+                pass
+
         configured = list(job.job_config.get("materials", []))
         if not configured or not job.persona_id:
             return
@@ -6565,7 +6721,20 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         runtime: dict[str, Any],
         job_id: str,
         force_revalidate: bool = False,
-    ) -> ResearchBackend:
+    ) -> ResearchBackend | None:
+        """Preflight research check: cache-only, never blocks on a live probe.
+
+        The behavioral probe (opening a real CLI session, running web search
+        and fetch) can take 2-6 minutes and must NOT run inside the HTTP
+        request handler.  Instead we check the durable capability cache:
+
+        - Cache VERIFIED (not expired): accept immediately.
+        - Cache UNAVAILABLE/BLOCKED (not expired): fail fast with a clear
+          error so the user can switch Runtime before wasting time.
+        - Cache expired or missing: return None (pass).  The background
+          worker will resolve the research backend asynchronously with
+          proper progress reporting and its own generous timeout budget.
+        """
         resolver = ResearchBackendResolver(
             adapter=adapter,
             research=probe.research.model_dump(mode="json"),
@@ -6573,24 +6742,76 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             mcp=getattr(self.continuum, "research_mcp", None),
             capability_cache=self.research_capability_cache,
         )
-        try:
-            backend = await resolver.resolve(
-                runtime=runtime,
-                job_id=job_id,
-                force_revalidate=force_revalidate or bool(runtime.get("force_revalidate")),
-            )
-        except RuntimeError as exc:
-            # Resolver errors are intentionally specific (session start,
-            # missing Web execution, or URL validation), never a generic
-            # "not reported" message.
+        # Force-revalidate is an explicit user action ("重新验证联网研究" button);
+        # it should still run the full probe, but with a bounded timeout.
+        if force_revalidate or bool(runtime.get("force_revalidate")):
+            try:
+                backend = await asyncio.wait_for(
+                    resolver.resolve(
+                        runtime=runtime,
+                        job_id=job_id,
+                        force_revalidate=True,
+                    ),
+                    timeout=300.0,
+                )
+            except TimeoutError as exc:
+                verified = resolver.last_capability
+                if verified is not None:
+                    probe.research = verified
+                raise ResearchCapabilityError(
+                    "WEB_RESEARCH_PROBE_TIMEOUT: 联网研究能力探测超时（300s），"
+                    "请更换 Runtime 或稍后重试。"
+                ) from exc
+            except RuntimeError as exc:
+                verified = resolver.last_capability
+                if verified is not None:
+                    probe.research = verified
+                raise ResearchCapabilityError(str(exc)) from exc
             verified = resolver.last_capability
             if verified is not None:
                 probe.research = verified
-            raise ResearchCapabilityError(str(exc)) from exc
-        verified = resolver.last_capability
-        if verified is not None:
-            probe.research = verified
-        return backend
+            return backend
+
+        # Non-force path: cache-only check, no behavioral probe.
+        cached = resolver._cached_capability(runtime)
+        if cached is not None:
+            from persona_continuum.agent.models import ResearchVerificationStatus
+
+            probe.research = cached
+            if cached.verification_status == ResearchVerificationStatus.VERIFIED:
+                return None  # Worker will reuse the cached verification.
+            if cached.verification_status in {
+                ResearchVerificationStatus.UNAVAILABLE,
+                ResearchVerificationStatus.BLOCKED,
+            }:
+                error_detail = cached.verification_error or ""
+                raise ResearchCapabilityError(
+                    f"{error_detail}" if error_detail
+                    else "当前 Runtime 的联网研究能力验证不可用，请更换 Runtime。"
+                )
+        # Cache expired or missing: decide whether to defer or fail fast.
+        # If the agent declares NO research capability and no broker/MCP is
+        # available, there is no reason to believe the worker will succeed.
+        research = probe.research
+        has_capability_hint = (
+            research.search
+            or research.fetch
+            or research.mode not in {"none", "", "unknown"}
+            or research.verification_status.value == "declared"
+            or (research.can_discover_sources or False)
+            or (research.can_read_sources or False)
+        )
+        has_fallback = self.research_broker is not None or getattr(
+            self.continuum, "research_mcp", None
+        ) is not None
+        if not has_capability_hint and not has_fallback:
+            raise ResearchCapabilityError(
+                "research_capability_unavailable: 当前 Runtime 未报告联网研究能力，"
+                "且没有可用的 Research Broker。请更换支持联网的 Runtime。"
+            )
+        # Agent claims research capability (or broker exists): defer
+        # verification to the background worker which has generous timeouts.
+        return None
 
     async def _resolve_research_backend(self, job: PersonaCreationJob) -> ResearchBackend:
         research = dict(job.capability_snapshot.get("research") or {})
@@ -7444,12 +7665,16 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
               visibility, dismissed_at, superseded_by,
               worker_state, worker_started_at, worker_heartbeat_at,
               worker_finished_at, agent_call_count,
+              subject_kind, work_or_universe, life_status, privacy_scope,
+              identity_context, user_defined_facts, research_mode, web_scope,
+              research_instructions, resolved_identity_json,
               created_at, updated_at
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              , ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(id) DO UPDATE SET
               display_name=excluded.display_name, aliases_json=excluded.aliases_json,
@@ -7487,6 +7712,16 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
               worker_heartbeat_at=excluded.worker_heartbeat_at,
               worker_finished_at=excluded.worker_finished_at,
               agent_call_count=excluded.agent_call_count,
+              subject_kind=excluded.subject_kind,
+              work_or_universe=excluded.work_or_universe,
+              life_status=excluded.life_status,
+              privacy_scope=excluded.privacy_scope,
+              identity_context=excluded.identity_context,
+              user_defined_facts=excluded.user_defined_facts,
+              research_mode=excluded.research_mode,
+              web_scope=excluded.web_scope,
+              research_instructions=excluded.research_instructions,
+              resolved_identity_json=excluded.resolved_identity_json,
               updated_at=excluded.updated_at
             """,
             (
@@ -7535,6 +7770,16 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
                 job.worker_heartbeat_at,
                 job.worker_finished_at,
                 job.agent_call_count,
+                job.subject_kind,
+                job.work_or_universe,
+                job.life_status,
+                job.privacy_scope,
+                job.identity_context,
+                job.user_defined_facts,
+                job.research_mode,
+                job.web_scope,
+                job.research_instructions,
+                dumps(job.resolved_identity) if job.resolved_identity else "{}",
                 job.created_at,
                 now,
             ),
@@ -7603,6 +7848,16 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             failure_json=(dict(loads(row["failure_json"])) if row["failure_json"] else None),
             agent_call_audits=list(loads(row["agent_call_audits_json"] or "[]")),
             checkpoints=list(loads(row["checkpoints_json"] or "[]")),
+            subject_kind=str(row["subject_kind"]) if "subject_kind" in row_keys and row["subject_kind"] else "real_person",
+            work_or_universe=row["work_or_universe"] if "work_or_universe" in row_keys else None,
+            life_status=str(row["life_status"]) if "life_status" in row_keys and row["life_status"] else "unknown",
+            privacy_scope=str(row["privacy_scope"]) if "privacy_scope" in row_keys and row["privacy_scope"] else "public",
+            identity_context=row["identity_context"] if "identity_context" in row_keys else None,
+            user_defined_facts=row["user_defined_facts"] if "user_defined_facts" in row_keys else None,
+            research_mode=str(row["research_mode"]) if "research_mode" in row_keys and row["research_mode"] else "auto",
+            web_scope=row["web_scope"] if "web_scope" in row_keys else None,
+            research_instructions=row["research_instructions"] if "research_instructions" in row_keys else None,
+            resolved_identity=dict(loads(row["resolved_identity_json"] or "{}")) if "resolved_identity_json" in row_keys and row["resolved_identity_json"] else None,
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
@@ -7618,19 +7873,6 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         }
         if mode not in allowed:
             raise PersonaCreationError(f"unknown_creation_mode:{mode}")
-        if (
-            persona_type.value.startswith("public_")
-            and mode != "public_research"
-            and enrichment_input_mode not in {"local_materials", "hybrid"}
-        ):
-            raise PersonaCreationError("public_person_requires_public_research")
-        if persona_type.value.startswith("private_") and mode not in {
-            "private_materials",
-            "guided_interview",
-        }:
-            raise PersonaCreationError("private_person_requires_private_materials_or_interview")
-        if persona_type == PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON and mode != "fictional":
-            raise PersonaCreationError("fictional_person_requires_fictional_mode")
 
     def _run_mode_for(self, persona_type: PersonaType) -> RunMode:
         if (

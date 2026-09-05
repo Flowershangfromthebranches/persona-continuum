@@ -124,6 +124,7 @@
                       <label for="lobby-mode">讨论方式</label>
                       <select class="input" id="lobby-mode">
                         <option value="" selected>— 请选择讨论方式 —</option>
+                        <option value="direct_chat">一对一聊天（一问一答）</option>
                         <option value="autonomous">自动讨论（Host + Director）</option>
                         <option value="manual">手动推进</option>
                       </select>
@@ -213,6 +214,7 @@
               <button class="btn btn-primary" id="btn-next" data-od-id="cta-next-turn" data-i="nextTurn">下一回合</button>
               <select class="input" id="manual-speaker" style="width:auto;min-width:160px;"></select>
               <button class="btn btn-ghost" id="btn-manual" data-i="speak">指定发言</button>
+              <button class="btn btn-ghost" id="btn-edit-bindings" data-i="editBindings">编辑模型绑定</button>
               <button class="btn btn-ghost" id="btn-pause" data-i="pause">暂停</button>
               <button class="btn btn-ghost" id="btn-resume" hidden data-i="resume">继续</button>
               <button class="btn btn-ghost" id="btn-cancel-turn" data-i="cancelTurn">取消当前轮</button>
@@ -289,9 +291,12 @@
               <div class="chat-feed" id="chat-feed"></div>
               <div class="banner" id="turn-banner"><span class="spinner"></span><span id="banner-text"></span></div>
               <div class="composer">
+                <button type="button" class="btn btn-ghost btn-icon attach-btn" id="btn-attach" data-i-title="attachTitle" title="上传图片 / 视频 / 文件">＋</button>
+                <input type="file" id="room-attachment-input" multiple hidden />
                 <input class="input" id="inject" data-i-placeholder="injectPh" />
                 <button class="btn btn-secondary" id="btn-inject" data-i="inject" disabled>注入</button>
               </div>
+              <div class="attach-preview" id="attach-preview" hidden></div>
             </div>
             <aside class="inspector">
               <div class="inspector-tabs">
@@ -1160,36 +1165,85 @@
         <button type="button" class="btn btn-text" id="persona-create-close">关闭</button>
       </div>
       <div class="stack" style="margin-top:18px;">
++        <div class="row-between" style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-top:10px;">
+          <h4 style="margin:0;font-size:14px;color:var(--text-muted);">基本身份（我是谁）</h4>
+        </div>
         <div class="grid-2">
           <div class="field">
-            <label for="pc-display-name">名称</label>
-            <input class="input" id="pc-display-name" required placeholder="例如：Steve Jobs" />
+            <label for="pc-display-name">名称 *</label>
+            <input class="input" id="pc-display-name" required placeholder="例如：夏彦 / Steve Jobs" />
           </div>
           <div class="field">
             <label for="pc-aliases">别名（逗号分隔）</label>
-            <input class="input" id="pc-aliases" placeholder="Jobs, Steven Paul Jobs" />
+            <input class="input" id="pc-aliases" placeholder="例如：Luke Pearce" />
           </div>
         </div>
         <div class="grid-2">
           <div class="field">
-            <label for="pc-persona-type">人物类型</label>
-            <select class="input" id="pc-persona-type">
-              <option value="public_living_person">公开在世人物</option>
-              <option value="public_historical_person">公开历史人物</option>
-              <option value="private_living_person">私人在世人物</option>
-              <option value="private_deceased_person">私人已故人物</option>
-              <option value="fictional_or_synthetic_person">虚构 / 原创人物</option>
+            <label for="pc-subject-kind">人物来源 *</label>
+            <select class="input" id="pc-subject-kind">
+              <option value="fictional_character">已有作品角色（如游戏/小说/影视角色）</option>
+              <option value="real_person">现实人物（真实存在的人）</option>
+              <option value="original_character">原创人物（用户自行创造的 OC）</option>
+              <option value="synthetic_persona">合成人格（综合创造/AI模板）</option>
+            </select>
+          </div>
+          <div class="field" id="pc-work-universe-wrap">
+            <label for="pc-work-universe">作品 / 世界观 *</label>
+            <input class="input" id="pc-work-universe" placeholder="例如：未定事件簿 / Tears of Themis" />
+          </div>
+        </div>
+        <div class="grid-2" id="pc-real-person-fields" hidden>
+          <div class="field">
+            <label for="pc-life-status">生存状态</label>
+            <select class="input" id="pc-life-status">
+              <option value="unknown">自动判断</option>
+              <option value="living">在世</option>
+              <option value="deceased">已故</option>
             </select>
           </div>
           <div class="field">
-            <label for="pc-creation-mode">创建方式</label>
-            <select class="input" id="pc-creation-mode">
-              <option value="public_research">联网深度研究</option>
-              <option value="private_materials">本地资料</option>
-              <option value="guided_interview">本地资料 + 引导访谈</option>
-              <option value="fictional">作品 / 手工设定</option>
+            <label for="pc-privacy-scope">资料性质</label>
+            <select class="input" id="pc-privacy-scope">
+              <option value="public">公开人物</option>
+              <option value="private">私人人物</option>
             </select>
           </div>
+        </div>
+        <div class="field">
+          <label for="pc-identity-context">身份定位 / 消歧信息</label>
+          <input class="input" id="pc-identity-context" placeholder="例如：《未定事件簿》中的男主角夏彦，英文名 Luke Pearce，HoYoverse 游戏角色，不是现实同名人物" />
+          <p class="meta" style="margin-top:4px;font-size:12px;">用于帮助系统确认实体并排除同名干扰，默认不作为事实直接写入最终人格。</p>
+        </div>
+        <div class="field">
+          <label for="pc-user-facts">人物设定 / 补充资料（可选）</label>
+          <textarea class="input" id="pc-user-facts" rows="2" placeholder="这里填写你明确希望作为人物事实或设定使用的信息，将作为权威 Evidence 纳入人格。"></textarea>
+        </div>
+
+        <div class="row-between" style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-top:16px;">
+          <h4 style="margin:0;font-size:14px;color:var(--text-muted);">研究策略（去哪里了解我）</h4>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="pc-research-mode">研究方式 *</label>
+            <select class="input" id="pc-research-mode">
+              <option value="auto">自动选择（推荐）</option>
+              <option value="web">联网深度研究</option>
+              <option value="local">本地资料</option>
+              <option value="hybrid">联网 + 本地资料</option>
+              <option value="guided_interview">本地资料 + 引导访谈</option>
+              <option value="author_defined">手工设定 / 无联网</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="pc-research-instructions">研究范围 / 特殊要求（可选）</label>
+            <input class="input" id="pc-research-instructions" placeholder="例如：重点研究国服公开剧情，同人创作不得作为 Canon 证据" />
+          </div>
+        </div>
+        <p class="meta" id="pc-oc-warning" hidden style="color:var(--accent);font-size:12px;margin-top:-6px;">注：原创人物（OC）若开启联网研究，仅用于时代、职业与世界观等背景参考，绝不会搜索同名现实人物污染人物生平。</p>
+        <div class="grid-2" style="display:none;" id="pc-legacy-hidden-controls">
+          <select id="pc-persona-type"><option value="fictional_or_synthetic_person">fictional</option></select>
+          <select id="pc-creation-mode"><option value="public_research">public</option></select>
         </div>
         <div class="grid-2">
           <div class="field">
@@ -1416,6 +1470,10 @@
             <option value="hybrid">本地材料 + 联网研究</option>
           </select>
         </div>
+        <div class="field" id="profile-enrich-focus-wrap" hidden>
+          <label for="profile-enrich-focus">研究方向（可选，仅联网研究时生效）</label>
+          <textarea class="input" id="profile-enrich-focus" rows="2" placeholder="可选：告诉模型这次着重研究什么方面，例如“着重她的晚年作品与获奖争议”。留空则由模型自行判断升级方向。"></textarea>
+        </div>
         <div class="grid-2" style="gap:10px;">
           <div class="field">
             <label for="profile-enrich-source">运行来源</label>
@@ -1611,6 +1669,19 @@
     </div>
   </dialog>
 
+  <dialog class="sheet" id="dlg-room-bindings" style="width:min(760px, calc(100% - 32px));">
+    <div class="sheet-body">
+    <h3 data-i="editBindings">编辑模型绑定</h3>
+    <p class="meta" data-i="editBindingsLead">修改席位使用的智能体（提供方）、模型与思考强度；保存后重开对应会话，下一回合生效。运行中的房间需先暂停或结束。</p>
+    <div id="binding-edit-slots" class="stack" style="margin-top:12px;"></div>
+    <p class="meta" id="binding-edit-error" style="color:var(--danger, #ef4444);display:none;"></p>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:16px;">
+      <button class="btn btn-ghost" id="btn-bindings-cancel" data-i="cancel">取消</button>
+      <button class="btn btn-primary" id="btn-bindings-save" data-i="save">保存</button>
+    </div>
+    </div>
+  </dialog>
+
   <dialog class="sheet" id="dlg-narr-new" style="width:min(720px, calc(100% - 32px));">
     <form class="sheet-body" id="form-narr-new">
       <h3 data-i="narrNew">新建作品</h3>
@@ -1793,8 +1864,8 @@
 
   <div class="toast" id="toast" role="status"></div>
 
-  <script src="/static/room_ui_state.js?v=1.0.1"></script>
+  <script src="/static/room_ui_state.js?v=1.0.2"></script>
   <script src="/static/safe_markdown.js?v=1.0.0"></script>
-  <script src="/static/app.js?v=2.7.4"></script>
+  <script src="/static/app.js?v=2.7.6"></script>
 </body>
 </html>

@@ -136,13 +136,17 @@ class ResearchArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _validate_references(self) -> ResearchArtifact:
-        source_ids = set(self.source_ids)
+        source_ids = set(self.source_ids or [])
+        missing_sources = set()
         for claim in self.claims:
             if claim.source_id is not None and claim.source_id not in source_ids:
-                raise ValueError("claim_source_id_not_in_artifact")
+                missing_sources.add(claim.source_id)
         for memory in self.memories:
             if memory.source_id is not None and memory.source_id not in source_ids:
-                raise ValueError("memory_source_id_not_in_artifact")
+                missing_sources.add(memory.source_id)
+        if missing_sources:
+            # Self-heal / auto-reconcile valid referenced source ids rather than crashing
+            self.source_ids = sorted(source_ids | missing_sources)
         level = safe_probability(self.uncertainty.get("level"), default=None)
         if level is None:
             raise ValueError("uncertainty_level_out_of_range")

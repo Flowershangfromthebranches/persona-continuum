@@ -312,6 +312,48 @@ class PromptTransportLimitExceededError(AgentTransportError):
     retriable = True
 
 
+class MediaInputUnsupportedError(AgentRuntimeError):
+    """The bound adapter cannot consume this attachment kind at all."""
+
+    code = "MEDIA_INPUT_UNSUPPORTED"
+    retriable = False
+
+
+class AttachmentTooLargeError(AgentRuntimeError):
+    """One attachment exceeds the adapter/provider media budget."""
+
+    code = "ATTACHMENT_TOO_LARGE"
+    retriable = False
+
+
+class AttachmentNotFoundError(AgentRuntimeError):
+    """The referenced attachment id has no file in the attachment store."""
+
+    code = "ATTACHMENT_NOT_FOUND"
+    retriable = False
+
+
+class AttachmentAccessDeniedError(AgentRuntimeError):
+    """The attachment path failed the store containment check."""
+
+    code = "ATTACHMENT_ACCESS_DENIED"
+    retriable = False
+
+
+class AttachmentProcessingFailedError(AgentRuntimeError):
+    """Extraction/decoding of an attachment failed before dispatch."""
+
+    code = "ATTACHMENT_PROCESSING_FAILED"
+    retriable = False
+
+
+class ProviderMediaLimitExceededError(AgentTransportError):
+    """The provider rejected the media payload (size/count/shape)."""
+
+    code = "PROVIDER_MEDIA_LIMIT_EXCEEDED"
+    retriable = False
+
+
 class ACPFrameTooLargeError(AgentTransportError):
     """An ACP JSONL frame exceeded the bounded subprocess stream limit."""
 
@@ -784,6 +826,12 @@ class AgentResponseCollector:
                 ReasoningBindingRejectedError.code: ReasoningBindingRejectedError,
                 ContextBudgetExceededError.code: ContextBudgetExceededError,
                 PromptTransportLimitExceededError.code: PromptTransportLimitExceededError,
+                MediaInputUnsupportedError.code: MediaInputUnsupportedError,
+                AttachmentTooLargeError.code: AttachmentTooLargeError,
+                AttachmentNotFoundError.code: AttachmentNotFoundError,
+                AttachmentAccessDeniedError.code: AttachmentAccessDeniedError,
+                AttachmentProcessingFailedError.code: AttachmentProcessingFailedError,
+                ProviderMediaLimitExceededError.code: ProviderMediaLimitExceededError,
                 AgentSessionStartError.code: AgentSessionStartError,
                 AgentProtocolOutputError.code: AgentProtocolOutputError,
                 AgentCancelledError.code: AgentCancelledError,
@@ -900,6 +948,12 @@ __all__ = [
     "ReasoningBindingRejectedError",
     "ContextBudgetExceededError",
     "PromptTransportLimitExceededError",
+    "MediaInputUnsupportedError",
+    "AttachmentTooLargeError",
+    "AttachmentNotFoundError",
+    "AttachmentAccessDeniedError",
+    "AttachmentProcessingFailedError",
+    "ProviderMediaLimitExceededError",
     "AgentSessionStartError",
     "AgentProtocolOutputError",
     "AgentCancelledError",

@@ -48,12 +48,13 @@
       && runtime.status !== "running";
   }
 
-  function shouldStartLegacyAutonomous(room, hasModelOutput) {
+  function shouldStartLegacyAutonomous(room, hasModelOutput, trigger) {
     if (!room) return false;
     return room.protocol === "free_discussion"
       && ["autonomous", "auto"].includes(room.mode)
       && room.status === "ready"
-      && !hasModelOutput;
+      && !hasModelOutput
+      && trigger === "user_message";
   }
 
   function canCancelTurn(room) {
@@ -67,6 +68,28 @@
 
   function canResumeRoom(room) {
     return !!room && ["paused", "completed"].includes(String(room.status || ""));
+  }
+
+  // Binding edit gate: provider/model/effort may only change while no turn
+  // generation or protocol run is in flight.  Returns "" when editable,
+  // otherwise a stable reason code used by the UI disable hint and tests.
+  function roomBindingsEditBlockReason(room) {
+    if (!room) return "no_room";
+    const status = String(room.status || "");
+    if (!["ready", "paused", "completed", "error"].includes(status)) {
+      return "room_not_settled";
+    }
+    const call = (room.metadata && room.metadata.model_call) || {};
+    if (["calling", "streaming"].includes(String(call.status || ""))) {
+      return "turn_in_flight";
+    }
+    const runtime = room.protocol_state || {};
+    if (String(runtime.status || "") === "running") return "protocol_running";
+    return "";
+  }
+
+  function canEditRoomBindings(room) {
+    return roomBindingsEditBlockReason(room) === "";
   }
 
   function shouldShowProtocolPanel(room) {
@@ -123,6 +146,8 @@
     shouldStartLegacyAutonomous,
     canCancelTurn,
     canResumeRoom,
+    canEditRoomBindings,
+    roomBindingsEditBlockReason,
     shouldShowProtocolPanel,
     shouldSuggestProtocolUpgrade,
     protocolUpgradeRoleMapping,

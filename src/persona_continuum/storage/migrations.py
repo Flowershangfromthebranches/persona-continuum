@@ -346,6 +346,7 @@ CREATE TABLE IF NOT EXISTS profile_enrichment_jobs (
   research_policy_json TEXT NOT NULL DEFAULT '{}',
   requested_scope TEXT NOT NULL DEFAULT 'full_refresh',
   enrichment_input_mode TEXT NOT NULL DEFAULT 'local_materials',
+  research_focus TEXT,
   status TEXT NOT NULL DEFAULT 'created',
   progress_json TEXT NOT NULL DEFAULT '{}',
   error TEXT,
