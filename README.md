@@ -84,11 +84,13 @@ Web UI 与平行世界共用 `PersonaCreationOrchestrator`。创建任务可暂�
 - **Narrative Studio**：分离作者真相、角色知识和观众知识；预测分支在显式提交前不进入正史，
   并可生成面向 AI 视频制作的 Production Package。
 
-### 隐私安全的公开版本
+### 太卜阁示例模板（六位人格包）
 
-公开仓库不包含任何本地 Persona 包、人格材料、记忆、对话记录、房间状态、数据库、运行日志
-或诊断记录。新建房间默认完全空白；只有使用者主动选择模板或手动添加席位后才会写入配置。
-内置模板只提供通用的角色与协作配置，不附带可导入人格或真实对话数据。
+[`examples/taibuge/`](examples/taibuge/) 提供了六位用于房间协作演示的示例 Persona 编译包（玄衡先生、子平先生、紫薇先生、易卦先生、三式先生、西学占测师）。这些包采用 `public_compiled` 模式导出，不包含任何个人隐私资料、本地历史对话、记忆或真实私有凭据。
+
+使用者克隆仓库后，只需将这六个人格包导入系统，在新建房间时选择内置的“太卜阁 · 术数综合会诊”模板，简单配置本机可用的 Agent/模型，即可一键体验多专家协同会诊。新建房间默认完全空白，只有选择模板后才会加载对应角色。
+
+> **免责声明与风险提示**：本模板中的术数与推演演算纯属娱乐与传统文化研究，请勿过度迷信；内容均由 AI 模型生成，可能存在事实偏差或幻觉，绝不构成任何投资、理财、医疗或法律建议。投资有风险，决策需理性。
 
 本版本不提供平行世界或叙事创作的用户演示与模板。术数/算命演算仅供娱乐与传统文化研究，
 请勿过度迷信；不构成投资、医疗、法律或其他专业建议。
@@ -165,14 +167,13 @@ OpenAI-compatible, cloud embedding, Zep Cloud, or other paid model APIs. The
 running Agent host performs natural-language research and reasoning, then
 submits structured artifacts to the local MCP server.
 
-## Privacy-Safe Public Release
+## Taibuge Sample Template (Six Persona Packages)
 
-The public repository contains no local Persona archives, persona source
-material, memories, conversation transcripts, Room state, databases, runtime
-logs, or diagnostic records. A new Room opens completely blank; configuration
-is applied only after the user explicitly selects a template or adds seats.
-Built-in templates contain generic role and collaboration settings only, with
-no importable Personas or real conversation data.
+[`examples/taibuge/`](examples/taibuge/) provides six sample compiled Persona packages (Xuanheng, Ziping, Ziwei, Yigua, Sanshi, and Western Divination Consultant) for multi-persona consultation demonstration. Exported via `public_compiled` mode, these packages contain only runtime persona components and exclude private materials, local conversation logs, personal memories, or credentials.
+
+After importing these six packages, users can select the built-in "Taibuge Consultation" template when creating a room, bind local Agent hosts/models, and start multi-expert discussions immediately. New rooms open blank by default.
+
+> **Disclaimer & Risk Notice**: Divination and astrological simulations in this template are for entertainment and cultural research purposes only. Do not rely on them superstitiously. All outputs are AI-generated and do not constitute financial, investment, medical, or legal advice.
 
 This release provides no end-user demo or template for Parallel World or
 Narrative Studio. Divination output is for entertainment and traditional-culture

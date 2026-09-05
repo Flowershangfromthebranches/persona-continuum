@@ -14,6 +14,8 @@ build/
 *.zip
 personas/
 exports/
+!examples/taibuge/personas/
+!examples/taibuge/personas/*.persona.zip
 /conversations/
 /transcripts/
 /rooms/
