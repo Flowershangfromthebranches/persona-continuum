@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from persona_continuum.domain.session import PreparedTurn
+from persona_continuum.room.attachments import describe_attachment_for_prompt
 from persona_continuum.room.models import ParticipantSlot, ResolvedBindingSnapshot
 
 
@@ -145,6 +146,17 @@ class PromptComposer:
         for t in recent_transcript:
             spk = t.get("speaker_name") or t.get("persona_id") or "Participant"
             cnt = str(t.get("content", ""))
+            attachments = t.get("attachments") or (t.get("metadata") or {}).get(
+                "attachments"
+            )
+            if isinstance(attachments, list) and attachments:
+                notes = " ".join(
+                    describe_attachment_for_prompt(a)
+                    for a in attachments
+                    if isinstance(a, dict)
+                )
+                if notes:
+                    cnt = f"{cnt}\n{notes}" if cnt else notes
             transcript_lines.append(f"{spk}: {cnt}")
 
         transcript_text = ""

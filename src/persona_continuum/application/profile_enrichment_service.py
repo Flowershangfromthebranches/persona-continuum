@@ -247,6 +247,7 @@ class ProfileEnrichmentService:
         materials: list[dict[str, Any]] | None = None,
         remote_material_consent: bool = False,
         enrichment_input_mode: str | EnrichmentInputMode | None = None,
+        research_focus: str | None = None,
         visibility: str = "user",
     ) -> ProfileEnrichmentJob:
         profile = self.profiles.get_profile(target_profile_id)
@@ -298,6 +299,9 @@ class ProfileEnrichmentService:
             research_policy=dict(research_policy or {}),
             requested_scope=requested_scope,
             enrichment_input_mode=mode,
+            research_focus=(
+                str(research_focus).strip() if str(research_focus or "").strip() else None
+            ),
             input_material_ids=[
                 str(item.get("id"))
                 for item in material_list
@@ -667,6 +671,7 @@ class ProfileEnrichmentService:
                     research_policy=job.research_policy or None,
                     requested_scope=job.requested_scope,
                     enrichment_input_mode=mode,
+                    research_instructions=job.research_focus,
                     materials=materials,
                     runtime=job.selected_runtime,
                     base_persona_version=profile.version,
@@ -695,6 +700,7 @@ class ProfileEnrichmentService:
                     reasoning_effort=job.selected_runtime.get("reasoning_effort"),
                     auth_profile_id=job.selected_runtime.get("auth_profile_id"),
                     research_policy=job.research_policy or None,
+                    research_instructions=job.research_focus,
                     existing_persona_id=profile.persona_id,
                     duplicate_action="enrich",
                     materials=materials,

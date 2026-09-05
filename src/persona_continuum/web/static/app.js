@@ -87,6 +87,10 @@
       dirDirector: "Director（启发式）", dirNatural: "自然流动", dirRR: "轮转", dirManual: "手动点名",
       titleNeed: "请填写房间标题。", slotNeed: "至少保留一个席位。",
       resolving: "正在解析绑定…", frozen: "启动时冻结",
+      editBindings: "编辑模型绑定",
+      editBindingsLead: "修改席位使用的智能体（提供方）、模型与思考强度；保存后重开对应会话，下一回合生效。运行中的房间需先暂停或结束。",
+      editBindingsHost: "主持席位", bindingsSaved: "模型绑定已更新，相关会话已重开。",
+      bindingsLocked: "房间正在运行或生成中，不能修改模型绑定；请先暂停或结束。",
       deleteRoom: "删除房间及其转写？", deleteApi: "删除该 API 配置？", deletePersona: "删除该人物？",
       confirm: "确认", test: "探测",
       scanning: "正在重新扫描本地宿主…", scanned: "扫描完成",
@@ -100,6 +104,19 @@
       selectSpeaker: "选择发言人",
       recallNone: "本回合尚未召回记忆。",
       bindNone: "选择一位参与者查看冻结绑定。",
+      attachTitle: "上传图片 / 视频 / 文件", attachRemove: "移除",
+      attachUploading: "正在上传附件…", attachFailed: "附件上传失败",
+      attachTooLarge: "文件过大，浏览器内存不足",
+      resetRuntime: "恢复初始状态",
+      resetRuntimeHint: "将情绪 / 需求 / 关系恢复到初始值",
+      resetRuntimeLead: "选择恢复范围。两种方式都不会删除人物档案与编译内容。",
+      resetRuntimeSoft: "保留记忆和聊天记录的重置",
+      resetRuntimeSoftHint: "只恢复情绪、需求与关系到初始值；聊天记录与记忆保留。",
+      resetRuntimeFull: "全量重置",
+      resetRuntimeFullHint: "同时清除会话、聊天记录与对话衍生记忆；人物档案与编译内容保留。",
+      resetRuntimeSoftDone: "已恢复初始状态，聊天记录与记忆已保留。",
+      resetRuntimeFullDone: "已全量重置，会话与对话记忆已清除。",
+      resetRuntimeFailed: "恢复初始状态失败", resetting: "正在恢复…",
       affect: "情绪", needs: "动机与需求", rels: "关系",
       aliases: "别名", mode: "运行模式", compiled: "已编译",
       close: "关闭",
@@ -224,7 +241,6 @@
       prodPromptLang: "Prompt 语言", prodLangAuto: "自动",
       prodPlanSubmit: "生成 Clip Plan",
       prodCompilePrompts: "生成完整 Prompt",
-      prodOneShotSubmit: "一键生成完整 Prompt（跳过审阅）",
       prodClipPlanReviewHint: "请审阅下方 Clip 计划（可拆分/合并/调整），确认后生成完整 Prompt。",
       ppStageQueued: "排队中...", ppStagePlanningClips: "正在规划 Clips...",
       ppStagePlanningAssets: "正在规划参考素材...", ppStageCompilingPrompts: "正在编译 Prompt...",
@@ -276,7 +292,19 @@
       prodGuideStageAnalyzingAssets: "正在分析参考素材...",
       prodGuideStageCompilingAssetPrompts: "正在编译素材图片 Prompt...",
       prodGuideStageCompilingClipPrompts: "正在编译完整视频 Prompt...",
-      prodGuideStageRenderingGuide: "正在渲染制作手册..."
+      prodGuideStageRenderingGuide: "正在渲染制作手册...",
+      prodViewGuide: "完整制作方案", prodViewAdvanced: "高级制作工具",
+      prodCompleteTitle: "完整 AI 视频制作方案",
+      prodCompleteHelp: "选择最终视频模型和画面比例，点击下方按钮。系统会自动完成素材分析、参考图方案、片段规划、每段完整 Prompt、字幕、声音、BGM 与剪辑方案，完成后直接打开完整制作方案。",
+      prodCompleteSubmit: "生成完整 AI 视频制作方案",
+      prodAdvancedSettings: "高级设置",
+      prodAdvancedGenMode: "强制生成方式（默认自动规划，每段由拍摄 Agent 智能决定）",
+      prodGuideMainEmpty: "还没有完整制作方案。选择目标视频模型后，点击「生成完整 AI 视频制作方案」。",
+      prodGuideCopyFull: "复制整份方案", prodGuideRegenFull: "重新生成",
+      prodGuideAskAgent: "让拍摄 Agent 修改",
+      prodGuideAskAgentHint: "打开拍摄 Agent 对话，直接说修改要求（例如：已有角色图不需要重新生成 / 第 5 段 Prompt 太简短）",
+      toastCompletePlanReady: "完整 AI 视频制作方案已生成",
+      prodClipTechPromptNote: "技术 Prompt 组件（高级工具）"
     },
     en: {
       navRooms: "Rooms", navWorlds: "Parallel World", navNarrative: "Narrative", navAgents: "Agents", navApi: "API", navPersonas: "Personas",
@@ -358,6 +386,10 @@
       dirDirector: "Director (heuristics)", dirNatural: "Natural flow", dirRR: "Round robin", dirManual: "Manual select",
       titleNeed: "A room title is required.", slotNeed: "A room needs at least one slot.",
       resolving: "Resolving bindings…", frozen: "Frozen at start",
+      editBindings: "Edit model bindings",
+      editBindingsLead: "Change the agent (provider), model and reasoning effort per slot; sessions are reopened on save and the next turn uses the new binding. Pause or finish a running room first.",
+      editBindingsHost: "Host slot", bindingsSaved: "Bindings updated; affected sessions reopened.",
+      bindingsLocked: "Bindings are locked while the room is running or generating; pause or finish the room first.",
       deleteRoom: "Delete this room and its transcript?", deleteApi: "Delete this API profile?", deletePersona: "Delete this persona?",
       confirm: "Confirm", test: "Probe",
       scanning: "Rescanning local hosts…", scanned: "Scan complete",
@@ -371,6 +403,19 @@
       selectSpeaker: "Choose speaker",
       recallNone: "No memories retrieved on this turn.",
       bindNone: "Select a participant to inspect the frozen binding.",
+      attachTitle: "Upload images / videos / files", attachRemove: "Remove",
+      attachUploading: "Uploading attachments…", attachFailed: "Attachment upload failed",
+      attachTooLarge: "File too large for browser memory",
+      resetRuntime: "Reset to initial state",
+      resetRuntimeHint: "Restore emotions / needs / relationships to initial values",
+      resetRuntimeLead: "Choose the reset scope. Neither option deletes the persona profile or compiled content.",
+      resetRuntimeSoft: "Reset keeping memories and chat history",
+      resetRuntimeSoftHint: "Only emotions, needs and relationships return to initial values; history and memories stay.",
+      resetRuntimeFull: "Full reset",
+      resetRuntimeFullHint: "Also clears sessions, chat history and conversation-derived memories; profile and compiled content stay.",
+      resetRuntimeSoftDone: "Initial state restored; history and memories kept.",
+      resetRuntimeFullDone: "Full reset done; sessions and conversation memories cleared.",
+      resetRuntimeFailed: "Reset failed", resetting: "Resetting…",
       affect: "Affect", needs: "Motivation & needs", rels: "Relationships",
       aliases: "Aliases", mode: "Run mode", compiled: "Compiled",
       close: "Close",
@@ -495,7 +540,6 @@
       prodPromptLang: "Prompt language", prodLangAuto: "Auto",
       prodPlanSubmit: "Generate Clip Plan",
       prodCompilePrompts: "Generate full prompts",
-      prodOneShotSubmit: "One-shot full prompts (skip review)",
       prodClipPlanReviewHint: "Review the clip plan below (split/merge/adjust), then generate full prompts.",
       ppStageQueued: "Queued...", ppStagePlanningClips: "Planning clips...",
       ppStagePlanningAssets: "Planning reference assets...", ppStageCompilingPrompts: "Compiling prompts...",
@@ -547,7 +591,19 @@
       prodGuideStageAnalyzingAssets: "Analyzing reference assets...",
       prodGuideStageCompilingAssetPrompts: "Compiling asset image prompts...",
       prodGuideStageCompilingClipPrompts: "Compiling full video prompts...",
-      prodGuideStageRenderingGuide: "Rendering production guide..."
+      prodGuideStageRenderingGuide: "Rendering production guide...",
+      prodViewGuide: "Full production plan", prodViewAdvanced: "Advanced tools",
+      prodCompleteTitle: "Complete AI video production plan",
+      prodCompleteHelp: "Pick the final video model and aspect ratio, then click. The system automatically plans assets, reference images, clips, full prompts, subtitles, sound, BGM and editing, then opens the complete plan.",
+      prodCompleteSubmit: "Generate complete AI video production plan",
+      prodAdvancedSettings: "Advanced settings",
+      prodAdvancedGenMode: "Force generation mode (default: auto-planned per clip by the Shooting Agent)",
+      prodGuideMainEmpty: "No complete plan yet. Pick a target video model, then click \"Generate complete AI video production plan\".",
+      prodGuideCopyFull: "Copy whole plan", prodGuideRegenFull: "Regenerate",
+      prodGuideAskAgent: "Ask the Shooting Agent to revise",
+      prodGuideAskAgentHint: "Open the Shooting Agent chat and describe the change (e.g. character art already exists / clip 5 prompt is too thin)",
+      toastCompletePlanReady: "Complete AI video production plan is ready",
+      prodClipTechPromptNote: "Technical prompt components (advanced tools)"
     }
   };
 
@@ -645,6 +701,8 @@
     narrGuides: {},
     narrGuideJobs: {},
     narrGuideDrawerPkg: null,
+    narrProductionView: "guide",
+    narrCompleteJobs: {},
   };
 
   // ─── DOM Helpers ─────────────────────────────────────────────────────────
@@ -929,6 +987,14 @@
   };
 
   async function api(url, opts = {}) {
+    const timeout = opts.timeout ?? (opts.method && opts.method !== "GET" ? 120_000 : 0);
+    let controller = null;
+    let timer = null;
+    if (timeout > 0) {
+      controller = new AbortController();
+      opts = { ...opts, signal: controller.signal };
+      timer = setTimeout(() => controller.abort(), timeout);
+    }
     try {
       const res = await fetch(url, opts);
       const ct = res.headers.get("content-type") || "";
@@ -939,8 +1005,14 @@
       const txt = await res.text();
       return { ok: res.ok, error: txt || `HTTP_${res.status}`, status: res.status };
     } catch (err) {
+      if (err && err.name === "AbortError") {
+        console.warn(`API request timed out after ${timeout}ms: ${url}`);
+        return { ok: false, error: `请求超时（${Math.round(timeout / 1000)}s），服务端可能正在执行耗时探测。请稍后重试或更换 Runtime。` };
+      }
       console.warn(`API fetch error for ${url}:`, err);
       return { ok: false, error: String(err) };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -1212,8 +1284,24 @@
     document.querySelectorAll("#sub-room-lobby [data-fd-only]").forEach(el => {
       el.hidden = protocol !== "free_discussion" || (el.hasAttribute("data-advanced") && !state.lobbyAdvanced);
     });
+    syncDirectChatLobbyMode();
     renderSlots();
     renderBindingPreview();
+  }
+
+  function syncDirectChatLobbyMode() {
+    const mode = $("#lobby-mode");
+    const direct = selectedProtocol() === "free_discussion"
+      && mode && mode.value === "direct_chat";
+    if (direct && state.lobbySlots.length > 1) {
+      state.lobbySlots = state.lobbySlots.slice(0, 1);
+    }
+    const addSlot = $("#btn-add-slot");
+    if (addSlot) addSlot.hidden = direct;
+    const speakerSelection = $("#lobby-speaker-selection");
+    if (speakerSelection && speakerSelection.closest(".field")) {
+      speakerSelection.closest(".field").hidden = direct;
+    }
   }
 
   const protocolMeta = {
@@ -1647,6 +1735,16 @@
       return;
     }
 
+    const conversationMode = $("#lobby-mode").value || "autonomous";
+    if (conversationMode === "direct_chat" && state.lobbySlots.length !== 1) {
+      if (errBox && errDetails) {
+        errBox.style.display = "block";
+        errDetails.textContent = "一对一聊天只能保留一个人格席位。";
+      }
+      toast("一对一聊天只能选择一个人格", "error");
+      return;
+    }
+
     // Explicit protocol: a selected template always wins over a drifted
     // select, and an empty selection must abort loudly instead of silently
     // creating a free_discussion room.
@@ -1760,7 +1858,7 @@
         rules: $("#room-shared-rules").value.split("\n").map(x => x.trim()).filter(Boolean),
         custom_instructions: $("#room-custom-instructions").value.trim()
       },
-      mode: protocol === "free_discussion" ? $("#lobby-mode").value : "autonomous",
+      mode: conversationMode,
       request_id: requestId,
       initialize_async: true,
       director_config: $("#lobby-director").value ? { mode: $("#lobby-director").value } : null,
@@ -1870,7 +1968,7 @@
     if (res && res.ok) {
       state.currentRoom = res.data;
       await openLiveRoom(room.id);
-      toast("房间已恢复，自动讨论正在启动");
+      toast("房间已恢复，等待你发起话题");
     } else {
       room.status = "error";
       room.last_error = (res && res.error) || "房间重新初始化失败";
@@ -1981,6 +2079,7 @@
 
     const canDiscuss = ["ready", "discussing"].includes(room.status);
     const isAutonomous = (room.mode === "autonomous" || room.mode === "auto");
+    const isDirectChat = room.mode === "direct_chat";
     const isProtocolRoom = (room.protocol || "free_discussion") !== "free_discussion";
     if ($("#btn-pause")) $("#btn-pause").hidden = !canDiscuss;
     if ($("#btn-resume")) {
@@ -1990,11 +2089,11 @@
     }
     if ($("#btn-next")) {
       $("#btn-next").disabled = !canDiscuss || (isProtocolRoom && state.isTurnBusy);
-      $("#btn-next").hidden = isAutonomous && !isProtocolRoom;
+      $("#btn-next").hidden = (isAutonomous || isDirectChat) && !isProtocolRoom;
       $("#btn-next").textContent = isProtocolRoom ? "运行协作协议" : t("nextTurn");
     }
-    if ($("#manual-speaker")) $("#manual-speaker").hidden = isAutonomous || isProtocolRoom;
-    if ($("#btn-manual")) $("#btn-manual").hidden = isAutonomous || isProtocolRoom;
+    if ($("#manual-speaker")) $("#manual-speaker").hidden = isAutonomous || isDirectChat || isProtocolRoom;
+    if ($("#btn-manual")) $("#btn-manual").hidden = isAutonomous || isDirectChat || isProtocolRoom;
     if ($("#btn-finalize-room")) $("#btn-finalize-room").hidden = !isProtocolRoom;
     if ($("#btn-cancel-turn")) {
       const canCancel = ROOM_UI_STATE.canCancelTurn(room);
@@ -2003,6 +2102,13 @@
     }
     const btnStop = $("#btn-stop");
     if (btnStop) btnStop.hidden = room.status === "completed";
+    const btnBindings = $("#btn-edit-bindings");
+    if (btnBindings) {
+      const editable = ROOM_UI_STATE.canEditRoomBindings(room);
+      btnBindings.hidden = !(room.participants || []).length;
+      btnBindings.disabled = !editable;
+      btnBindings.title = editable ? "" : t("bindingsLocked");
+    }
     const panel = $("#protocol-live-panel");
     if (panel) panel.hidden = !ROOM_UI_STATE.shouldShowProtocolPanel(room);
     const upgradeWarn = $("#protocol-upgrade-warning");
@@ -2310,15 +2416,8 @@
           if (generation !== state.wsGeneration) return;
           wsSend({ action: "ping" });
         }, 25000);
-        const room = state.currentRoom;
-        if (ROOM_UI_STATE.shouldStartLegacyAutonomous(room, transcriptHasModelOutput(room))) {
-          // Legacy autonomous discussion only ever starts for free_discussion
-          // rooms; protocol rooms advance through their own runtime.
-          ws.send(JSON.stringify({ action: "autonomous", max_turns: 6 }));
-          const hasUser = (room.transcript || []).some((item) => item.participant_id === "user");
-          banner(true, hasUser ? t("bannerWaiting") : t("bannerHost"));
-          watchLiveRoom(room.id);
-        }
+        // Opening or reconnecting to a room only restores its state. A new
+        // discussion starts after an explicit user message, never on entry.
       };
 
       ws.onmessage = (e) => {
@@ -2363,6 +2462,14 @@
     if (type === "protocol_message" && ev.message) {
       pushTranscript(ev.message);
       renderChatFeed();
+      return;
+    }
+
+    // Binding edits from any tab: refresh the frozen snapshot pills in place.
+    if (type === "room_bindings_updated" && ev.binding_snapshots) {
+      room.binding_snapshots = ev.binding_snapshots;
+      renderLivePills();
+      renderLiveInspector();
       return;
     }
 
@@ -2558,6 +2665,177 @@
     });
   }
 
+  // ─── Room binding edit dialog (provider / model / reasoning effort) ──────
+  let roomBindingEdits = [];
+
+  function allSelectableAgents() {
+    return [...getSelectableLocalAgents(), ...getSelectableApiAgents()];
+  }
+
+  function bindingAgentOptions(currentId) {
+    const agents = allSelectableAgents();
+    const known = agents.some((a) => a.id === currentId);
+    const stale = !known && currentId
+      ? `<option value="${esc(currentId)}" selected>${esc(currentId)}（当前绑定）</option>`
+      : "";
+    const opts = agents.map((a) =>
+      `<option value="${esc(a.id)}" ${a.id === currentId ? "selected" : ""}>${esc(a.name)} [READY]</option>`
+    ).join("");
+    return stale + opts;
+  }
+
+  function bindingModelOptions(agent, currentId) {
+    const models = agent ? getRuntimeModels(agent) : [];
+    if (!models.length) {
+      const cur = currentId && currentId !== "default"
+        ? `<option value="${esc(currentId)}" selected>${esc(currentId)}（当前绑定）</option>`
+        : "";
+      return cur + `<option value="default" ${!currentId || currentId === "default" ? "selected" : ""}>Agent 默认模型</option>`;
+    }
+    const known = models.some((m) => m.id === currentId);
+    const cur = !known && currentId
+      ? `<option value="${esc(currentId)}" selected>${esc(currentId)}（当前绑定）</option>`
+      : "";
+    const opts = models.map((m) =>
+      `<option value="${esc(m.id)}" ${m.id === currentId ? "selected" : ""}>${esc(runtimeModelOptionLabel(agent, m))}</option>`
+    ).join("");
+    return cur + opts;
+  }
+
+  function bindingEffortOptions(agent, model, currentId) {
+    const efforts = getRuntimeReasoningOptions(agent, model);
+    if (!efforts.length) {
+      const cur = currentId && currentId !== "default" ? currentId : "default";
+      return `<option value="${esc(cur)}" selected>${cur === "default" ? "Provider default" : esc(cur)}</option>`;
+    }
+    const selected = efforts.includes(currentId) ? currentId : efforts[0];
+    return efforts.map((e) =>
+      `<option value="${esc(e)}" ${e === selected ? "selected" : ""}>${esc(reasoningOptionLabel(e))}</option>`
+    ).join("");
+  }
+
+  function renderBindingEditRows() {
+    const room = state.currentRoom;
+    const box = $("#binding-edit-slots");
+    if (!room || !box) return;
+    const agents = allSelectableAgents();
+    box.innerHTML = (room.participants || []).map((p, idx) => {
+      const row = roomBindingEdits[idx] || {};
+      const agent = agents.find((a) => a.id === row.runtime_selection);
+      const model = agent && getRuntimeModels(agent).find((m) => m.id === row.model_selection);
+      const isHost = p.participant_id === room.host_participant_id;
+      const name = p.display_name || p.persona_id || p.participant_id;
+      return `
+        <div class="card slot-card" data-bind-idx="${idx}" style="padding:12px;margin-bottom:8px;">
+          <div class="row" style="gap:8px;align-items:center;margin-bottom:8px;">
+            <div class="avatar sm">${esc((name || "?").charAt(0).toUpperCase())}</div>
+            <strong>${esc(name)}</strong>
+            ${isHost ? `<span class="tag solid">${t("editBindingsHost")}</span>` : ""}
+          </div>
+          <div class="slot-grid">
+            <div class="field"><label>${t("host")}</label>
+              <select class="input" data-bk="runtime_selection" data-bidx="${idx}">${bindingAgentOptions(row.runtime_selection)}</select></div>
+            <div class="field"><label>${t("model")}</label>
+              <select class="input" data-bk="model_selection" data-bidx="${idx}">${bindingModelOptions(agent, row.model_selection)}</select></div>
+            <div class="field"><label>${t("effort")}</label>
+              <select class="input" data-bk="reasoning_selection" data-bidx="${idx}">${bindingEffortOptions(agent, model, row.reasoning_selection)}</select></div>
+          </div>
+        </div>`;
+    }).join("");
+
+    box.querySelectorAll("select[data-bk]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const idx = +sel.dataset.bidx;
+        const row = roomBindingEdits[idx];
+        const agentList = allSelectableAgents();
+        const agentFor = (runtimeId) => agentList.find((a) => a.id === runtimeId);
+        if (sel.dataset.bk === "runtime_selection") {
+          row.runtime_selection = sel.value;
+          const ag = agentFor(sel.value);
+          const models = getRuntimeModels(ag);
+          row.model_selection = models.length ? models[0].id : "default";
+          const md = models.find((m) => m.id === row.model_selection);
+          const efforts = getRuntimeReasoningOptions(ag, md);
+          row.reasoning_selection = efforts.length ? efforts[0] : "default";
+        } else if (sel.dataset.bk === "model_selection") {
+          row.model_selection = sel.value;
+          const ag = agentFor(row.runtime_selection);
+          const md = getRuntimeModels(ag).find((m) => m.id === sel.value);
+          const efforts = getRuntimeReasoningOptions(ag, md);
+          row.reasoning_selection = efforts.length ? efforts[0] : "default";
+        } else {
+          row.reasoning_selection = sel.value;
+        }
+        renderBindingEditRows();
+      });
+    });
+  }
+
+  function openRoomBindingsDialog() {
+    const room = state.currentRoom;
+    if (!room) return;
+    if (!ROOM_UI_STATE.canEditRoomBindings(room)) {
+      toast(t("bindingsLocked"));
+      return;
+    }
+    const agents = allSelectableAgents();
+    roomBindingEdits = (room.participants || []).map((p) => {
+      const snap = (room.binding_snapshots || {})[p.participant_id] || {};
+      const runtimeId = snap.agent_runtime_id || "default";
+      const agent = agents.find((a) => a.id === runtimeId);
+      const modelId = snap.model_id || "default";
+      const md = agent && getRuntimeModels(agent).find((m) => m.id === modelId);
+      const efforts = getRuntimeReasoningOptions(agent, md);
+      const effort = snap.reasoning_effort && (!efforts.length || efforts.includes(snap.reasoning_effort))
+        ? snap.reasoning_effort
+        : (efforts.length ? efforts[0] : "default");
+      return {
+        participant_id: p.participant_id,
+        runtime_selection: runtimeId,
+        model_selection: modelId,
+        reasoning_selection: effort,
+      };
+    });
+    const errEl = $("#binding-edit-error");
+    if (errEl) { errEl.style.display = "none"; errEl.textContent = ""; }
+    renderBindingEditRows();
+    const dlg = $("#dlg-room-bindings");
+    if (dlg && !dlg.open) dlg.showModal();
+  }
+
+  async function saveRoomBindings() {
+    const room = state.currentRoom;
+    if (!room || !roomBindingEdits.length) return;
+    const bindings = {};
+    roomBindingEdits.forEach((row) => {
+      bindings[row.participant_id] = {
+        agent_runtime_id: row.runtime_selection,
+        model_id: row.model_selection,
+        reasoning_effort: row.reasoning_selection,
+      };
+    });
+    const btn = $("#btn-bindings-save");
+    if (btn) btn.disabled = true;
+    const res = await api(`/api/rooms/${room.id}/bindings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bindings }),
+    });
+    if (btn) btn.disabled = false;
+    if (!res || !res.ok || !res.data) {
+      const errEl = $("#binding-edit-error");
+      if (errEl) {
+        errEl.textContent = (res && res.error) || "保存失败";
+        errEl.style.display = "block";
+      }
+      return;
+    }
+    applyLiveRoom(res.data);
+    const dlg = $("#dlg-room-bindings");
+    if (dlg && dlg.open) dlg.close();
+    toast(t("bindingsSaved"));
+  }
+
   // Protocol message cards: light labels over the normal chat style. Only
   // public structured output reaches the transcript, never hidden reasoning.
   const PROTOCOL_KIND_META = {
@@ -2673,11 +2951,127 @@
             <span class="msg-time num">${esc(m.created_at ? m.created_at.slice(11, 16) : nowTime())}</span>
           </div>
           <div class="msg-body md">${renderMessageBody(m.content)}</div>
+          ${renderMsgAttachments(m)}
         </div>
       </div>`;
     }).join("");
     feed.scrollTop = feed.scrollHeight;
     syncClearChatButton();
+  }
+
+  // ─── Room attachments (images / videos / files) ─────────────────────────
+  // Files travel base64-in-JSON (same contract as persona-creation
+  // materials): no multipart, no new transport.  Human-visible attachments
+  // render from transcript metadata; model-visible delivery happens
+  // server-side via _turn_image_messages + content-block converters.
+  let pendingRoomAttachments = [];
+
+  function msgAttachmentsOf(m) {
+    if (!m) return [];
+    const direct = Array.isArray(m.attachments) ? m.attachments : [];
+    const meta = m.metadata && Array.isArray(m.metadata.attachments)
+      ? m.metadata.attachments
+      : [];
+    const seen = new Set();
+    return [...direct, ...meta].filter((a) => {
+      if (!a || typeof a !== "object") return false;
+      const key = a.id || a.url;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function renderMsgAttachments(m) {
+    const items = msgAttachmentsOf(m);
+    if (!items.length) return "";
+    const cards = items.map((a) => {
+      const url = esc(a.url || "");
+      const name = esc(a.filename || a.id || "attachment");
+      if (!url) return "";
+      if (a.kind === "image" || String(a.mime || "").startsWith("image/")) {
+        return `<a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="${name}" loading="lazy" /></a>`;
+      }
+      if (a.kind === "video" || String(a.mime || "").startsWith("video/")) {
+        return `<video src="${url}" controls preload="metadata"></video>`;
+      }
+      if (a.kind === "audio" || String(a.mime || "").startsWith("audio/")) {
+        return `<audio src="${url}" controls preload="metadata"></audio>`;
+      }
+      return `<a class="msg-attach-file" href="${url}" target="_blank" rel="noopener" download="${name}">📎 ${name}</a>`;
+    }).filter(Boolean).join("");
+    if (!cards) return "";
+    return `<div class="msg-attachments">${cards}</div>`;
+  }
+
+  function renderPendingAttachments() {
+    const box = $("#attach-preview");
+    if (!box) return;
+    box.hidden = !pendingRoomAttachments.length;
+    box.innerHTML = pendingRoomAttachments.map((a, idx) => {
+      const name = esc(a.filename || "attachment");
+      const thumb = (a.kind === "image" || String(a.mime || "").startsWith("image/"))
+        ? `<img src="${esc(a.url)}" alt="${name}" />`
+        : "📎";
+      return `<span class="attach-chip">${thumb}<span>${name}</span><button type="button" data-rm-attach="${idx}" title="${esc(t("attachRemove"))}">×</button></span>`;
+    }).join("");
+    box.querySelectorAll("[data-rm-attach]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        pendingRoomAttachments.splice(+btn.dataset.rmAttach, 1);
+        renderPendingAttachments();
+      });
+    });
+  }
+
+  function clearPendingAttachments() {
+    pendingRoomAttachments = [];
+    renderPendingAttachments();
+    const input = $("#room-attachment-input");
+    if (input) input.value = "";
+    if (typeof window.__syncInjectEnabled === "function") window.__syncInjectEnabled();
+  }
+
+  function readFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const comma = result.indexOf(",");
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error || new Error("read_failed"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function queueRoomAttachmentFiles(files) {
+    const room = state.currentRoom;
+    if (!room || !files || !files.length) return;
+    for (const file of files) {
+      let content_base64;
+      try {
+        content_base64 = await readFileAsBase64(file);
+      } catch (err) {
+        toast(t("attachTooLarge"));
+        continue;
+      }
+      const res = await api(`/api/rooms/${room.id}/attachments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          mime: file.type || "",
+          content_base64
+        })
+      });
+      if (!res || !res.ok || !res.data) {
+        toast(`${t("attachFailed")}：${(res && res.error) || file.name}`);
+        continue;
+      }
+      pendingRoomAttachments.push(res.data);
+    }
+    renderPendingAttachments();
+    if (typeof window.__syncInjectEnabled === "function") window.__syncInjectEnabled();
   }
 
   // ─── Real Persona Runtime State ──────────────────────────────────────────
@@ -3054,7 +3448,8 @@
   async function injectUserMessage() {
     const input = $("#inject");
     const text = input.value.trim();
-    if (!text || !state.currentRoom || !["ready", "discussing"].includes(state.currentRoom.status)) return;
+    const attachments = pendingRoomAttachments.map((a) => a.id).filter(Boolean);
+    if ((!text && !attachments.length) || !state.currentRoom || !["ready", "discussing"].includes(state.currentRoom.status)) return;
     if (state.isTurnBusy) return;
     input.value = "";
     $("#btn-inject").disabled = true;
@@ -3068,9 +3463,11 @@
       body: JSON.stringify({
         content: text,
         type: "external_information",
-        client_message_id: clientMessageId
+        client_message_id: clientMessageId,
+        attachments
       })
     });
+    clearPendingAttachments();
     if (!res || !res.ok) {
       toast((res && res.error) || "注入失败");
       return;
@@ -3088,9 +3485,19 @@
       watchLiveRoom(room.id);
       return;
     }
+    if (room.mode === "direct_chat") {
+      state.isTurnBusy = true;
+      banner(true, t("bannerWaiting"));
+      watchLiveRoom(room.id);
+      return;
+    }
     if (room.mode === "autonomous" || room.mode === "auto") {
       banner(true, t("bannerWaiting"));
-      if (ROOM_UI_STATE.shouldStartLegacyAutonomous(room, transcriptHasModelOutput(room))) {
+      if (ROOM_UI_STATE.shouldStartLegacyAutonomous(
+        room,
+        transcriptHasModelOutput(room),
+        "user_message"
+      )) {
         wsSend({ action: "autonomous", max_turns: 6 });
       }
       watchLiveRoom(room.id);
@@ -4101,6 +4508,8 @@
       }
       return `<div class="row-between" style="gap:12px;align-items:center;border-top:1px solid var(--border-soft);padding-top:8px;">
         <div style="min-width:0;flex:1;"><strong>${esc(title)}</strong><span class="tag" style="margin-left:6px;">${esc(kind === "persona_creation" ? "Persona" : "Profile")}</span>
+          ${job.work_or_universe ? `<span class="tag" style="margin-left:4px;font-size:11px;">${esc(job.work_or_universe)}</span>` : ""}
+          ${job.subject_kind ? `<span class="tag" style="margin-left:4px;font-size:11px;">${esc(job.subject_kind === "fictional_character" ? "已有作品角色" : (job.subject_kind === "original_character" ? "原创人物" : "现实人物"))}</span>` : ""}
           <p class="meta" style="margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(statusLabel)} · ${esc(job.id)}</p>
           ${failure ? `<p class="error" style="font-size:11px;margin-top:3px;">${esc(failure.code || job.error || "任务失败")}：${esc(failure.message || job.error || "")} ${esc(failureMeta)}</p>` : ""}
           ${agentDiagnostics ? `<p class="meta" style="font-size:11px;margin-top:3px;">${esc(agentDiagnostics)}</p>` : ""}
@@ -4382,10 +4791,33 @@
         ${p.profile_type === "persona" ? `<button class="btn btn-danger" id="pd-delete" style="font-size:13px;">${t("deletePersona") || "删除该人物"}</button>` : `<span></span>`}
         <div class="row" style="gap:8px;">
           ${p.profile_type === "persona" ? `<button class="btn btn-ghost" id="pd-rename" style="font-size:13px;">重命名</button>` : ""}
+          ${p.profile_type === "persona" && p.persona_id ? `<button class="btn btn-ghost" id="pd-reset-runtime" style="font-size:13px;" title="${esc(t("resetRuntimeHint"))}">${t("resetRuntime")}</button>` : ""}
           <button class="btn btn-secondary" id="pd-enrich">${profileActionLabel(p)}</button>
           <button class="btn btn-secondary" id="pd-close-bottom">${t("close")}</button>
         </div>
-      </div>`;
+      </div>
+
+      <dialog class="sheet" id="dlg-runtime-reset" style="width:min(480px, calc(100% - 32px));">
+        <div class="sheet-body">
+          <h3>${t("resetRuntime")}</h3>
+          <p class="meta" style="margin:8px 0 16px;">${esc(t("resetRuntimeLead"))}</p>
+          <div class="stack" style="gap:10px;">
+            <label class="card" style="display:flex;gap:10px;padding:12px;cursor:pointer;">
+              <input type="radio" name="runtime-reset-mode" value="soft" checked />
+              <span><strong>${t("resetRuntimeSoft")}</strong><br /><span class="meta">${esc(t("resetRuntimeSoftHint"))}</span></span>
+            </label>
+            <label class="card" style="display:flex;gap:10px;padding:12px;cursor:pointer;">
+              <input type="radio" name="runtime-reset-mode" value="full" />
+              <span><strong>${t("resetRuntimeFull")}</strong><br /><span class="meta">${esc(t("resetRuntimeFullHint"))}</span></span>
+            </label>
+          </div>
+          <p class="error" id="runtime-reset-error" hidden></p>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:16px;">
+            <button type="button" class="btn btn-ghost" id="btn-runtime-reset-cancel">${t("cancel")}</button>
+            <button type="button" class="btn btn-primary" id="btn-runtime-reset-confirm">${t("confirm")}</button>
+          </div>
+        </div>
+      </dialog>`;
 
     const closeBtn = $("#pd-close");
     if (closeBtn) closeBtn.onclick = () => $("#dlg-persona").close();
@@ -4419,7 +4851,83 @@
         }
       };
     }
+    const resetRuntimeBtn = $("#pd-reset-runtime");
+    if (resetRuntimeBtn && (p.persona_id || p.id)) {
+      resetRuntimeBtn.onclick = () => openRuntimeResetDialog(p.persona_id || p.id);
+    }
+    const runtimeResetCancel = $("#btn-runtime-reset-cancel");
+    if (runtimeResetCancel) {
+      runtimeResetCancel.onclick = () => {
+        const dlg = $("#dlg-runtime-reset");
+        if (dlg && dlg.open) dlg.close();
+      };
+    }
+    const runtimeResetConfirm = $("#btn-runtime-reset-confirm");
+    if (runtimeResetConfirm) {
+      runtimeResetConfirm.onclick = () => submitRuntimeReset(p.persona_id || p.id);
+    }
     $("#dlg-persona").showModal();
+  }
+
+  function openRuntimeResetDialog(personaId) {
+    const dlg = $("#dlg-runtime-reset");
+    if (!dlg || !personaId) return;
+    const error = $("#runtime-reset-error");
+    if (error) {
+      error.hidden = true;
+      error.textContent = "";
+    }
+    const soft = dlg.querySelector('input[name="runtime-reset-mode"][value="soft"]');
+    if (soft) soft.checked = true;
+    if (!dlg.open) dlg.showModal();
+  }
+
+  async function submitRuntimeReset(personaId) {
+    const dlg = $("#dlg-runtime-reset");
+    const error = $("#runtime-reset-error");
+    const confirmBtn = $("#btn-runtime-reset-confirm");
+    const picked = dlg
+      ? dlg.querySelector('input[name="runtime-reset-mode"]:checked')
+      : null;
+    const full = picked ? picked.value === "full" : false;
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = t("resetting");
+    }
+    try {
+      const res = await api(
+        `/api/personas/${encodeURIComponent(personaId)}/runtime/reset`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ branch_id: "main", include_memories: full })
+        }
+      );
+      if (!res || !res.ok) {
+        throw new Error((res && res.error) || t("resetRuntimeFailed"));
+      }
+      if (dlg && dlg.open) dlg.close();
+      invalidatePersonaRuntime(personaId, "main");
+      toast(full ? t("resetRuntimeFullDone") : t("resetRuntimeSoftDone"));
+      // Refresh the detail view if it is still showing this persona.
+      const box = $("#persona-detail");
+      if (box && $("#profile-enrich-id")) {
+        showProfileDetail($("#profile-enrich-id").value || personaId).catch(() => {});
+      }
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      if (error) {
+        error.hidden = false;
+        error.textContent = message;
+      } else {
+        toast(message);
+      }
+    } finally {
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = t("confirm");
+      }
+    }
   }
 
   // Keep the old name as a compatibility shim for room-side callers.
@@ -4566,6 +5074,14 @@
     }
   }
 
+  // Research focus is only meaningful for web research: show the optional
+  // steering textarea for web_research/hybrid, hide it for local materials.
+  function syncProfileEnrichFocusVisibility() {
+    const wrap = $("#profile-enrich-focus-wrap");
+    const mode = $("#profile-enrich-input-mode")?.value || "local_materials";
+    if (wrap) wrap.hidden = !["web_research", "hybrid"].includes(mode);
+  }
+
   async function openProfileEnrichment(profileId) {
     const normalizedProfileId = typeof profileId === "string" ? profileId.trim() : "";
     if (!normalizedProfileId) throw new Error("缺少 Profile ID。");
@@ -4593,6 +5109,9 @@
     $("#profile-enrich-files").value = "";
     const inputMode = $("#profile-enrich-input-mode");
     if (inputMode) inputMode.value = "local_materials";
+    syncProfileEnrichFocusVisibility();
+    const focusInput = $("#profile-enrich-focus");
+    if (focusInput) focusInput.value = "";
     $("#profile-enrich-remote-consent").checked = false;
     const resetupEnrichSelectors = () => {
       let loadError = "";
@@ -4685,7 +5204,8 @@
           ],
           remote_material_consent: $("#profile-enrich-remote-consent").checked,
           research_policy: { profile: "deep" },
-          enrichment_input_mode: $("#profile-enrich-input-mode")?.value || "local_materials"
+          enrichment_input_mode: $("#profile-enrich-input-mode")?.value || "local_materials",
+          research_focus: $("#profile-enrich-focus")?.value.trim() || undefined
         })
       });
       if (!res || !res.ok) {
@@ -4859,23 +5379,32 @@
 
   // ─── Persona Creation Runtime ───────────────────────────────────────────
   function personaCreationTypeChanged() {
-    const type = $("#pc-persona-type").value;
-    const mode = $("#pc-creation-mode");
-    const publicType = type.startsWith("public_");
-    const privateType = type.startsWith("private_");
-    const fictional = type === "fictional_or_synthetic_person";
-    if (publicType) mode.value = "public_research";
-    else if (fictional) mode.value = "fictional";
-    else if (privateType && !["private_materials", "guided_interview"].includes(mode.value)) mode.value = "private_materials";
-    mode.querySelectorAll("option").forEach(option => {
-      option.hidden = (publicType && option.value !== "public_research")
-        || (fictional && option.value !== "fictional")
-        || (privateType && !["private_materials", "guided_interview"].includes(option.value));
-    });
-    $("#pc-policy-wrap").hidden = !publicType;
-    // Private and fictional personas both use local Evidence materials;
-    // only public research hides the materials uploader.
-    $("#pc-materials-wrap").hidden = publicType;
+    const subjectKind = $("#pc-subject-kind")?.value || "fictional_character";
+    const researchMode = $("#pc-research-mode")?.value || "auto";
+    
+    // Dynamic visibility based on subjectKind
+    const isRealPerson = subjectKind === "real_person";
+    const isFictional = subjectKind === "fictional_character";
+    const isOC = subjectKind === "original_character";
+    
+    const realFields = $("#pc-real-person-fields");
+    if (realFields) realFields.hidden = !isRealPerson;
+    
+    const workUniverseWrap = $("#pc-work-universe-wrap");
+    if (workUniverseWrap) workUniverseWrap.hidden = !isFictional;
+    
+    const ocWarning = $("#pc-oc-warning");
+    if (ocWarning) ocWarning.hidden = !isOC;
+    
+    // Policy wrap & materials wrap based on research mode
+    const needsWeb = ["web", "hybrid"].includes(researchMode) || (researchMode === "auto" && ["real_person", "fictional_character"].includes(subjectKind));
+    const needsMaterials = ["local", "hybrid", "guided_interview"].includes(researchMode) || (researchMode === "auto" && ["original_character", "synthetic_persona"].includes(subjectKind));
+    
+    const policyWrap = $("#pc-policy-wrap");
+    if (policyWrap) policyWrap.hidden = !needsWeb;
+    
+    const materialsWrap = $("#pc-materials-wrap");
+    if (materialsWrap) materialsWrap.hidden = !needsMaterials;
   }
 
   function personaCreationPolicyChanged() {
@@ -5225,12 +5754,45 @@
       }
       return;
     }
-    const type = $("#pc-persona-type").value;
-    const mode = $("#pc-creation-mode").value;
     const source = $("#pc-runtime-source").value;
     const agent = $("#pc-agent").value;
     const model = $("#pc-model").value;
     const reasoning = $("#pc-reasoning").value || null;
+
+    // V2 Identity & Research Strategy extraction
+    const subjectKind = $("#pc-subject-kind")?.value || "fictional_character";
+    const workUniverse = $("#pc-work-universe")?.value.trim() || null;
+    const lifeStatus = $("#pc-life-status")?.value || "unknown";
+    const privacyScope = $("#pc-privacy-scope")?.value || "public";
+    const identityContext = $("#pc-identity-context")?.value.trim() || null;
+    const userDefinedFacts = $("#pc-user-facts")?.value.trim() || null;
+    const researchMode = $("#pc-research-mode")?.value || "auto";
+    const researchInstructions = $("#pc-research-instructions")?.value.trim() || null;
+
+    // Derive backward-compatible type & mode
+    let type = "public_living_person";
+    let mode = "public_research";
+    if (subjectKind === "real_person") {
+      if (privacyScope === "private") {
+        type = lifeStatus === "deceased" ? "private_deceased_person" : "private_living_person";
+        mode = researchMode === "guided_interview" ? "guided_interview" : "private_materials";
+      } else {
+        type = lifeStatus === "deceased" ? "public_historical_person" : "public_living_person";
+        mode = "public_research";
+      }
+    } else {
+      type = "fictional_or_synthetic_person";
+      if (["web", "hybrid", "auto"].includes(researchMode) && subjectKind === "fictional_character") {
+        mode = "public_research";
+      } else if (researchMode === "guided_interview") {
+        mode = "guided_interview";
+      } else if (researchMode === "local") {
+        mode = "private_materials";
+      } else {
+        mode = "fictional";
+      }
+    }
+
     const materialText = $("#pc-materials").value.trim();
     const materials = materialText ? materialText.split(/\n\s*\n/).filter(Boolean).map((content, index) => ({
       title: `User material ${index + 1}`,
@@ -5266,6 +5828,15 @@
       aliases: $("#pc-aliases").value.split(",").map(value => value.trim()).filter(Boolean),
       persona_type: type,
       creation_mode: mode,
+      subject_kind: subjectKind,
+      work_or_universe: workUniverse,
+      life_status: lifeStatus,
+      privacy_scope: privacyScope,
+      identity_context: identityContext,
+      user_defined_facts: userDefinedFacts,
+      research_mode: researchMode,
+      research_instructions: researchInstructions,
+      web_scope: subjectKind === "original_character" ? "background_only" : (subjectKind === "fictional_character" ? "identity_and_canon" : "identity_and_biography"),
       birth_date: $("#pc-birth-date").value || null,
       death_date: $("#pc-death-date").value || null,
       data_cutoff_date: $("#pc-data-cutoff-date").value || null,
@@ -5283,6 +5854,22 @@
     if (!payload.display_name || !agent || !model) {
       if (error) { error.hidden = false; error.textContent = "名称、READY Runtime 和模型能力均为必填。"; }
       return;
+    }
+    // Block submission early when the selected agent's research capability is
+    // known-unavailable and the mode requires web research.  This prevents a
+    // hanging server-side behavioral probe on every attempt.
+    const needsResearch = mode === "public_research" || mode === "deep_research";
+    if (needsResearch) {
+      const selectedAgent = (state.agents || []).find(a => a.id === agent);
+      const researchStatus = ((selectedAgent && selectedAgent.research) || {}).verification_status || "";
+      if (researchStatus === "unavailable" || researchStatus === "blocked") {
+        const detail = (selectedAgent.research || {}).verification_error || "";
+        if (error) {
+          error.hidden = false;
+          error.textContent = `当前 Runtime 的联网研究能力${researchStatus === "blocked" ? "被策略阻止" : "验证不可用"}，无法执行联网深度研究。请更换 Runtime 或切换为“本地材料”模式。${detail ? " (" + detail + ")" : ""}`;
+        }
+        return;
+      }
     }
     start.disabled = true;
     start.textContent = "正在创建任务…";
@@ -7264,7 +7851,6 @@
       </div>
       <div class="row" style="gap:8px;flex-wrap:wrap;">
         <div><button class="btn btn-sm btn-primary" type="submit">${t("prodPlanSubmit")}</button></div>
-        <div><button class="btn btn-sm btn-secondary" type="button" data-narr-vp-action="one-shot" data-prod-pkg="${esc(pkg.id)}" title="${t("prodOneShotSubmit")}">${t("prodOneShotSubmit")}</button></div>
       </div>
     </form>`;
   }
@@ -7318,6 +7904,43 @@
     </div>`;
   }
 
+  // Human labels for recommended settings (task #28): no snake_case, one
+  // duration source of truth.
+  const NARR_VP_SETTING_LABELS = {
+    actual_generation_duration: "生成时长",
+    duration_seconds: "生成时长",
+    aspect_ratio: "比例",
+    quality_priority: "质量策略",
+    generation_mode: "模式",
+  };
+  const NARR_VP_QUALITY_LABELS = { quality: "质量优先", balanced: "均衡", fast: "速度优先" };
+
+  function narrVpSettingRows(settings) {
+    if (!settings || typeof settings !== "object") return [];
+    return Object.entries(settings)
+      .filter(([key]) => key !== "target_duration_seconds") // dropped: conflicts with duration
+      .map(([key, value]) => {
+        const label = NARR_VP_SETTING_LABELS[key] || key;
+        let text = typeof value === "object" ? JSON.stringify(value) : String(value);
+        if (key === "quality_priority") text = NARR_VP_QUALITY_LABELS[value] || text;
+        if (key === "actual_generation_duration" || key === "duration_seconds") text = `${text} 秒`;
+        return [label, text];
+      });
+  }
+
+  function narrVpContinuityText(clip) {
+    // Translate machine codes; stable ordered dedupe (task #30/#60).
+    const seen = new Set();
+    const rows = [];
+    for (const item of (clip.continuity_constraints || [])) {
+      const raw = String(item || "").trim();
+      if (!raw || seen.has(raw)) continue;
+      seen.add(raw);
+      rows.push(raw === "previous_clip_end_frame" ? "上一段尾帧 = 本段首帧（物理连续）" : raw);
+    }
+    return rows;
+  }
+
   function narrVpClipCard(plan, clip, profile) {
     const prodPkgId = plan.production_package_id;
     const ready = plan.status === "ready";
@@ -7331,6 +7954,8 @@
         </select>`
       : `<input class="input narr-vp-duration" type="number" step="1" value="${esc(clip.duration_seconds)}"${durations && durations.min != null ? ` min="${esc(durations.min)}"` : ""}${durations && durations.max != null ? ` max="${esc(durations.max)}"` : ""} data-narr-vp-change="clip-duration" ${clipMeta} />`;
     const shots = narrVpShotRanges(clip.source_shot_numbers);
+    const continuityRows = narrVpContinuityText(clip);
+    const startKey = clip.start_frame_asset_key || "";
     return `
     <div class="narr-vp-clip" data-clip-id="${esc(clip.id)}">
       <div class="row-between" style="gap:8px;flex-wrap:wrap;">
@@ -7338,9 +7963,9 @@
         ${shots ? `<span class="meta">${t("clipSourceShots")}：${esc(shots)}</span>` : ""}
       </div>
       ${clip.purpose ? `<p class="meta">${t("clipPurpose")}：${esc(clip.purpose)}</p>` : ""}
-      <p class="meta">${t("clipGenMode")}：${esc(narrVpModeLabel(clip.generation_mode || "auto"))}</p>
+      <p class="meta">${t("clipGenMode")}：${esc(narrVpModeLabel(clip.generation_mode || "auto"))}${startKey ? ` ｜ Start Frame：${esc(startKey)}` : ""}</p>
       <p class="meta">${t("clipRefs")}：${narrVpClipRefNames(clip.reference_asset_ids)}</p>
-      ${(clip.continuity_constraints || []).length ? `<p class="meta">${t("clipContinuity")}：${esc(clip.continuity_constraints.join("；"))}</p>` : ""}
+      ${continuityRows.length ? `<p class="meta">${t("clipContinuity")}：${esc(continuityRows.join("；"))}</p>` : ""}
       <div class="row narr-vp-clip-edit" style="gap:8px;flex-wrap:wrap;align-items:center;">
         <span class="meta">${t("clipEditDuration")}</span>${durationControl}
         <span class="meta">${t("clipEditMode")}</span>
@@ -7358,18 +7983,17 @@
   }
 
   function narrVpClipPromptBlock(plan, clip, clipMeta) {
-    const settings = clip.recommended_settings && typeof clip.recommended_settings === "object"
-      ? Object.entries(clip.recommended_settings)
-        .map(([key, value]) => `<li>${esc(key)}：${esc(typeof value === "object" ? JSON.stringify(value) : String(value))}</li>`)
-        .join("")
+    const settingRows = narrVpSettingRows(clip.recommended_settings);
+    const settings = settingRows.length
+      ? settingRows.map(([label, value]) => `<li>${esc(label)}：${esc(value)}</li>`).join("")
       : "";
     return `
       <div class="narr-vp-prompt-block">
+        <p class="narr-vp-prompt-label">${t("prodClipTechPromptNote")}</p>
         <p class="narr-vp-prompt-label">${t("clipPrompt")}</p>
         <pre class="narr-vp-prompt-text">${esc(clip.prompt || "—")}</pre>
         ${clip.audio_prompt ? `<p class="narr-vp-prompt-label">${t("clipAudioPrompt")}</p><pre class="narr-vp-prompt-text">${esc(clip.audio_prompt)}</pre>` : ""}
         ${clip.negative_prompt ? `<p class="narr-vp-prompt-label">${t("clipNegativePrompt")}</p><pre class="narr-vp-prompt-text">${esc(clip.negative_prompt)}</pre>` : ""}
-        ${(clip.continuity_constraints || []).length ? `<p class="narr-vp-prompt-label">${t("clipContinuity")}</p><ul>${clip.continuity_constraints.map(item => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}
         ${settings ? `<p class="narr-vp-prompt-label">${t("clipRecommended")}</p><ul>${settings}</ul>` : ""}
         <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:8px;">
           <button class="btn btn-sm btn-secondary" type="button" data-narr-vp-action="copy-prompt" ${clipMeta}>${t("clipCopyPrompt")}</button>
@@ -7396,12 +8020,13 @@
     ];
     if (clip.audio_prompt) rows.push(`${t("clipAudioPrompt")}：\n${clip.audio_prompt}`);
     if (clip.negative_prompt) rows.push(`${t("clipNegativePrompt")}：\n${clip.negative_prompt}`);
-    if (clip.recommended_settings && Object.keys(clip.recommended_settings).length) {
-      const rec = Object.entries(clip.recommended_settings)
-        .map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : value}`)
-        .join("; ");
+    const settingRows = narrVpSettingRows(clip.recommended_settings);
+    if (settingRows.length) {
+      const rec = settingRows.map(([label, value]) => `${label}=${value}`).join("; ");
       rows.push(`${t("clipRecommended")}：${rec}`);
     }
+    const continuityRows = narrVpContinuityText(clip);
+    if (continuityRows.length) rows.push(`${t("clipContinuity")}：${continuityRows.join("；")}`);
     return rows.join("\n\n");
   }
 
@@ -7484,8 +8109,18 @@
     for (const pkg of state.narrProduction) {
       if (!Array.isArray(state.narrPromptPlans[pkg.id])) await loadNarrativePromptPlans(pkg.id);
     }
+    const view = state.narrProductionView === "advanced" ? "advanced" : "guide";
     host.innerHTML = `
       <div class="narr-prod-layers">
+        <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+          <button class="btn btn-sm ${view === "guide" ? "btn-primary" : "btn-secondary"}" type="button" data-narr-vp-action="view-guide">${t("prodViewGuide")}</button>
+          <button class="btn btn-sm ${view === "advanced" ? "btn-primary" : "btn-secondary"}" type="button" data-narr-vp-action="view-advanced">${t("prodViewAdvanced")}</button>
+        </div>
+        ${view === "guide"
+          ? (state.narrProduction.length
+              ? state.narrProduction.map(pkg => narrVpCompleteSection(pkg)).join("")
+              : `<p class="meta">暂无制作包 — 在单集创作中生成。</p>`)
+          : `
         <section class="narr-prod-layer" id="narr-vp-master-layer">
           <h4 class="narr-prod-layer-title">${t("prodLayerMaster")}</h4>
           <p class="meta">${t("prodLayerMasterHelp")}</p>
@@ -7500,9 +8135,205 @@
           <h4 class="narr-prod-layer-title">${t("prodLayerGuide")}</h4>
           <p class="meta">${t("prodLayerGuideHelp")}</p>
           ${state.narrProduction.length ? state.narrProduction.map(pkg => narrVpGuideSection(pkg)).join("") : `<p class="meta">暂无制作包 — 生成制作包后可产出完整制作手册。</p>`}
-        </section>
+        </section>`}
       </div>`;
     bindNarrativeProductionEvents();
+  }
+
+  // ─── Simple Mode: one-click complete AI video production plan ─────────
+  function narrVpCompleteSection(pkg) {
+    const guide = state.narrGuides[pkg.id] || null;
+    return `
+    <section class="card narr-vp-complete" data-prod-pkg="${esc(pkg.id)}">
+      <div class="row-between" style="gap:8px;flex-wrap:wrap;">
+        <strong>${t("prodCompleteTitle")} · EP${String(pkg.episode_number).padStart(2, "0")}</strong>
+        <span class="row" style="gap:6px;flex-wrap:wrap;">
+          ${pkg.is_preview ? `<span class="tag danger">${t("prodPreviewBadge")}</span>` : `<span class="tag ok">${t("prodCanonBadge")}</span>`}
+        </span>
+      </div>
+      <p class="meta">${t("prodCompleteHelp")}</p>
+      ${narrVpCompleteFormHtml(pkg)}
+      <div id="narr-guide-job-${esc(pkg.id)}"></div>
+      <div id="narr-complete-job-${esc(pkg.id)}"></div>
+      ${pkg.stale ? `<div class="narr-prod-stale">${t("prodStaleBanner")}</div>` : ""}
+      ${guide ? narrVpGuideMainBlock(pkg, guide) : `<p class="meta">${t("prodGuideMainEmpty")}</p>`}
+    </section>`;
+  }
+
+  function narrVpCompleteFormHtml(pkg) {
+    const st = narrVpFormState(pkg.id);
+    const profile = narrVpProfileById(st.profile_id);
+    const modes = (profile && Array.isArray(profile.modes)) ? profile.modes : [];
+    const ratios = (profile && Array.isArray(profile.aspect_ratios)) ? profile.aspect_ratios : [];
+    const aspectOptions = ratios.length ? ratios : ["16:9", "9:16"];
+    if (!st.aspect_ratio) st.aspect_ratio = aspectOptions.includes("9:16") ? "9:16" : aspectOptions[0];
+    return `
+    <form class="narr-vp-create stack" data-narr-vp-form="complete" data-prod-pkg="${esc(pkg.id)}">
+      <div class="field">
+        <label>${t("prodTargetModel")}</label>
+        <select class="input" data-narr-vp-change="profile" data-prod-pkg="${esc(pkg.id)}">
+          <option value="">—</option>
+          ${(state.narrVideoProfiles || []).map(p => `<option value="${esc(p.id)}" ${p.id === st.profile_id ? "selected" : ""}>${esc(narrVpProfileOptionLabel(p))}</option>`).join("")}
+        </select>
+      </div>
+      <div class="grid-2 narr-form-grid">
+        <div class="field"><label>${t("prodAspect")}</label>
+          <select class="input" data-narr-vp-change="aspect" data-prod-pkg="${esc(pkg.id)}">
+            ${aspectOptions.map(r => `<option value="${esc(r)}" ${r === st.aspect_ratio ? "selected" : ""}>${esc(r)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field"><label>${t("prodQuality")}</label>
+          <select class="input" data-narr-vp-change="quality" data-prod-pkg="${esc(pkg.id)}">
+            <option value="quality" ${st.quality_priority === "quality" ? "selected" : ""}>${t("prodQualityQuality")}</option>
+            <option value="balanced" ${st.quality_priority === "balanced" ? "selected" : ""}>${t("prodQualityBalanced")}</option>
+            <option value="fast" ${st.quality_priority === "fast" ? "selected" : ""}>${t("prodQualityFast")}</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid-2 narr-form-grid">
+        <div class="field"><label>${t("prodContinuity")}</label>
+          <select class="input" data-narr-vp-change="continuity" data-prod-pkg="${esc(pkg.id)}">
+            <option value="auto" ${st.continuity_strategy === "auto" ? "selected" : ""}>${t("prodContinuityAuto")}</option>
+          </select>
+        </div>
+        <div class="field"><label>${t("prodPromptLang")}</label>
+          <select class="input" data-narr-vp-change="lang" data-prod-pkg="${esc(pkg.id)}">
+            <option value="auto" ${st.prompt_language === "auto" ? "selected" : ""}>${t("prodLangAuto")}</option>
+            <option value="en" ${st.prompt_language === "en" ? "selected" : ""}>English</option>
+            <option value="zh" ${st.prompt_language === "zh" ? "selected" : ""}>中文</option>
+          </select>
+        </div>
+      </div>
+      <details class="narr-advanced-block">
+        <summary>${t("prodAdvancedSettings")}</summary>
+        <div class="field"><label>${t("prodAdvancedGenMode")}</label>
+          <select class="input" data-narr-vp-change="mode" data-prod-pkg="${esc(pkg.id)}">
+            <option value="auto" ${st.generation_strategy === "auto" ? "selected" : ""}>${t("modeAuto")}</option>
+            ${modes.map(m => `<option value="${esc(m)}" ${m === st.generation_strategy ? "selected" : ""}>${esc(narrVpModeLabel(m))}</option>`).join("")}
+          </select>
+        </div>
+        <p class="meta">${narrVpAudioHint(profile)}</p>
+      </details>
+      <div>
+        <button class="btn btn-primary" type="submit">${t("prodCompleteSubmit")}</button>
+      </div>
+    </form>`;
+  }
+
+  // ─── Complete plan: main guide document view (not a drawer) ────────────
+  function narrVpGuideMainBlock(pkg, guide) {
+    return `
+    <div class="narr-guide-main" data-prod-pkg="${esc(pkg.id)}">
+      ${guide.stale ? `<div class="narr-prod-stale">${t("prodGuideStaleBanner")}</div>` : ""}
+      <div class="row-between narr-guide-toolbar" style="gap:8px;flex-wrap:wrap;margin:10px 0;">
+        <strong>${esc(guide.title || t("prodLayerGuide"))}</strong>
+        <span class="row" style="gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-sm btn-secondary" type="button" data-narr-vp-action="guide-copy-full" data-prod-pkg="${esc(pkg.id)}">${t("prodGuideCopyFull")}</button>
+          <button class="btn btn-sm btn-secondary" type="button" data-narr-vp-action="guide-export" data-prod-pkg="${esc(pkg.id)}">${t("prodGuideExportMd")}</button>
+          <button class="btn btn-sm btn-secondary" type="button" data-narr-vp-action="complete-plan" data-prod-pkg="${esc(pkg.id)}">${t("prodGuideRegenFull")}</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-narr-vp-action="guide-ask" data-prod-pkg="${esc(pkg.id)}" title="${t("prodGuideAskAgentHint")}">${t("prodGuideAskAgent")}</button>
+        </span>
+      </div>
+      <div class="narr-guide-markdown">${renderMessageBody(guide.markdown_document || "")}</div>
+    </div>`;
+  }
+
+  function renderNarrativeCompleteJob(prodPkgId, progress, error) {
+    const host = document.getElementById(`narr-complete-job-${prodPkgId}`);
+    if (!host) return;
+    if (error) { host.innerHTML = `<div class="narr-prod-stale danger">${esc(error)}</div>`; return; }
+    if (!progress) { host.innerHTML = ""; return; }
+    // The complete-plan job reports creator-facing Chinese labels straight
+    // from the backend; fall back to the raw label/stage string.
+    const label = (progress.label && String(progress.label).trim())
+      ? progress.label
+      : (progress.stage || "");
+    const total = Number(progress.total);
+    const completed = Number(progress.completed || 0);
+    const counts = Number.isFinite(total) && total > 0 ? `（${completed}/${total}）` : "";
+    let percent = 8;
+    const order = ["analyzing_episode", "planning_clips", "matching_model", "character_references",
+      "scene_references", "video_prompts", "frame_chain", "subtitle_sound", "bgm_editing", "final_document"];
+    const idx = order.indexOf(progress.stage);
+    if (idx >= 0) percent = 8 + Math.round((idx / order.length) * 88);
+    else if (progress.stage === "completed") percent = 100;
+    if (progress.percent != null && Number.isFinite(Number(progress.percent))) {
+      percent = Math.max(percent, Math.min(100, Number(progress.percent)));
+    }
+    host.innerHTML = `
+      <div class="card narr-vp-job" style="background:var(--surface);border:1px solid var(--border-soft);padding:12px 14px;border-radius:var(--radius-sm);margin:10px 0;display:flex;flex-direction:column;gap:8px;">
+        <div class="row-between" style="gap:8px;align-items:center;">
+          <div class="row" style="gap:8px;align-items:center;">
+            <span class="spinner"></span>
+            <strong>${esc(label)}${esc(counts)}</strong>
+          </div>
+          <span class="meta" style="font-weight:700;font-size:12px;color:var(--accent);">${percent}%</span>
+        </div>
+        <div class="progress" style="height:6px;background:color-mix(in oklch, var(--text) 10%, var(--bg));border-radius:980px;overflow:hidden;">
+          <div class="progress-bar" style="height:100%;width:${percent}%;background:var(--accent);border-radius:980px;transition:width 0.3s ease;"></div>
+        </div>
+        <div class="meta" style="font-size:12px;">${t("prodJobRunningHint")}</div>
+      </div>`;
+  }
+
+  async function pollNarrativeCompleteJob(prodPkgId, jobId) {
+    state.narrCompleteJobs[prodPkgId] = jobId;
+    renderNarrativeCompleteJob(prodPkgId, { stage: "created" });
+    for (;;) {
+      await new Promise(resolve => setTimeout(resolve, 800));
+      const snap = await api(`/api/narrative-jobs/${jobId}`);
+      if (!snap || !snap.ok) {
+        renderNarrativeCompleteJob(prodPkgId, null, redactNarrText((snap && snap.error) || "任务状态读取失败"));
+        return;
+      }
+      const job = snap.data;
+      if (!job || !["completed", "failed", "cancelled"].includes(job.status)) {
+        renderNarrativeCompleteJob(prodPkgId, (job && job.progress) || {});
+        continue;
+      }
+      state.narrCompleteJobs[prodPkgId] = null;
+      if (job.status !== "completed") {
+        const failure = parseNarrativeJobError(job);
+        renderNarrativeCompleteJob(prodPkgId, null, redactNarrText((failure && failure.message) || job.error || "任务失败"));
+        return;
+      }
+      renderNarrativeCompleteJob(prodPkgId, null);
+      // Task #46: after the one-click job completes, the COMPLETE plan is the
+      // first thing the user sees (default view + fresh guide at top).
+      state.narrProductionView = "guide";
+      await loadNarrativePromptPlans(prodPkgId);
+      await loadNarrativeGuide(prodPkgId);
+      await renderNarrativeProductionLayers();
+      toast(t("toastCompletePlanReady"));
+      const target = document.querySelector(`.narr-guide-main[data-prod-pkg="${CSS.escape(prodPkgId)}"]`);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+  }
+
+  async function createNarrativeCompletePlanJob(prodPkgId) {
+    if (!state.narrProject) return;
+    const st = narrVpFormState(prodPkgId);
+    if (!st.profile_id) { toast(t("toastSelectTargetModel")); return; }
+    renderNarrativeCompleteJob(prodPkgId, { stage: "created" });
+    const res = await api(`/api/narratives/${state.narrProject.id}/production/${prodPkgId}/complete-plan`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target_profile_id: st.profile_id,
+        aspect_ratio: st.aspect_ratio || "16:9",
+        quality_priority: st.quality_priority || "balanced",
+        generation_strategy: st.generation_strategy || "auto",
+        continuity_strategy: st.continuity_strategy || "auto",
+        audio_strategy: "auto",
+        prompt_language: st.prompt_language || "auto",
+      }),
+    });
+    if (!res || !res.ok) {
+      renderNarrativeCompleteJob(prodPkgId, null, redactNarrText((res && res.error) || "任务创建失败"));
+      toast(redactNarrText((res && res.error) || "任务创建失败"));
+      return;
+    }
+    await pollNarrativeCompleteJob(prodPkgId, res.data.id);
   }
 
   function bindNarrativeProductionEvents() {
@@ -7521,7 +8352,8 @@
       const form = event.target.closest("form[data-narr-vp-form]");
       if (form && host.contains(form)) {
         event.preventDefault();
-        if (form.dataset.narrVpForm === "plan") createNarrativeClipPlanJob(form.dataset.prodPkg);
+        if (form.dataset.narrVpForm === "complete") createNarrativeCompletePlanJob(form.dataset.prodPkg);
+        else if (form.dataset.narrVpForm === "plan") createNarrativeClipPlanJob(form.dataset.prodPkg);
         else submitNarrativeProductionAsset(form.dataset.prodPkg);
       }
     });
@@ -7746,22 +8578,6 @@
     );
   }
 
-  async function createNarrativePromptPackageJob(prodPkgId) {
-    const st = narrVpFormState(prodPkgId);
-    if (!st.profile_id) { toast(t("toastSelectTargetModel")); return; }
-    const profile = narrVpProfileById(st.profile_id);
-    renderNarrativePlanJob(prodPkgId, { stage: "queued" });
-    await submitNarrativePromptPackageJob(prodPkgId, {
-      profile_id: st.profile_id,
-      aspect_ratio: st.aspect_ratio || (profile && profile.aspect_ratios && profile.aspect_ratios[0]) || "16:9",
-      quality_priority: st.quality_priority || "balanced",
-      generation_strategy: st.generation_strategy || "auto",
-      continuity_strategy: st.continuity_strategy || "auto",
-      audio_strategy: "auto",
-      prompt_language: st.prompt_language || "auto",
-    });
-  }
-
   async function recompileNarrativePromptPackage(prodPkgId, plan) {
     renderNarrativePlanJob(prodPkgId, { stage: "queued" });
     await submitNarrativePromptPackageJob(prodPkgId, {
@@ -7824,6 +8640,39 @@
   async function handleNarrativeVpAction(btn) {
     const action = btn.dataset.narrVpAction;
     const prodPkgId = btn.dataset.prodPkg;
+    if (action === "view-guide") {
+      state.narrProductionView = "guide";
+      await renderNarrativeProductionLayers();
+      return;
+    }
+    if (action === "view-advanced") {
+      state.narrProductionView = "advanced";
+      await renderNarrativeProductionLayers();
+      return;
+    }
+    if (action === "complete-plan" && prodPkgId) { await createNarrativeCompletePlanJob(prodPkgId); return; }
+    if (action === "guide-copy-full" && prodPkgId) {
+      const guide = state.narrGuides[prodPkgId];
+      if (guide) await copyNarrText(guide.markdown_document || "");
+      return;
+    }
+    if (action === "guide-export" && prodPkgId) {
+      const guide = state.narrGuides[prodPkgId];
+      if (!guide || !state.narrProject) return;
+      // File download bypasses the JSON api() helper: direct navigation to
+      // the markdown endpoint (server sets Content-Disposition: attachment).
+      const link = document.createElement("a");
+      link.href = `/api/narratives/${state.narrProject.id}/production-guides/${guide.id}/export`;
+      link.download = "";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return;
+    }
+    if (action === "guide-ask" && prodPkgId) {
+      await openShootingPanelWithInstruction(t("prodGuideAskAgentHint"));
+      return;
+    }
     if (action === "toggle-form") {
       const st = narrVpFormState(prodPkgId);
       st.open = !st.open;
@@ -7849,7 +8698,6 @@
     if (action === "guide-create" && prodPkgId && state.narrProject) { await createNarrativeGuideJob(prodPkgId); return; }
     if (action === "guide-open" && prodPkgId) { openNarrativeGuideDrawer(prodPkgId); return; }
     if (action === "compile-prompts" && plan) { await compileNarrativePromptPackage(prodPkgId, plan); return; }
-    if (action === "one-shot") { await createNarrativePromptPackageJob(prodPkgId); return; }
     if (action === "pkg-recompile" && plan) { await recompileNarrativePromptPackage(prodPkgId, plan); }
     if (action === "export-zip" && prodPkgId && state.narrProject) {
       // File download bypasses the JSON api() helper: direct navigation to
@@ -7937,11 +8785,12 @@
 
   function narrGuideClipItem(clip) {
     const shots = narrVpShotRanges(clip.source_shot_numbers);
-    const settings = clip.recommended_settings && typeof clip.recommended_settings === "object"
-      ? Object.entries(clip.recommended_settings)
-        .map(([key, value]) => `<li>${esc(key)}：${esc(typeof value === "object" ? JSON.stringify(value) : String(value))}</li>`)
-        .join("")
+    const settingRows = narrVpSettingRows(clip.recommended_settings);
+    const settings = settingRows.length
+      ? settingRows.map(([label, value]) => `<li>${esc(label)}：${esc(value)}</li>`).join("")
       : "";
+    const continuityRows = narrVpContinuityText(clip);
+    const startKey = clip.start_frame_asset_key || "";
     return `
     <div class="narr-guide-clip">
       <div class="row-between" style="gap:8px;flex-wrap:wrap;">
@@ -7949,8 +8798,8 @@
         ${shots ? `<span class="meta">${t("clipSourceShots")}：${esc(shots)}</span>` : ""}
       </div>
       ${clip.purpose ? `<p class="meta">${t("clipPurpose")}：${esc(clip.purpose)}</p>` : ""}
-      <p class="meta">${t("clipGenMode")}：${esc(narrVpModeLabel(clip.generation_mode || "auto"))}</p>
-      ${(clip.continuity_constraints || []).length ? `<p class="meta">${t("clipContinuity")}：${esc(clip.continuity_constraints.join("；"))}</p>` : ""}
+      <p class="meta">${t("clipGenMode")}：${esc(narrVpModeLabel(clip.generation_mode || "auto"))}${startKey ? ` ｜ Start Frame：${esc(startKey)}` : ""}</p>
+      ${continuityRows.length ? `<p class="meta">${t("clipContinuity")}：${esc(continuityRows.join("；"))}</p>` : ""}
       <pre class="narr-vp-prompt-text">${esc(clip.copy_ready_prompt || clip.prompt || "—")}</pre>
       ${settings ? `<p class="narr-vp-prompt-label">${t("clipRecommended")}</p><ul>${settings}</ul>` : ""}
       <div class="row" style="gap:8px;margin-top:6px;">
@@ -8026,10 +8875,16 @@
   }
 
   function renderNarrativePlanForm(prodPkgId) {
-    const host = document.getElementById(`narr-vp-create-${prodPkgId}`);
     const pkg = (state.narrProduction || []).find(item => item.id === prodPkgId);
-    if (!host || !pkg) return;
-    host.outerHTML = narrVpPlanFormHtml(pkg);
+    if (!pkg) return;
+    // Re-render whichever form variant is currently in the DOM: the advanced
+    // clip-plan form and/or the Simple Mode complete-plan form share state.
+    const planHost = document.getElementById(`narr-vp-create-${prodPkgId}`);
+    if (planHost) planHost.outerHTML = narrVpPlanFormHtml(pkg);
+    const completeHost = document.querySelector(
+      `form[data-narr-vp-form="complete"][data-prod-pkg="${CSS.escape(prodPkgId)}"]`
+    );
+    if (completeHost) completeHost.outerHTML = narrVpCompleteFormHtml(pkg);
   }
 
   function openNarrativeCreateModal() {
@@ -8811,6 +9666,10 @@
       syncTopicClamp();
     });
     $("#btn-add-slot").onclick = () => {
+      if ($("#lobby-mode").value === "direct_chat") {
+        toast("一对一聊天只能选择一个人格");
+        return;
+      }
       if (!state.personas.length) {
         toast("当前没有可用人物");
         return;
@@ -8839,12 +9698,20 @@
     };
     $("#lobby-protocol").addEventListener("change", () => {
       const protocol = $("#lobby-protocol").value;
+      if (protocol !== "free_discussion" && $("#lobby-mode").value === "direct_chat") {
+        $("#lobby-mode").value = "autonomous";
+      }
       state.lobbySlots.forEach((slot, index) => {
         slot.role = defaultRole(protocol, index);
         slot.authority = authorityForRole(slot.role);
       });
       renderProtocolSettings();
       applyLobbyMode(state.lobbyAdvanced ? "advanced" : "simple");
+      renderBindingPreview();
+    });
+    $("#lobby-mode").addEventListener("change", () => {
+      syncDirectChatLobbyMode();
+      renderSlots();
       renderBindingPreview();
     });
     document.querySelectorAll("#lobby-mode-toggle [data-lobby-mode]").forEach(btn => {
@@ -8864,6 +9731,17 @@
 
     $("#btn-next").onclick = () => stepTurn();
     $("#btn-retry-room").onclick = retryRoomInitialization;
+    const editBindingsBtn = $("#btn-edit-bindings");
+    if (editBindingsBtn) editBindingsBtn.onclick = openRoomBindingsDialog;
+    const bindingsCancelBtn = $("#btn-bindings-cancel");
+    if (bindingsCancelBtn) {
+      bindingsCancelBtn.onclick = () => {
+        const dlg = $("#dlg-room-bindings");
+        if (dlg && dlg.open) dlg.close();
+      };
+    }
+    const bindingsSaveBtn = $("#btn-bindings-save");
+    if (bindingsSaveBtn) bindingsSaveBtn.onclick = saveRoomBindings;
     $("#btn-manual").onclick = () => {
       const spk = $("#manual-speaker").value;
       if (spk) stepTurn(spk);
@@ -8999,13 +9877,34 @@
 
     const injectInput = $("#inject");
     if (injectInput) {
-      injectInput.addEventListener("input", () => {
-        $("#btn-inject").disabled = !injectInput.value.trim() || !state.currentRoom || !["ready", "discussing", "paused"].includes(state.currentRoom.status);
-      });
+      const syncInjectEnabled = () => {
+        if (!state.currentRoom || !["ready", "discussing", "paused"].includes(state.currentRoom.status)) {
+          $("#btn-inject").disabled = true;
+          return;
+        }
+        $("#btn-inject").disabled = !injectInput.value.trim() && !pendingRoomAttachments.length;
+      };
+      injectInput.addEventListener("input", syncInjectEnabled);
       injectInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter") injectUserMessage();
       });
       $("#btn-inject").onclick = injectUserMessage;
+      window.__syncInjectEnabled = syncInjectEnabled;
+    }
+    const attachBtn = $("#btn-attach");
+    if (attachBtn) {
+      attachBtn.onclick = () => {
+        if (!state.currentRoom) return;
+        const picker = $("#room-attachment-input");
+        if (picker) picker.click();
+      };
+    }
+    const attachInput = $("#room-attachment-input");
+    if (attachInput) {
+      attachInput.addEventListener("change", () => {
+        queueRoomAttachmentFiles(attachInput.files);
+        attachInput.value = "";
+      });
     }
 
     const dismissRoomErrBtn = $("#btn-dismiss-room-error");
@@ -9965,6 +10864,10 @@
     });
     onClick("#profile-create-close", () => $("#dlg-profile-create").close());
     onClick("#profile-enrich-close", () => $("#dlg-profile-enrich").close());
+    const profileEnrichInputMode = $("#profile-enrich-input-mode");
+    if (profileEnrichInputMode) {
+      profileEnrichInputMode.addEventListener("change", syncProfileEnrichFocusVisibility);
+    }
     onClick("#profile-enrich-progress-close", () => $("#dlg-profile-enrich-progress").close());
     onClick("#profile-enrich-progress-pause", async () => {
       const job = state.profileEnrichmentJob;
@@ -10028,6 +10931,10 @@
     onClick("#persona-creation-progress-close", () => $("#dlg-persona-creation-progress").close());
     const personaForm = $("#form-persona-create");
     if (personaForm) personaForm.addEventListener("submit", submitPersonaCreation);
+    const subjectKindSel = $("#pc-subject-kind");
+    if (subjectKindSel) subjectKindSel.addEventListener("change", personaCreationTypeChanged);
+    const researchModeSel = $("#pc-research-mode");
+    if (researchModeSel) researchModeSel.addEventListener("change", personaCreationTypeChanged);
     onClick("#pc-persona-type", personaCreationTypeChanged);
     const personaTypeSel = $("#pc-persona-type");
     if (personaTypeSel) personaTypeSel.addEventListener("change", personaCreationTypeChanged);

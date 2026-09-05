@@ -112,8 +112,8 @@ def test_guide_pipeline_happy_path_deterministic(app, monkeypatch) -> None:
     assert guide.episode_version_id == production.episode_version_id
     assert guide.target_profile_id == PROFILE_ID
     assert guide.markdown_document.strip()
-    assert "一、制作目标" in guide.markdown_document
-    assert "十三、最终检查清单" in guide.markdown_document
+    assert "一、制作目标与基础设置" in guide.markdown_document
+    assert "、最终检查清单" in guide.markdown_document
     assert guide.required_assets
     assert all(asset.generation_prompt for asset in guide.required_assets)
     assert guide.clip_workflows

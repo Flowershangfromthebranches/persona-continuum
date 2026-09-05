@@ -887,6 +887,14 @@ class VideoModelProfile(BaseModel):
     # Same honesty rule as negative_prompt_strategy: conservative default,
     # never asserting an undocumented capability.
     reference_prompt_syntax: str = "textual_anchor"
+    # Platform UI terminology translation (task #63/#64): how the guide words
+    # reference inputs for THIS vendor's actual product UI, e.g. Veo calls
+    # them "Ingredients" / "Start Frame" while Runway uses "Input Image" /
+    # "Character Reference". Empty entries fall back to neutral wording.
+    platform_terms: dict[str, str] = Field(default_factory=dict)
+    # native_screen_text | post_composite: whether the model can reliably
+    # render in-frame readable text (default: composite in post).
+    screen_text_strategy: str = "post_composite"
 
 
 class ProductionAsset(BaseModel):
@@ -952,6 +960,11 @@ class GenerationClip(BaseModel):
     copy_ready_prompt: str = ""
     character_ids: list[str] = Field(default_factory=list)
     prop_ids: list[str] = Field(default_factory=list)
+    # User-facing start-frame token resolved by the guide layer (e.g.
+    # "FRAME_01" carried from the previous clip, or "EP01_CLIP01_START" for a
+    # dedicated scene start-frame asset). Empty on planner output; the guide
+    # compiler fills it so the UI never has to re-derive frame logic.
+    start_frame_asset_key: str = ""
 
 
 class ModelPromptPackage(BaseModel):
@@ -1072,6 +1085,12 @@ class ProductionGuideAsset(BaseModel):
     source_bible_refs: list[str] = Field(default_factory=list)
     # deterministic | llm_refined
     provenance: str = "deterministic"
+    # CharacterVisualIdentity (task #13): the fixed visual character design
+    # (age/face/hair/height/body/costume/palette/temperament) synthesized when
+    # the bibles lack concrete visual data. Deterministic per (project,
+    # character) so every episode reuses the SAME identity instead of drifting
+    # back to a generic description.
+    visual_identity: dict[str, Any] = Field(default_factory=dict)
     compiler_trace: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 

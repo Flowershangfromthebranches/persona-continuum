@@ -8,6 +8,7 @@ It never fabricates files — missing reference assets become explicit
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from persona_continuum.application._utils import new_id
@@ -117,6 +118,200 @@ def _character_anchor(
 _GENERIC_LOCATION_ANCHOR = "the established location"
 
 
+def _normalize_location_name(name: str) -> tuple[str, list[str]]:
+    """Split a location name into its base name and bracketed aliases.
+
+    Example: "智源科技总部大楼（MindCore Tower）" -> ("智源科技总部大楼", ["MindCore Tower"])
+    """
+    aliases = [a.strip() for a in re.findall(r"[\(（\[【](.*?)[\)）\]】]", name) if a.strip()]
+    base = re.sub(r"[\(（\[【].*?[\)）\]】]", "", name).strip()
+    return base, aliases
+
+
+_COMMON_LOCATION_SUFFIXES = (
+    "总部大楼",
+    "写字楼",
+    "办公楼",
+    "大楼",
+    "大厦",
+    "大厅",
+    "广场",
+    "中心",
+    "大堂",
+    "园区",
+    "基地",
+    "外",
+    "内",
+)
+
+
+def _location_core_stem(name: str) -> str:
+    """Extract the core stem of a location name by stripping common building suffixes."""
+    base, _ = _normalize_location_name(name)
+    stem = base.strip()
+    for suffix in sorted(_COMMON_LOCATION_SUFFIXES, key=len, reverse=True):
+        if stem.endswith(suffix) and len(stem) > len(suffix):
+            stem = stem[: -len(suffix)].strip()
+    return stem
+
+
+def _enrich_entry_description(
+    entry: dict[str, Any], production_package: ProductionPackage
+) -> dict[str, Any]:
+    """If entry has no description, try to find description from other entries in package."""
+    if _bible_entry_text(entry):
+        return entry
+    eid = str(entry.get("location_id") or entry.get("id") or "")
+    ename = str(entry.get("name") or "")
+    for entries in (production_package.location_list, production_package.location_visual_bible):
+        for other in entries:
+            if not isinstance(other, dict):
+                continue
+            other_id = str(other.get("location_id") or other.get("id") or "")
+            other_name = str(other.get("name") or "")
+            if (eid and eid == other_id) or (ename and ename == other_name):
+                text = _bible_entry_text(other)
+                if text:
+                    enriched = dict(entry)
+                    enriched["description"] = text
+                    return enriched
+    return entry
+
+
+def resolve_location_entry(
+    location: str, production_package: ProductionPackage
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve a clip location to a location visual bible / list entry.
+
+    Supports exact matching, alias/parenthesis extraction, hierarchical
+    sub-location splitting (e.g. '智源科技大厦·运营部开放工位' ->
+    '智源科技总部大楼'), and core stem matching.
+
+    Returns ``(matched_entry, sub_location_detail)``, or ``(None, "")``
+    if no relationship can be established (fail-closed).
+    """
+    loc = location.strip()
+    if not loc:
+        return None, ""
+
+    candidate_entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entries in (
+        production_package.location_visual_bible,
+        production_package.location_list,
+    ):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            eid = str(entry.get("location_id") or entry.get("id") or entry.get("name") or "")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                candidate_entries.append(entry)
+
+    if not candidate_entries:
+        return None, ""
+
+    matched: dict[str, Any] | None = None
+    sub_detail = ""
+
+    # Pass 1: Exact id or name match (case-sensitive, then case-insensitive)
+    for entry in candidate_entries:
+        keys = {str(entry.get(k, "")).strip() for k in ("location_id", "id", "name")}
+        if loc in keys:
+            matched = entry
+            break
+    if matched is None:
+        for entry in candidate_entries:
+            keys = {str(entry.get(k, "")).strip().casefold() for k in ("location_id", "id", "name")}
+            if loc.casefold() in keys:
+                matched = entry
+                break
+
+    # Pass 2: Base name or bracketed alias match
+    if matched is None:
+        for entry in candidate_entries:
+            entry_name = _bible_entry_name(entry)
+            base, aliases = _normalize_location_name(entry_name)
+            all_aliases = {base, *aliases}
+            if loc in all_aliases or loc.casefold() in {a.casefold() for a in all_aliases if a}:
+                matched = entry
+                break
+
+    # Pass 3: Hierarchical / delimiter splitting (e.g. Parent · Sub-space)
+    if matched is None:
+        parts = [p.strip() for p in re.split(r"[·\-—–/\\_:,：]", loc) if p.strip()]
+        if len(parts) > 1:
+            parent = parts[0]
+            sub = " · ".join(parts[1:])
+            # 3a. Parent matches exact / alias
+            for entry in candidate_entries:
+                keys = {str(entry.get(k, "")).strip() for k in ("location_id", "id", "name")}
+                entry_name = _bible_entry_name(entry)
+                base, aliases = _normalize_location_name(entry_name)
+                all_names = keys | {base, *aliases}
+                folded = {a.casefold() for a in all_names if a}
+                if parent in all_names or parent.casefold() in folded:
+                    matched = entry
+                    sub_detail = sub
+                    break
+
+            # 3b. Parent core stem matches entry core stem
+            if matched is None:
+                parent_stem = _location_core_stem(parent)
+                if len(parent_stem) >= 2:
+                    for entry in candidate_entries:
+                        e_name = _bible_entry_name(entry)
+                        e_stem = _location_core_stem(e_name)
+                        if (
+                            parent_stem.casefold() == e_stem.casefold()
+                            or parent_stem.casefold() in e_stem.casefold()
+                            or e_stem.casefold() in parent_stem.casefold()
+                        ):
+                            matched = entry
+                            sub_detail = sub
+                            break
+
+            # 3c. Sub-part matches an entry (e.g. '街角至十字路口' -> '滨海大道十字路口')
+            if matched is None:
+                for part in parts[1:]:
+                    part_stem = _location_core_stem(part)
+                    if len(part_stem) >= 2:
+                        for entry in candidate_entries:
+                            e_name = _bible_entry_name(entry)
+                            e_stem = _location_core_stem(e_name)
+                            p_fold = part_stem.casefold()
+                            e_fold = e_stem.casefold()
+                            if (
+                                p_fold == e_fold
+                                or (len(part_stem) >= 3 and p_fold in e_fold)
+                                or (len(e_stem) >= 3 and e_fold in p_fold)
+                            ):
+                                matched = entry
+                                sub_detail = sub
+                                break
+                    if matched is not None:
+                        break
+
+    # Pass 4: Direct core stem match without delimiters (e.g. '智源科技大厦' -> '智源科技总部大楼')
+    if matched is None:
+        stem = _location_core_stem(loc)
+        if len(stem) >= 2:
+            for entry in candidate_entries:
+                e_name = _bible_entry_name(entry)
+                e_stem = _location_core_stem(e_name)
+                if (
+                    stem.casefold() == e_stem.casefold()
+                    or (len(stem) >= 3 and stem.casefold() in e_stem.casefold())
+                    or (len(e_stem) >= 3 and e_stem.casefold() in stem.casefold())
+                ):
+                    matched = entry
+                    break
+
+    if matched is not None:
+        return _enrich_entry_description(matched, production_package), sub_detail
+    return None, ""
+
+
 def _location_anchor(location: str, production_package: ProductionPackage) -> str:
     """Bible anchor for one clip's location.
 
@@ -125,15 +320,15 @@ def _location_anchor(location: str, production_package: ProductionPackage) -> st
     describe a completely different scene — it falls back to a generalized
     phrase instead.
     """
-    if location:
-        for entry in production_package.location_visual_bible:
-            if not isinstance(entry, dict):
-                continue
-            keys = {str(entry.get(key, "")) for key in ("location_id", "id", "name")}
-            if location in keys:
-                name = _bible_entry_name(entry)
-                text = _bible_entry_text(entry)
-                return f"{name}: {text}" if name and text else (name or text)
+    entry, _ = resolve_location_entry(location, production_package)
+    if entry is not None:
+        name = _bible_entry_name(entry)
+        text = _bible_entry_text(entry)
+        if location and location != name:
+            context = f"{name}: {text}" if (name and text) else (name or text)
+            return f"{location} ({context})" if context else location
+        if name or text:
+            return f"{name}: {text}" if name and text else (name or text)
     return _GENERIC_LOCATION_ANCHOR
 
 
@@ -412,8 +607,10 @@ def _reference_token(asset: ProductionAsset) -> str:
 def _character_identities_for_guide(
     character_ids: list[str], production_package: ProductionPackage
 ) -> list[tuple[str, str]]:
-    """(character_id, full bible text) pairs; text stays empty when the id
-    has no character_visual_bible entry (the caller owns the fallback)."""
+    """(character_id, merged bible text) pairs; text stays empty when the id
+    has no character_visual_bible/character_list entry (the caller owns the
+    fallback). Merges the visual bible with the story-bible character list
+    (task #11: Narrative Character + Visual Bible + wardrobe together)."""
     identities: list[tuple[str, str]] = []
     for character_id in character_ids:
         if not character_id:
@@ -426,6 +623,27 @@ def _character_identities_for_guide(
             if character_id in keys:
                 text = _bible_entry_text(entry)
                 break
+        if not text:
+            # Story-bible character_list fallback: role + visual description.
+            for entry in production_package.character_list:
+                if not isinstance(entry, dict):
+                    continue
+                keys = {str(entry.get(key, "")) for key in ("id", "name")}
+                if character_id in keys:
+                    role = str(entry.get("role") or "").strip()
+                    visual = entry.get("visual")
+                    visual_text = ""
+                    if isinstance(visual, str) and visual.strip():
+                        visual_text = visual.strip()
+                    elif isinstance(visual, dict):
+                        visual_text = "; ".join(
+                            f"{str(key).replace('_', ' ')}: {str(value)}"
+                            for key, value in visual.items()
+                            if isinstance(value, str) and value.strip()
+                        )
+                    bits = [bit for bit in (role, visual_text) if bit]
+                    text = " — ".join(bits)
+                    break
         identities.append((character_id, text))
     return identities
 
@@ -439,22 +657,18 @@ def _location_identity_for_guide(
     when the location resolves to no location bible entry and no location
     list entry: the guide layer never falls back to a generic anchor.
     """
-    if location:
-        for entries in (
-            production_package.location_visual_bible,
-            production_package.location_list,
-        ):
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                keys = {
-                    str(entry.get(key, "")) for key in ("location_id", "id", "name")
-                }
-                if location in keys:
-                    name = _bible_entry_name(entry)
-                    text = _bible_entry_text(entry)
-                    if name or text:
-                        return f"{name}: {text}" if name and text else (name or text)
+    entry, sub = resolve_location_entry(location, production_package)
+    if entry is not None:
+        name = _bible_entry_name(entry)
+        text = _bible_entry_text(entry)
+        if location and location != name:
+            context = f"{name}: {text}" if (name and text) else (name or text)
+            if context:
+                return f"{location} ({context})"
+            return location
+        if name or text:
+            return f"{name}: {text}" if name and text else (name or text)
+
     raise NarrativeAgentError(
         SHOOTING_LOCATION_CONTEXT_MISSING,
         f"Clip location '{location}' resolves to no location bible entry and "
@@ -464,6 +678,11 @@ def _location_identity_for_guide(
     )
 
 
+def _dedupe_lines(lines: list[str]) -> list[str]:
+    """Stable ordered dedupe for prompt-section lines (task #30)."""
+    return list(dict.fromkeys(line for line in lines if line.strip()))
+
+
 def compile_copy_ready_prompt(
     clip: GenerationClip,
     profile: VideoModelProfile,
@@ -471,6 +690,7 @@ def compile_copy_ready_prompt(
     assets_by_id: dict[str, ProductionAsset],
     frame_plan: dict[str, Any] | None = None,
     trace_out: dict[str, Any] | None = None,
+    identity_overrides: dict[str, str] | None = None,
 ) -> str:
     """Build ONE self-contained, copy-paste-ready prompt for one clip.
 
@@ -485,7 +705,10 @@ def compile_copy_ready_prompt(
     final state) and ``produces_next_start_frame`` (this clip's final frame
     becomes the next clip's start frame). ``trace_out``, when a dict is
     passed, is populated with ``{profile_id, syntax, sections_included,
-    character_count}``.
+    character_count}``. ``identity_overrides`` maps character_id -> a
+    synthesized CharacterVisualIdentity block that replaces the thin
+    "match the reference images" line for characters whose bible text is
+    empty (task #11/#13).
 
     The old ``max_prompt_chars`` truncation is intentionally NOT applied:
     the copy-ready prompt owns its own section budget.
@@ -496,6 +719,16 @@ def compile_copy_ready_prompt(
     plan = frame_plan or {}
     carry_in = bool(plan.get("carry_in_start_frame"))
     produces_next = bool(plan.get("produces_next_start_frame"))
+    # Guide-layer planned inputs (task #19/#20): a dedicated scene start-frame
+    # token and the master reference tokens the work order tells the user to
+    # upload. They keep the prompt's REFERENCE INPUTS section consistent with
+    # the work order even before real files exist in the asset registry.
+    scene_start_token = str(plan.get("scene_start_frame") or "").strip()
+    reference_tokens = [
+        str(token).strip()
+        for token in (plan.get("reference_tokens") or [])
+        if str(token).strip()
+    ]
     syntax = profile.reference_prompt_syntax
     sections: list[str] = []
     sections_included: list[str] = []
@@ -519,6 +752,11 @@ def compile_copy_ready_prompt(
         goal_lines.append(
             "Continue exactly from the provided START FRAME (the final state "
             "of the previous clip); do not restart the scene."
+        )
+    elif scene_start_token:
+        goal_lines.append(
+            "Animate forward from the provided scene START FRAME image; do "
+            "not restart or re-frame the scene."
         )
     goal_lines.append(f"Frame the shot in {clip.aspect_ratio}.")
     add_section("GOAL", goal_lines)
@@ -568,11 +806,22 @@ def compile_copy_ready_prompt(
                 "START FRAME: use the provided START FRAME image as the first "
                 "frame of this clip."
             )
+        elif scene_start_token:
+            reference_lines.append(
+                f"START FRAME: use the provided scene start-frame image "
+                f"({scene_start_token}) as the first frame of this clip."
+            )
         if reference_assets:
             names = ", ".join(asset.name for asset in reference_assets)
             reference_lines.append(
                 "REFERENCE IMAGES: use the provided reference images "
                 f"({names}) to lock identity and style."
+            )
+        elif reference_tokens:
+            reference_lines.append(
+                "REFERENCE IMAGES: use the provided reference images "
+                f"({', '.join(reference_tokens)}) to lock character identity, "
+                "environment, and style."
             )
     if not reference_lines:
         reference_lines.append(
@@ -586,7 +835,10 @@ def compile_copy_ready_prompt(
         for character_id, text in _character_identities_for_guide(
             clip.character_ids, production_package
         ):
-            if text:
+            override = (identity_overrides or {}).get(character_id)
+            if override:
+                identity_lines.append(f"- {character_id}: {override}")
+            elif text:
                 identity_lines.append(f"- {character_id}: {text}")
             else:
                 identity_lines.append(
@@ -645,21 +897,27 @@ def compile_copy_ready_prompt(
             "final state of the previous clip; match its framing, lighting, "
             "and character positions."
         )
+    elif scene_start_token:
+        continuity_lines.append(
+            "The clip starts from the provided scene START FRAME image "
+            f"({scene_start_token}); match its framing, lighting, and "
+            "character positions exactly."
+        )
     continuity_lines.extend(
         constraint
         for constraint in clip.continuity_constraints
         if constraint and constraint != "previous_clip_end_frame"
     )
-    add_section("CONTINUITY", continuity_lines)
+    add_section("CONTINUITY", _dedupe_lines(continuity_lines))
 
     if produces_next:
         ending_line = (
-            "ENDING: design the final frame to be stable and well-composed, "
-            "because it will become the start frame of the next clip."
+            "Design the final frame to be stable and well-composed, because "
+            "it will become the start frame of the next clip."
         )
     else:
         ending_line = (
-            "ENDING: leave the final frame clean and stable so subtitles or a "
+            "Leave the final frame clean and stable so subtitles or a "
             "fade-out can be applied in post-production."
         )
     add_section("ENDING", [ending_line])

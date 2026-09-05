@@ -590,6 +590,185 @@ class SessionService:
         self.database.conn.commit()
         return True
 
+    def reset_runtime_state(
+        self,
+        persona_id: str,
+        *,
+        branch_id: str = "main",
+        include_memories: bool = False,
+    ) -> dict[str, Any]:
+        """Restore a persona's runtime state to its initial values.
+
+        With ``include_memories=False`` (default) only the volatile runtime
+        is reset: affect intensities back to baseline, needs back to
+        baseline, relationships removed, plus the change-event log and the
+        derived runtime_state.json cache for that branch.  Sessions, session
+        turns, memories and compiled persona content are untouched, so the
+        conversation history stays visible while the persona "cools down".
+
+        With ``include_memories=True`` the branch's conversational footprint
+        goes as well: sessions, session turns, derived memories (experience
+        summaries, reflections, relationship events) and -- for the main
+        branch -- room transcripts that belong to the persona.  Compiled
+        persona content (sources, evidence, dimensions, versions) is never
+        touched: this is a state reset, not a persona deletion.
+        """
+
+        self.personas.get(persona_id)
+        removed: dict[str, int] = {}
+        removed["affect_states"] = self._delete_count(
+            "DELETE FROM affect_states WHERE persona_id = ? AND branch_id = ?",
+            (persona_id, branch_id),
+        )
+        removed["needs"] = self._delete_count(
+            "DELETE FROM needs WHERE persona_id = ? AND branch_id = ?",
+            (persona_id, branch_id),
+        )
+        removed["relationships"] = self._delete_count(
+            "DELETE FROM relationships WHERE persona_id = ? AND branch_id = ?",
+            (persona_id, branch_id),
+        )
+        event_ids = [
+            str(row["id"])
+            for row in self.database.conn.execute(
+                "SELECT id FROM change_events WHERE persona_id = ? AND branch_id = ?",
+                (persona_id, branch_id),
+            ).fetchall()
+        ]
+        if event_ids:
+            placeholders = ",".join("?" for _ in event_ids)
+            self.database.conn.execute(
+                f"DELETE FROM change_event_supports WHERE event_id IN ({placeholders})",
+                event_ids,
+            )
+            removed["change_event_supports"] = self.database.conn.total_changes
+            self.database.conn.execute(
+                f"DELETE FROM change_events WHERE id IN ({placeholders})",
+                event_ids,
+            )
+        else:
+            removed["change_event_supports"] = 0
+        removed["change_events"] = len(event_ids)
+        if include_memories:
+            removed.update(self._reset_conversational_footprint(persona_id, branch_id))
+        self.database.conn.commit()
+        self._refresh_runtime_state(persona_id, branch_id)
+        return {"persona_id": persona_id, "branch_id": branch_id, "removed": removed}
+
+    def _delete_count(self, sql: str, params: tuple[object, ...]) -> int:
+        before = self.database.conn.total_changes
+        self.database.conn.execute(sql, params)
+        return self.database.conn.total_changes - before
+
+    def _reset_conversational_footprint(
+        self, persona_id: str, branch_id: str
+    ) -> dict[str, int]:
+        """Delete sessions, turns and derived memories for one branch."""
+
+        removed: dict[str, int] = {}
+        session_ids = [
+            str(row["id"])
+            for row in self.database.conn.execute(
+                "SELECT id FROM sessions WHERE persona_id = ?", (persona_id,)
+            ).fetchall()
+        ]
+        branch_session_ids = (
+            session_ids
+            if branch_id == "main"
+            else [
+                session_id
+                for session_id in session_ids
+                if self._session_branch(persona_id, session_id) == branch_id
+            ]
+        )
+        if branch_session_ids:
+            placeholders = ",".join("?" for _ in branch_session_ids)
+            params: tuple[object, ...] = (persona_id, *branch_session_ids)
+            removed["session_turns"] = self._delete_count(
+                "DELETE FROM session_turns "
+                f"WHERE persona_id = ? AND session_id IN ({placeholders})",
+                params,
+            )
+            removed["sessions"] = self._delete_count(
+                "DELETE FROM sessions "
+                f"WHERE persona_id = ? AND id IN ({placeholders})",
+                params,
+            )
+        else:
+            removed["session_turns"] = 0
+            removed["sessions"] = 0
+        derived_kinds = (
+            "digital_experience",
+            "reflection_summary",
+            "system_summary",
+            "relationship_update_event",
+            "unresolved_event",
+        )
+        kind_placeholders = ",".join("?" for _ in derived_kinds)
+        if branch_id == "main":
+            memory_rows = self.database.conn.execute(
+                "SELECT id FROM memories "
+                f"WHERE persona_id = ? AND source_kind IN ({kind_placeholders})",
+                (persona_id, *derived_kinds),
+            ).fetchall()
+        else:
+            memory_rows = [
+                row
+                for row in self.database.conn.execute(
+                    "SELECT id, metadata_json FROM memories "
+                    f"WHERE persona_id = ? AND source_kind IN ({kind_placeholders})",
+                    (persona_id, *derived_kinds),
+                ).fetchall()
+                if (
+                    str(dict(loads(str(row["metadata_json"] or "{}"))).get("branch_id") or "main")
+                    == branch_id
+                )
+            ]
+        memory_ids = [str(row["id"]) for row in memory_rows]
+        if memory_ids:
+            placeholders = ",".join("?" for _ in memory_ids)
+            params = (persona_id, *memory_ids)
+            removed["memories_fts"] = self._delete_count(
+                f"DELETE FROM memories_fts WHERE persona_id = ? AND memory_id IN ({placeholders})",
+                params,
+            )
+            removed["memories"] = self._delete_count(
+                f"DELETE FROM memories WHERE persona_id = ? AND id IN ({placeholders})",
+                params,
+            )
+        else:
+            removed["memories_fts"] = 0
+            removed["memories"] = 0
+        removed["room_transcripts"] = self._reset_room_transcripts(persona_id, branch_id)
+        return removed
+
+    def _session_branch(self, persona_id: str, session_id: str) -> str:
+        row = self.database.conn.execute(
+            "SELECT metadata_json FROM sessions WHERE persona_id = ? AND id = ?",
+            (persona_id, session_id),
+        ).fetchone()
+        if row is None:
+            return "main"
+        try:
+            return str(dict(loads(str(row["metadata_json"] or "{}"))).get("branch_id") or "main")
+        except Exception:
+            return "main"
+
+    def _reset_room_transcripts(self, persona_id: str, branch_id: str) -> int:
+        """Delete room transcript rows that belong to this persona's branch.
+
+        Room transcripts have no branch column; the main branch owns every
+        row where the persona spoke.  Non-main branches leave the shared
+        room history alone.
+        """
+
+        if branch_id != "main":
+            return 0
+        return self._delete_count(
+            "DELETE FROM room_transcripts WHERE persona_id = ?",
+            (persona_id,),
+        )
+
     def list_sessions(self, persona_id: str | None = None) -> list[SessionRecord]:
         if persona_id:
             rows = self.database.conn.execute(

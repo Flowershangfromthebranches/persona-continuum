@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from persona_continuum.agent.contracts import (
     adapter_output_streaming_mode,
     adapter_prompt_mode,
     adapter_structured_output_mode,
+    adapter_wire_text,
 )
 from persona_continuum.agent.models import (
     AgentEvent,
@@ -210,12 +210,15 @@ class AgentRuntimeExecutor:
         system_prompt: str | None,
         user_message: str,
         messages: list[dict[str, Any]] | None = None,
+        attachments: list[Any] | None = None,
         expected_output: Any = None,
         phase: str = "agent_turn",
         stream: bool = False,
         metadata: dict[str, Any] | None = None,
         state_callback: Callable[[str], None] | None = None,
     ) -> AgentExecutionResult:
+        from persona_continuum.agent.models import AgentAttachment
+
         turn = AgentTurn(
             user_message=user_message,
             system_prompt=(
@@ -224,6 +227,11 @@ class AgentRuntimeExecutor:
                 else system_prompt
             ),
             messages=list(messages or []),
+            attachments=[
+                AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+                for a in (attachments or [])
+                if isinstance(a, (dict, AgentAttachment))
+            ],
             expected_output=schema_as_json(expected_output),
             stream=stream,
             metadata={"phase": phase, **dict(metadata or {})},
@@ -241,6 +249,7 @@ class AgentRuntimeExecutor:
         schema: Any,
         phase: str,
         messages: list[dict[str, Any]] | None = None,
+        attachments: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
         max_repair_attempts: int | None = None,
         state_callback: Callable[[str], None] | None = None,
@@ -250,6 +259,7 @@ class AgentRuntimeExecutor:
             system_prompt=system_prompt,
             user_message=user_message,
             messages=messages,
+            attachments=attachments,
             expected_output=schema,
             phase=phase,
             stream=False,
@@ -585,6 +595,7 @@ class AgentRuntimeExecutor:
         system_prompt: str | None,
         user_message: str,
         messages: list[dict[str, Any]] | None = None,
+        attachments: list[Any] | None = None,
         expected_output: Any = None,
         tools: list[dict[str, Any]] | None = None,
         phase: str = "agent_turn",
@@ -598,6 +609,8 @@ class AgentRuntimeExecutor:
         the DONE event; relying on garbage collection could strand a slot.
         """
 
+        from persona_continuum.agent.models import AgentAttachment
+
         turn = AgentTurn(
             user_message=user_message,
             system_prompt=(
@@ -606,6 +619,11 @@ class AgentRuntimeExecutor:
                 else system_prompt
             ),
             messages=list(messages or []),
+            attachments=[
+                AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+                for a in (attachments or [])
+                if isinstance(a, (dict, AgentAttachment))
+            ],
             tools=list(tools or []),
             expected_output=schema_as_json(expected_output),
             stream=True,
@@ -723,16 +741,14 @@ class AgentRuntimeExecutor:
         # Prompt Transport Guard: model context and prompt transport are two
         # different capabilities.  A prompt that the transport cannot carry
         # must fail loudly here instead of hanging or truncating downstream.
+        # The guard measures the ACTUAL wire text for this adapter: adapters
+        # render attachments through their own carrier (local path reference,
+        # native protocol item, inline base64) via ``adapter_wire_text``.
+        # Attachment bytes are governed by adapter media budgets, never by
+        # this text budget.
         transport = resolve_prompt_transport_capability(adapter)
-        estimated_prompt_bytes = len(
-            ((turn.system_prompt or "") + (turn.full_prompt or turn.user_message or "")).encode(
-                "utf-8"
-            )
-        )
-        for message in turn.messages or []:
-            estimated_prompt_bytes += len(
-                json.dumps(message, ensure_ascii=False, default=str).encode("utf-8")
-            )
+        wire_text = adapter_wire_text(adapter, turn)
+        estimated_prompt_bytes = len(wire_text.encode("utf-8"))
         if not transport.allows_bytes(estimated_prompt_bytes):
             raise PromptTransportLimitExceededError(
                 "PROMPT_TRANSPORT_LIMIT_EXCEEDED",

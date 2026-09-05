@@ -97,6 +97,28 @@ def test_gemini_chat_safe_prompt_forbids_headless_tool_calls() -> None:
     assert prompt.endswith("rendered prompt")
 
 
+def test_gemini_chat_safe_policy_applies_with_room_declared_tools() -> None:
+    # Room protocol slots carry allow_agent_tools=True, so AgentSessionConfig
+    # lists the persona built-ins even though the plain-CLI protocol cannot
+    # execute them.  The headless policy must still be applied or the model
+    # calls its native tools and headless mode auto-denies them.
+    adapter = GeminiCliAdapter()
+    config = AgentSessionConfig(
+        room_id="persona-room",
+        participant_id="slot_1",
+        persona_id="子平先生",
+        permission_profile=PermissionProfile.CHAT_SAFE,
+        allow_mcp=False,
+        tools=[{"name": "persona_search_memories"}],
+    )
+    turn = AgentTurn(user_message="room protocol task")
+
+    prompt = adapter.prepare_prompt(config, turn, "rendered room prompt")
+
+    assert "Do not call GrepSearch, read_file" in prompt
+    assert prompt.endswith("rendered room prompt")
+
+
 def test_gemini_research_prompt_does_not_disable_declared_tools() -> None:
     adapter = GeminiCliAdapter()
     prompt = adapter.prepare_prompt(

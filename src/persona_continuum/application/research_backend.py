@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import itertools
 import json
+import os
 import re
 from collections.abc import Iterable
 from contextlib import suppress
@@ -25,6 +26,61 @@ from persona_continuum.application.research_capability_cache import ResearchCapa
 from persona_continuum.numeric import safe_acp_stream_limit, safe_int, safe_timeout
 
 _worker_seq = itertools.count(1)
+
+# Probe-failure markers.  They are matched against an exception's *own*
+# surface (message, typed code, adapter-classified CLI failure) and never
+# against its diagnostics blob: every turn's diagnostics contain
+# timeout-budget keys and the sanitized command shape, whose permission
+# flags are expected policy arguments rather than denials.
+_GEO_BLOCK_MARKERS = (
+    "user location is not supported",
+    "location is not supported",
+)
+_AUTH_MARKERS = (
+    "auth",
+    "login",
+    "credential",
+    "unauthorized",
+    "not authenticated",
+)
+_POLICY_MARKERS = (
+    "permission",
+    "policy",
+    "not allowed",
+    "disallowed",
+    "denied",
+    "forbidden",
+    "sandbox",
+    "headless",
+    "allowlist",
+)
+# Typed codes the runtime executor raises when the turn's own timeout
+# budget expires; only these are genuine "the session timed out" signals.
+_EXECUTOR_TIMEOUT_CODES = frozenset(
+    {"AGENT_IDLE_TIMEOUT", "AGENT_HARD_TIMEOUT", "AGENT_TURN_TIMEOUT"}
+)
+
+
+def _proxy_hint() -> str:
+    """Explain the most common cause of a hanging CLI: no proxy in this process.
+
+    CLI subprocesses inherit this server's environment, so a Runtime that
+    needs a proxy hangs until the turn budget expires when the Web service
+    was started without ``HTTP_PROXY``/``HTTPS_PROXY``.
+    """
+
+    configured = [
+        name
+        for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+        if os.environ.get(name)
+    ]
+    if configured:
+        return ""
+    return (
+        "当前服务进程未检测到 HTTP_PROXY/HTTPS_PROXY 环境变量，"
+        "CLI 子进程会继承该环境——若该 CLI 需要代理才能联网，"
+        "请在启动 Web 服务的终端配置代理后重启服务。"
+    )
 
 
 def new_worker_seq() -> int:
@@ -300,6 +356,27 @@ class NativeCliResearchBackend:
                 *(self.search(query, limit=limit) for query in normalized)
             )
             return dict(zip(normalized, values, strict=True))
+
+        # Chunk large query sets into manageable slices (e.g. 4 queries per turn)
+        # to prevent model reasoning + tool calling from timing out.
+        chunk_size = 4
+        if len(normalized) > chunk_size:
+            combined_output: dict[str, list[dict[str, Any]]] = {}
+            for i in range(0, len(normalized), chunk_size):
+                chunk = normalized[i : i + chunk_size]
+                try:
+                    chunk_res = await self.batch_search(chunk, limit=limit)
+                    combined_output.update(chunk_res)
+                except Exception:
+                    # Fallback to individual search for robustness
+                    for q in chunk:
+                        try:
+                            single_res = await self.search(q, limit=limit)
+                            combined_output[q] = single_res
+                        except Exception:
+                            combined_output[q] = []
+            return combined_output
+
         payload = await self._ask(
             "Use your native web search tool for every query below in this ONE Agent turn. "
             "You may issue multiple tool calls. Return JSON only as "
@@ -600,59 +677,110 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
         cli_name: str,
         can_discover_sources: bool | None = None,
     ) -> ResearchCapabilityProbeError:
-        raw_error = " ".join(
-            (
-                str(exc),
-                str(getattr(exc, "code", "")),
-                str(getattr(exc, "diagnostics", "")),
-            )
+        """Classify a probe failure from the error's own surface only.
+
+        The full ``diagnostics`` dict is deliberately NOT substring-matched:
+        every turn's diagnostics contain timeout-budget keys such as
+        ``idle_timeout_seconds``, and research sessions legitimately carry
+        permission flags (``--dangerously-skip-permissions``) inside the
+        sanitized command shape.  Matching those strings turned every CLI
+        transport failure into "timeout" + "policy blocked" and buried the
+        real cause (for example the provider's FAILED_PRECONDITION
+        region rejection).
+        """
+
+        diagnostics = getattr(exc, "diagnostics", None)
+        cli_failure_parts: list[str] = []
+        if isinstance(diagnostics, dict):
+            # Only *values* are read, never key names: the executor's
+            # budget keys ("idle_timeout_seconds") and the sanitized
+            # command shape (with its permission flags) must stay out of
+            # the match, while the CLI's own failure text carries the
+            # only actionable reason.
+            for key in ("diagnostic", "cli_failure", "stderr_tail", "last_error"):
+                value = diagnostics.get(key)
+                if isinstance(value, str) and value.strip():
+                    cli_failure_parts.append(value.strip())
+            failure_payload = diagnostics.get("failure")
+            if isinstance(failure_payload, dict):
+                failure_message = failure_payload.get("message")
+                if isinstance(failure_message, str) and failure_message.strip():
+                    cli_failure_parts.append(failure_message.strip())
+            exception_type = diagnostics.get("exception_type")
+            if isinstance(exception_type, str) and exception_type.strip():
+                cli_failure_parts.append(exception_type.strip())
+        surface = " ".join(
+            [str(exc), str(getattr(exc, "code", "") or ""), *cli_failure_parts]
         ).casefold()
-        is_timeout = "timed out" in raw_error or "timeout" in raw_error
-        is_auth = any(
-            marker in raw_error
-            for marker in ("auth", "login", "credential", "unauthorized", "not authenticated")
+        typed_code = str(getattr(exc, "code", "") or "").upper()
+
+        cli_detail = ""
+        for part in cli_failure_parts:
+            if part.casefold() != str(exc).casefold():
+                cli_detail = part
+                break
+        detail_suffix = f"（CLI 原始错误：{cli_detail[:200]}）" if cli_detail else ""
+
+        is_geo_blocked = any(marker in surface for marker in _GEO_BLOCK_MARKERS) or (
+            "failed_precondition" in surface and "location" in surface
         )
-        is_policy = any(
-            marker in raw_error
-            for marker in (
-                "permission",
-                "policy",
-                "not allowed",
-                "disallowed",
-                "denied",
-                "forbidden",
-                "sandbox",
-                "headless",
-                "allowlist",
+        is_executor_timeout = (
+            typed_code in _EXECUTOR_TIMEOUT_CODES
+            or "timed out" in surface
+            or "timeout" in surface
+            or "deadline exceeded" in surface
+        )
+        is_auth = any(marker in surface for marker in _AUTH_MARKERS)
+        is_policy = any(marker in surface for marker in _POLICY_MARKERS)
+
+        if is_geo_blocked:
+            code = "WEB_RESEARCH_REGION_BLOCKED"
+            message = (
+                f"{cli_name} 的模型调用被服务方以地理位置拒绝"
+                "（User location is not supported / FAILED_PRECONDITION）。"
+                "这通常意味着当前网络出口（直连或代理节点）不被 Gemini API 接受；"
+                "请更换可用的代理/VPN 出口节点后重新验证，或改用其他 Runtime。"
+                f"{detail_suffix}"
             )
-        )
-        if is_timeout:
+            verification_status = ResearchVerificationStatus.UNAVAILABLE
+        elif is_executor_timeout:
             code = "WEB_RESEARCH_PROBE_TIMEOUT"
-            message = f"{cli_name} CLI Research Session 超时，未能验证联网能力。"
+            message = (
+                f"{cli_name} CLI Research Session 超时，未能验证联网能力。"
+                f"{_proxy_hint()}{detail_suffix}"
+            )
+            verification_status = ResearchVerificationStatus.UNAVAILABLE
         elif is_auth:
             code = "WEB_RESEARCH_AUTH_REQUIRED"
-            message = f"{cli_name} CLI Research 需要完成认证。"
+            message = f"{cli_name} CLI Research 需要完成认证。{detail_suffix}"
+            verification_status = ResearchVerificationStatus.BLOCKED
         elif operation == "search" and is_policy:
             code = "WEB_SEARCH_POLICY_BLOCKED"
-            message = f"{cli_name} 的 google_web_search 被当前 Headless Tool Policy 拒绝。"
+            message = (
+                f"{cli_name} 的 google_web_search 被当前 Headless Tool Policy 拒绝。"
+                f"{detail_suffix}"
+            )
+            verification_status = ResearchVerificationStatus.BLOCKED
         elif operation == "fetch" and is_policy:
             code = "WEB_FETCH_POLICY_BLOCKED"
-            message = f"{cli_name} 的 web_fetch 被当前 Headless Tool Policy 拒绝。"
+            message = (
+                f"{cli_name} 的 web_fetch 被当前 Headless Tool Policy 拒绝。"
+                f"{detail_suffix}"
+            )
+            verification_status = ResearchVerificationStatus.BLOCKED
         else:
             code = "WEB_SEARCH_UNAVAILABLE"
+            fallback_detail = cli_detail or str(exc)
             message = (
-                f"{cli_name} CLI 无法执行 google_web_search。"
-                if operation == "search"
-                else f"{cli_name} CLI 无法执行 web_fetch。"
+                f"{cli_name} CLI 无法执行 "
+                + ("google_web_search" if operation == "search" else "web_fetch")
+                + f"。{fallback_detail[:300]}"
             )
+            verification_status = ResearchVerificationStatus.UNAVAILABLE
         return ResearchCapabilityProbeError(
             code,
             message,
-            verification_status=(
-                ResearchVerificationStatus.BLOCKED
-                if is_policy or is_auth
-                else ResearchVerificationStatus.UNAVAILABLE
-            ),
+            verification_status=verification_status,
             can_discover_sources=(
                 can_discover_sources
                 if can_discover_sources is not None

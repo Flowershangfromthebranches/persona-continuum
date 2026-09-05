@@ -338,3 +338,48 @@ def test_copy_ready_prompt_fails_closed_on_missing_location() -> None:
         )
     assert excinfo.value.code == SHOOTING_LOCATION_CONTEXT_MISSING
     assert excinfo.value.stage == "video_production_guide"
+
+
+def test_copy_ready_prompt_resolves_hierarchical_and_sub_locations() -> None:
+    """Sub-locations (e.g. 智源科技大厦·运营部开放工位) and bracketed aliases resolve to
+    the parent location bible entry without triggering SHOOTING_LOCATION_CONTEXT_MISSING."""
+    package = _production_package(
+        location_visual_bible=[
+            {
+                "id": "loc_mindcore_hq",
+                "name": "智源科技总部大楼（MindCore Tower）",
+                "description": "矗立在城市核心区的高科技写字楼，通体覆盖防窥玻璃与生物识别安防。",
+            },
+            {
+                "id": "office",
+                "name": "Office",
+                "description": "Open-plan office with soft neon lighting.",
+            },
+        ]
+    )
+
+    # 1. Chinese delimiter + stem matching
+    clip_cjk = _clip(location="智源科技大厦·运营部开放工位")
+    prompt_cjk = compile_copy_ready_prompt(
+        clip_cjk, get_profile("generic"), package, {}, {}, {}
+    )
+    assert "ENVIRONMENT IDENTITY" in prompt_cjk
+    assert "智源科技大厦·运营部开放工位" in prompt_cjk
+    assert "高科技写字楼" in prompt_cjk
+
+    # 2. English delimiter matching
+    clip_en = _clip(location="Office - Conference Room")
+    prompt_en = compile_copy_ready_prompt(
+        clip_en, get_profile("generic"), package, {}, {}, {}
+    )
+    assert "Office - Conference Room" in prompt_en
+    assert "soft neon lighting" in prompt_en
+
+    # 3. Bracketed alias matching
+    clip_alias = _clip(location="MindCore Tower")
+    prompt_alias = compile_copy_ready_prompt(
+        clip_alias, get_profile("generic"), package, {}, {}, {}
+    )
+    assert "MindCore Tower" in prompt_alias
+    assert "高科技写字楼" in prompt_alias
+

@@ -31,6 +31,16 @@ supports_negative_prompt: true
 negative_prompt_strategy: api_parameter
 # Conservative default: no official evidence of @named-reference syntax.
 reference_prompt_syntax: textual_anchor
+# Veo 3.1 platform UI wording (task #63/#64): the guide translates internal
+# concepts into the vendor's actual product terminology.
+platform_terms:
+  start_frame: "Start Frame"
+  reference_images: "Ingredients"
+  character_reference: "Character Reference (Ingredients)"
+  location_reference: "Location Reference (Ingredients)"
+  prompt_field: "Prompt"
+# Veo 3.1 renders in-frame text unreliably; composite readable CJK in post.
+screen_text_strategy: post_composite
 prompt_language_preferences:
   - en
 prompt_strategy:

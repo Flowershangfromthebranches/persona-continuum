@@ -205,16 +205,31 @@ def test_protocol_upgrade_role_mapping_defers_host_choice_without_host() -> None
     }
 
 
-def test_legacy_autonomous_is_free_discussion_only() -> None:
+def test_legacy_autonomous_requires_explicit_user_message() -> None:
     free_room = {
         "protocol": "free_discussion",
         "mode": "autonomous",
         "status": "ready",
     }
     protocol_room = {**free_room, "protocol": "expert_consultation"}
-    assert _evaluate(f"ui.shouldStartLegacyAutonomous({json.dumps(free_room)}, false)") is True
+    encoded = json.dumps(free_room)
     assert (
-        _evaluate(f"ui.shouldStartLegacyAutonomous({json.dumps(protocol_room)}, false)")
+        _evaluate(f"ui.shouldStartLegacyAutonomous({encoded}, false, 'room_open')")
+        is False
+    )
+    assert (
+        _evaluate(f"ui.shouldStartLegacyAutonomous({encoded}, false, 'reconnect')")
+        is False
+    )
+    assert (
+        _evaluate(f"ui.shouldStartLegacyAutonomous({encoded}, false, 'user_message')")
+        is True
+    )
+    assert (
+        _evaluate(
+            "ui.shouldStartLegacyAutonomous("
+            f"{json.dumps(protocol_room)}, false, 'user_message')"
+        )
         is False
     )
 
@@ -261,3 +276,34 @@ def test_completed_success_run_keeps_protocol_panel_visible() -> None:
     encoded = json.dumps(room)
     assert _evaluate("ui.isProtocolTerminal('success')") is True
     assert _evaluate(f"ui.shouldShowProtocolPanel({encoded})") is True
+
+
+def test_room_binding_edit_gate() -> None:
+    assert _evaluate("ui.canEditRoomBindings(null)") is False
+    assert _evaluate('ui.roomBindingsEditBlockReason(null)') == "no_room"
+
+    settled = json.dumps({"status": "ready", "protocol_state": {"status": "pending"}})
+    assert _evaluate(f"ui.canEditRoomBindings({settled})") is True
+    assert _evaluate(f"ui.roomBindingsEditBlockReason({settled})") == ""
+
+    for status in ("paused", "completed", "error"):
+        assert _evaluate(f"ui.canEditRoomBindings({json.dumps({'status': status})})") is True
+
+    for status in ("creating", "initializing", "discussing"):
+        room = json.dumps({"status": status})
+        assert _evaluate(f"ui.canEditRoomBindings({room})") is False
+        assert _evaluate(f"ui.roomBindingsEditBlockReason({room})") == "room_not_settled"
+
+    calling = json.dumps(
+        {"status": "ready", "metadata": {"model_call": {"status": "calling"}}}
+    )
+    assert _evaluate(f"ui.canEditRoomBindings({calling})") is False
+    assert _evaluate(f"ui.roomBindingsEditBlockReason({calling})") == "turn_in_flight"
+
+    running_protocol = json.dumps(
+        {"status": "ready", "protocol_state": {"status": "running"}}
+    )
+    assert _evaluate(f"ui.canEditRoomBindings({running_protocol})") is False
+    assert _evaluate(f"ui.roomBindingsEditBlockReason({running_protocol})") == (
+        "protocol_running"
+    )

@@ -192,3 +192,13 @@ class PersonaContinuum:
                 for state in self.relationships.list_relationships(persona_id, branch_id)
             ],
         }
+
+    def reset_runtime_state(
+        self,
+        persona_id: str,
+        branch_id: str = "main",
+        include_memories: bool = False,
+    ) -> dict[str, object]:
+        return self.sessions.reset_runtime_state(
+            persona_id, branch_id=branch_id, include_memories=include_memories
+        )

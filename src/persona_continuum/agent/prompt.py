@@ -90,10 +90,53 @@ class AgentPromptRenderer:
             messages.append({"role": "system", "content": envelope.system_prompt})
         messages.extend(dict(message) for message in envelope.messages)
         if envelope.full_prompt is not None and envelope.full_prompt != envelope.user_message:
-            messages.append({"role": "user", "content": envelope.full_prompt})
+            messages.append(cls._user_content(envelope.full_prompt, turn))
         if envelope.user_message or envelope.full_prompt is None:
-            messages.append({"role": "user", "content": envelope.user_message})
+            messages.append(cls._user_content(envelope.user_message, turn))
         return messages
+
+    @classmethod
+    def _user_content(
+        cls, text: str, turn: AgentTurn | PromptEnvelope
+    ) -> dict[str, Any]:
+        """Build the user message content.
+
+        Legacy ``metadata["inline_images"]`` base64 items are still honoured
+        for callers that constructed turns before canonical attachments
+        existed.  Canonical ``turn.attachments`` are NOT inlined here: each
+        adapter materialises its own carrier (local path / native protocol /
+        inline base64 at the HTTP boundary), so the shared renderer must stay
+        byte-free.
+        """
+
+        images: list[dict[str, Any]] = []
+        if not isinstance(turn, PromptEnvelope):
+            raw = (turn.metadata or {}).get("inline_images")
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    media_type = str(item.get("media_type") or "").strip()
+                    data = str(item.get("data") or "").strip()
+                    if media_type.startswith("image/") and data:
+                        images.append({"media_type": media_type, "data": data})
+        if not images:
+            return {"role": "user", "content": text}
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        for image in images:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": (
+                            f"data:{image['media_type']};base64,{image['data']}"
+                        )
+                    },
+                }
+            )
+        return {"role": "user", "content": content}
 
     @classmethod
     def render(cls, turn: AgentTurn, mode: PromptMode | str) -> str | list[dict[str, Any]]:

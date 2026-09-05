@@ -72,6 +72,57 @@ class PromptMode(StrEnum):
     PROTOCOL_SPECIFIC = "protocol_specific"
 
 
+class MediaInputMode(StrEnum):
+    """How one adapter can consume one attachment.
+
+    "Whether images work" and "how images travel" are two different
+    questions: a CLI whose model sees images natively may still only accept
+    a local file path, while an HTTP provider wants inline base64.  Room code
+    must branch on this mode, never on an adapter id or a model name.
+    """
+
+    # The runtime can read the file from disk (CLI @path / file-read tool).
+    LOCAL_PATH = "local_path"
+    # The wire protocol carries a native image item (app-server localImage).
+    NATIVE_PROTOCOL = "native_protocol"
+    # The provider HTTP API wants inline base64 content blocks.
+    INLINE_BASE64 = "inline_base64"
+    # Binary is unusable, but extracted text may travel as plain text.
+    EXTRACTED_CONTENT = "extracted_content"
+    # The adapter cannot consume this attachment kind at all.
+    UNSUPPORTED = "unsupported"
+
+
+class AttachmentKind(StrEnum):
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+    FILE = "file"
+
+
+class AgentAttachment(BaseModel):
+    """Canonical first-class attachment: metadata only, never the bytes.
+
+    The Room layer resolves uploads into these records (id/kind/mime/size +
+    a server-side ``local_path`` inside the attachment store).  Each adapter
+    decides at its own boundary how to carry one: local path reference,
+    native protocol item, or inline base64.  The raw bytes are read lazily by
+    the adapter that actually needs them, so they never flow through the
+    text prompt transport or its byte budget.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    kind: str = AttachmentKind.FILE.value
+    mime_type: str = "application/octet-stream"
+    filename: str = "attachment"
+    size_bytes: int = 0
+    local_path: str = ""
+    url: str = ""
+    extracted_text: str | None = None
+
+
 class StructuredOutputMode(StrEnum):
     """The strongest structured-output contract an adapter can provide."""
 
@@ -232,6 +283,10 @@ class AgentCapabilityFlags(BaseModel):
     permission_control: bool = True
     cancel: bool = True
     images: bool = False
+    # How this adapter consumes attachments, per attachment kind.  ``images``
+    # above answers "can it work at all"; this map answers "how does it
+    # travel".  Missing kinds default to UNSUPPORTED: never guess a carrier.
+    media_input_modes: dict[str, str] = Field(default_factory=dict)
     # ``structured_output`` used to default to True, which caused business
     # code to assume every CLI accepted a schema.  Keep the legacy field
     # readable for old snapshots while making the explicit mode authoritative.
@@ -497,6 +552,7 @@ class AgentTurn(BaseModel):
     prompt_mode: PromptMode | None = None
     full_prompt: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[AgentAttachment] = Field(default_factory=list)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     expected_output: Any = None
     context_budget: dict[str, Any] = Field(default_factory=dict)

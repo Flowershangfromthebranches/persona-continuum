@@ -143,8 +143,13 @@ class Config(BaseModel):
     def sources_dir(self) -> Path:
         return self.data_dir / "sources"
 
+    @property
+    def room_uploads_dir(self) -> Path:
+        return self.data_dir / "room_uploads"
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.personas_dir.mkdir(parents=True, exist_ok=True)
         self.exports_dir.mkdir(parents=True, exist_ok=True)
         self.sources_dir.mkdir(parents=True, exist_ok=True)
+        self.room_uploads_dir.mkdir(parents=True, exist_ok=True)

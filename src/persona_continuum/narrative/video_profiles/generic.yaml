@@ -24,6 +24,14 @@ supports_negative_prompt: true
 negative_prompt_strategy: separate_field
 # Conservative default: no official evidence of @named-reference syntax.
 reference_prompt_syntax: textual_anchor
+# Neutral wording baseline (task #63/#64); vendor profiles override.
+platform_terms:
+  start_frame: "Start Frame"
+  reference_images: "参考图 / References"
+  character_reference: "角色参考图"
+  location_reference: "场景参考图"
+  prompt_field: "Prompt"
+screen_text_strategy: post_composite
 prompt_language_preferences:
   - en
   - zh

@@ -204,3 +204,22 @@ async def test_waiting_clarification_settles_room_ready_without_error(app: Any) 
     assert settled.status.value == "ready"
     assert settled.last_error is None
     assert settled.protocol_state.clarification is not None
+
+
+@pytest.mark.anyio
+async def test_protocol_run_failure_records_specific_error_detail(app: Any) -> None:
+    room = await _expert_room(app, "fail_detail")
+    fake = app.agent_registry.get_adapter("fake_agent")
+    assert isinstance(fake, FakeAgentAdapter)
+
+    def failing_response(session: Any, turn: Any) -> str:
+        raise RuntimeError("simulated_expert_crash")
+
+    fake._generate_mock_response = failing_response  # type: ignore[method-assign]
+
+    settled = await app.orchestrator.run_protocol(room.id, CASE_ANCHOR)
+    assert settled.protocol_state.status.value == "failed"
+    assert settled.status.value == "error"
+    assert settled.last_error.startswith("room_protocol_run_failed: ")
+    assert "Agent transport failed" in settled.last_error
+

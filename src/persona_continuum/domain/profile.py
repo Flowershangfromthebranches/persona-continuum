@@ -128,6 +128,10 @@ class ProfileEnrichmentJob(BaseModel):
     research_policy: dict[str, Any] = Field(default_factory=dict)
     requested_scope: str = "full_refresh"
     enrichment_input_mode: EnrichmentInputMode = EnrichmentInputMode.LOCAL_MATERIALS
+    # Optional user steering for web research ("着重研究她的晚年作品" etc).
+    # Empty means the model plans the research direction itself.  Carried into
+    # the child persona-creation job's research_instructions.
+    research_focus: str | None = None
     status: ProfileEnrichmentStatus = ProfileEnrichmentStatus.CREATED
     visibility: str = "user"
     dismissed_at: str | None = None

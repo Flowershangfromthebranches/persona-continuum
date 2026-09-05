@@ -109,6 +109,7 @@ NARRATIVE_JOB_KINDS = (
     "production_package",
     "model_prompt_package",
     "video_production_guide",
+    "complete_video_production",
 )
 
 OUTLINE_CHUNK_SIZE = 10
@@ -133,10 +134,46 @@ GUIDE_STAGE_LABELS = {
     "analyzing_assets": "正在分析参考素材...",
     "compiling_asset_prompts": "正在编译素材图片 Prompt...",
     "compiling_clip_prompts": "正在编译完整视频 Prompt...",
+    "subtitle_sound": "正在生成字幕与声音方案...",
+    "bgm_editing": "正在生成 BGM 与剪辑方案...",
     "rendering_guide": "正在渲染制作手册...",
 }
 GUIDE_RESUMABLE_STATUSES = frozenset({"drafting", "compiling"})
 GUIDE_REFINEMENT_BATCH_SIZE = 4
+
+# One-click complete video production pipeline (task #6/#7): clip plan +
+# prompt package + production guide as ONE operation, reported to the user
+# in creator language (never model_prompt_package / clip_fingerprint jargon).
+COMPLETE_VIDEO_PRODUCTION_STAGE_LABELS = {
+    "analyzing_episode": "正在分析本集所需素材",
+    "planning_clips": "正在规划视频片段",
+    "matching_model": "正在匹配目标视频模型",
+    "character_references": "正在生成角色参考图方案",
+    "scene_references": "正在生成场景参考图方案",
+    "video_prompts": "正在生成完整视频 Prompt",
+    "frame_chain": "正在规划尾帧接续",
+    "subtitle_sound": "正在生成字幕与声音方案",
+    "bgm_editing": "正在生成 BGM 与剪辑方案",
+    "final_document": "正在整理完整制作文档",
+}
+# Inner pipeline stage -> user-facing complete-plan stage. Both phases reuse
+# the same labels so the progress bar reads as ONE continuous workflow.
+_COMPLETE_PLAN_STAGE_MAP_PACKAGE = {
+    "loading_source": "analyzing_episode",
+    "planning_clips": "planning_clips",
+    "planning_assets": "character_references",
+    "compiling_prompts": "video_prompts",
+    "validating": "matching_model",
+}
+_COMPLETE_PLAN_STAGE_MAP_GUIDE = {
+    "loading_source": "frame_chain",
+    "analyzing_assets": "character_references",
+    "compiling_asset_prompts": "scene_references",
+    "compiling_clip_prompts": "video_prompts",
+    "subtitle_sound": "subtitle_sound",
+    "bgm_editing": "bgm_editing",
+    "rendering_guide": "final_document",
+}
 
 # Whitelist of episode-plan fields a Director Agent may patch. Identity,
 # trace, and bookkeeping fields are immutable (spec: patch_episode_plan).
@@ -3133,6 +3170,98 @@ class NarrativeService:
             )
 
     # ------------------------------------------------------------------
+    # One-click complete video production (task #6: one user operation, not
+    # three product steps)
+    # ------------------------------------------------------------------
+    def generate_complete_video_production_plan(
+        self,
+        project_id: str,
+        production_package_id: str,
+        target_profile_id: str,
+        *,
+        aspect_ratio: str = "16:9",
+        quality_priority: str = "balanced",
+        generation_strategy: str = "auto",
+        continuity_strategy: str = "auto",
+        audio_strategy: str = "auto",
+        prompt_language: str = "auto",
+    ) -> ExecutableVideoProductionGuide:
+        return cast(
+            ExecutableVideoProductionGuide,
+            self._run_sync(
+                self.generate_complete_video_production_plan_async(
+                    project_id,
+                    production_package_id,
+                    target_profile_id,
+                    aspect_ratio=aspect_ratio,
+                    quality_priority=quality_priority,
+                    generation_strategy=generation_strategy,
+                    continuity_strategy=continuity_strategy,
+                    audio_strategy=audio_strategy,
+                    prompt_language=prompt_language,
+                )
+            ),
+        )
+
+    async def generate_complete_video_production_plan_async(
+        self,
+        project_id: str,
+        production_package_id: str,
+        target_profile_id: str,
+        *,
+        aspect_ratio: str = "16:9",
+        quality_priority: str = "balanced",
+        generation_strategy: str = "auto",
+        continuity_strategy: str = "auto",
+        audio_strategy: str = "auto",
+        prompt_language: str = "auto",
+        progress_callback: Callable[[str, int | None, int | None], None] | None = None,
+    ) -> ExecutableVideoProductionGuide:
+        """ONE operation: clip plan + model prompt package + production guide.
+
+        Internally reuses the checkpointed pipelines (idempotent reuse, stale
+        cascade, LLM refinement batches all keep working); the user never
+        sees the intermediate products as separate steps. ``progress_callback``
+        receives the creator-facing stages of
+        :data:`COMPLETE_VIDEO_PRODUCTION_STAGE_LABELS` with the inner pipelines'
+        real counts.
+        """
+
+        def mapped(
+            phase_map: dict[str, str],
+        ) -> Callable[[str, int | None, int | None], None]:
+            def report(stage: str, completed: int | None, total: int | None) -> None:
+                if progress_callback is None:
+                    return
+                progress_callback(
+                    phase_map.get(stage, stage), completed, total
+                )
+
+            return report
+
+        report = mapped(_COMPLETE_PLAN_STAGE_MAP_PACKAGE)
+        report("loading_source", None, None)
+        prompt_package = await self.generate_model_prompt_package_async(
+            project_id,
+            production_package_id,
+            target_profile_id,
+            aspect_ratio=aspect_ratio,
+            quality_priority=quality_priority,
+            generation_strategy=generation_strategy,
+            continuity_strategy=continuity_strategy,
+            audio_strategy=audio_strategy,
+            prompt_language=prompt_language,
+            progress_callback=report,
+            stop_after_plan=False,
+        )
+        guide = await self.generate_video_production_guide_async(
+            project_id,
+            prompt_package.id,
+            progress_callback=mapped(_COMPLETE_PLAN_STAGE_MAP_GUIDE),
+        )
+        return guide
+
+    # ------------------------------------------------------------------
     # Executable video production guide (copy-ready export layer)
     # ------------------------------------------------------------------
     async def generate_video_production_guide_async(
@@ -3356,15 +3485,20 @@ class NarrativeService:
                     retried_once = False
                 report("compiling_clip_prompts", min(index, total_clips), total_clips)
 
-        report("rendering_guide")
         assets = self.repo.list_production_assets(project_id, production_package.id)
+        # The builder builds subtitle/sound/BGM/editing sections inside the
+        # final render; report those sub-stages at their real boundaries so
+        # the progress reads like the creator-facing workflow (task #7).
+        report("subtitle_sound")
+        report("bgm_editing")
+        report("rendering_guide")
         built: ExecutableVideoProductionGuide = build_executable_video_production_guide(
             production_package,
             prompt_package,
             profile,
             assets,
             project_id,
-            None,
+            {"episode_title": (version.title or "").strip()},
         )
         # The builder assembles the deterministic handbook; overlay the
         # working guide's identity, provenance and LLM-refined state onto it
@@ -4054,6 +4188,41 @@ class NarrativeService:
                     progress_callback=on_guide_progress,
                 )
                 row["result"] = {"production_guide_id": guide.id}
+            elif kind == "complete_video_production":
+
+                def on_complete_plan_progress(
+                    stage: str, completed: int | None, total: int | None
+                ) -> None:
+                    self._raise_if_pause_or_cancel(row)
+                    values: dict[str, Any] = {}
+                    if completed is not None:
+                        values["completed"] = completed
+                    if total is not None:
+                        values["total"] = total
+                    # Real counts only; percent stays untouched when unknown.
+                    self._set_stage(
+                        row,
+                        stage,
+                        COMPLETE_VIDEO_PRODUCTION_STAGE_LABELS.get(stage, stage),
+                        **values,
+                    )
+
+                guide = await self.generate_complete_video_production_plan_async(
+                    row["project_id"],
+                    str(payload.get("production_package_id") or ""),
+                    str(payload.get("target_profile_id") or payload.get("profile_id") or ""),
+                    aspect_ratio=str(payload.get("aspect_ratio") or "16:9"),
+                    quality_priority=str(payload.get("quality_priority") or "balanced"),
+                    generation_strategy=str(payload.get("generation_strategy") or "auto"),
+                    continuity_strategy=str(payload.get("continuity_strategy") or "auto"),
+                    audio_strategy=str(payload.get("audio_strategy") or "auto"),
+                    prompt_language=str(payload.get("prompt_language") or "auto"),
+                    progress_callback=on_complete_plan_progress,
+                )
+                row["result"] = {
+                    "production_guide_id": guide.id,
+                    "model_prompt_package_id": guide.prompt_package_id,
+                }
             elif kind == "episode_pipeline":
                 steps = payload.get("steps", ["prepare", "draft", "audit"])
                 results: dict[str, Any] = {}

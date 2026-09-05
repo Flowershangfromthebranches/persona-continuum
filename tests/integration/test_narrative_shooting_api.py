@@ -596,8 +596,9 @@ def test_refinement_merges_recommended_settings_over_baseline(
     pkg = _create_ready_package(test_client, project, production)
     clip = pkg["clips"][0]
     settings = clip["recommended_settings"]
-    # Baseline planner recommendations survive the merge...
-    assert settings["duration_seconds"] == clip["duration_seconds"]
+    # Baseline planner recommendations survive the merge... (the single
+    # duration source of truth is actual_generation_duration, task #29)
+    assert settings["actual_generation_duration"] == clip["duration_seconds"]
     assert settings["aspect_ratio"] == clip["aspect_ratio"]
     # ... and the model-supplied override is merged in, not replacing it.
     assert settings["seed"] == 42
@@ -938,3 +939,70 @@ def test_shooting_action_surfaces_location_context_missing(canon_env) -> None:
     assert failed["result"]["code"] == "SHOOTING_LOCATION_CONTEXT_MISSING"
     # The session survives the failed action and settles cleanly.
     assert snapshot["session"]["status"] != "running"
+
+
+# ----------------------------------------------------------------------
+# One-click complete AI video production plan (task #5/#6/#7)
+# ----------------------------------------------------------------------
+def test_complete_video_production_one_click_flow(canon_env) -> None:
+    """ONE POST (complete-plan) runs clip plan + prompt package + production
+    guide as a single job whose stages are reported in creator language."""
+    test_client, continuum, project, production = canon_env
+    production = _regen_master_with_bible(continuum, project, production)
+
+    created = test_client.post(
+        f"/api/narratives/{project.id}/production/{production.id}/complete-plan",
+        json={"target_profile_id": "veo_3_1", "aspect_ratio": "9:16"},
+    )
+    assert created.status_code == 202, created.text
+    job = _wait_for_job(test_client, created.json()["data"]["id"])
+    assert job["kind"] == "complete_video_production"
+    # The final result carries the guide — the only deliverable the user needs.
+    guide_id = job["result"]["production_guide_id"]
+    assert guide_id
+    assert job["result"]["model_prompt_package_id"]
+
+    guide = continuum.narratives.repo.get_video_production_guide(guide_id)
+    assert guide is not None and guide.status == "ready"
+    markdown = guide.markdown_document
+    assert markdown.startswith("# EP01《")
+    assert "# Google Veo 3.1 AI视频完整制作方案" in markdown
+    for section in (
+        "## 一、制作目标与基础设置",
+        "## 二、先建立永久角色参考素材",
+        "## 三、本集需要建立的场景参考素材",
+        "## 五、整集视频结构",
+        "## 使用方式",
+        "### Start Frame",
+        "### Ingredients / References",
+        "、尾帧接首帧完整流程",
+        "、字幕时间轴",
+        "、BGM 完整生成 Prompt",
+        "、最终检查清单",
+    ):
+        assert section in markdown, section
+    # Job progress never leaks developer jargon (task #7).
+    progress_dump = json.dumps(job.get("progress") or {}, ensure_ascii=False)
+    assert "model_prompt_package" not in progress_dump
+    assert "clip_fingerprint" not in progress_dump
+
+
+def test_complete_video_production_validates_inputs(canon_env) -> None:
+    test_client, _continuum, project, production = canon_env
+    missing_profile = test_client.post(
+        f"/api/narratives/{project.id}/production/{production.id}/complete-plan",
+        json={"target_profile_id": "not_a_model"},
+    )
+    assert missing_profile.status_code == 422, missing_profile.text
+
+    no_profile = test_client.post(
+        f"/api/narratives/{project.id}/production/{production.id}/complete-plan",
+        json={},
+    )
+    assert no_profile.status_code == 400, no_profile.text
+
+    unknown_package = test_client.post(
+        f"/api/narratives/{project.id}/production/pkg_does_not_exist/complete-plan",
+        json={"target_profile_id": "veo_3_1"},
+    )
+    assert unknown_package.status_code == 404, unknown_package.text

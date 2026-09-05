@@ -1,11 +1,16 @@
-"""Executable video production guide renderer (guide layer, Task B).
+"""Executable video production guide renderer (guide layer).
 
 A pure, deterministic export layer stacked on top of an existing
-:class:`~persona_continuum.domain.narrative.ModelPromptPackage`. It turns the
-compiled clips into a self-contained, human-operable shooting handbook:
-permanent reference assets with complete copy-ready image prompts, one
-copy-ready video prompt per clip, a tail-frame chaining workflow, and
-subtitle / dialogue / SFX / BGM / editing / checklist plans.
+:class:`~persona_continuum.domain.narrative.ModelPromptPackage`. It compiles
+ONE continuous, human-operable production handbook structured after the
+user's reference document 《视频生成模型.md》:
+
+* 永久角色/场景/道具素材 (素材N with a COMPLETE image-generation prompt each)
+  come BEFORE every video section — masters are generated once and reused;
+* per-clip work orders named 视频 N with 使用方式 / Start Frame /
+  Ingredients / ONE complete copy-ready Prompt / 生成完成后 tail-frame action;
+* tail-frame chaining workflow, subtitle / screen-composite / dialogue /
+  SFX / BGM / editing / final checklist sections.
 
 Rules honoured here:
 * zero I/O, zero LLM calls, deterministic (identical inputs -> identical
@@ -14,11 +19,18 @@ Rules honoured here:
 * never fabricate files — reference assets are prompts/instructions, their
   status is ``PROMPT_READY`` / ``NEEDED`` and never ``BOUND``;
 * a clip whose location resolves to no bible/list entry fails closed via
-  :func:`compile_copy_ready_prompt` (SHOOTING_LOCATION_CONTEXT_MISSING).
+  :func:`compile_copy_ready_prompt` (SHOOTING_LOCATION_CONTEXT_MISSING);
+* thin visual bibles trigger deterministic CharacterVisualIdentity synthesis
+  (fixed age/face/hair/body/costume) instead of a generic person;
+* continuity constraints / reference lists / strict rules are stable-ordered
+  deduplicated before they reach the final guide;
+* one duration source of truth (``actual_generation_duration``) — never a
+  ``duration_seconds`` vs ``target_duration_seconds`` contradiction.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -33,7 +45,10 @@ from persona_continuum.domain.narrative import (
     Shot,
     VideoModelProfile,
 )
-from persona_continuum.narrative.video_prompt_compiler import compile_copy_ready_prompt
+from persona_continuum.narrative.video_prompt_compiler import (
+    compile_copy_ready_prompt,
+    resolve_location_entry,
+)
 
 # Banned in every emitted prompt / instruction / markdown body. English
 # patterns are matched case-insensitively; CJK patterns match verbatim.
@@ -88,22 +103,105 @@ _MODE_LABELS = {
     "reference_conditioned": "参考图约束",
     "auto": "自动",
 }
-_NUMERALS = (
-    "一",
-    "二",
-    "三",
-    "四",
-    "五",
-    "六",
-    "七",
-    "八",
-    "九",
-    "十",
-    "十一",
-    "十二",
-    "十三",
-    "十四",
-    "十五",
+_QUALITY_LABELS = {
+    "quality": "质量优先",
+    "balanced": "均衡",
+    "fast": "速度优先",
+}
+_DIGITS = ("一", "二", "三", "四", "五", "六", "七", "八", "九")
+
+# Visual-identity synthesis option pools (task #13). Selection is seeded by a
+# stable hash of (project_id, character_id) so every episode reuses the SAME
+# synthesized identity instead of drifting back to a generic person.
+_FACE_OPTIONS = (
+    "oval face with soft cheekbones and a small straight nose",
+    "round face with full cheeks and a gentle jawline",
+    "long face with defined cheekbones and a straight brow line",
+    "square face with a strong, calm jawline",
+    "heart-shaped face with a narrow chin and wide-set eyes",
+)
+_EYE_OPTIONS = (
+    "dark brown almond eyes with a calm, steady gaze",
+    "deep black eyes with slightly downturned lids, reading as tired but focused",
+    "dark eyes with short, straight brows and an alert expression",
+    "brown eyes with a mild epicanthic fold and quiet intensity",
+)
+_HAIR_OPTIONS = (
+    "shoulder-length straight black hair, centre-parted, tucked behind the left ear",
+    "short black hair cropped just above the collar, neatly brushed",
+    "black hair tied in a low ponytail with a clean side part",
+    "collar-length black hair with a light natural wave and no parting",
+    "very short black hair with a faint fade along the sides",
+)
+_HEIGHT_OPTIONS = {
+    "female": ("162 cm", "165 cm", "168 cm", "158 cm"),
+    "male": ("174 cm", "177 cm", "180 cm", "171 cm"),
+    "neutral": ("168 cm", "173 cm", "176 cm"),
+}
+_BODY_OPTIONS = {
+    "female": (
+        "slim build with upright, composed posture",
+        "medium build with a slightly forward, work-worn posture",
+        "lean build with quick, light movements",
+    ),
+    "male": (
+        "lean build with squared shoulders and a settled stance",
+        "medium build with a slightly rounded, desk-bound posture",
+        "slim build with tense, energy-saving movements",
+    ),
+    "neutral": ("medium build with a quietly alert posture",),
+}
+_COSTUME_OPTIONS = {
+    "female": (
+        "charcoal-grey knitted top with sleeves pushed to the forearms, dark "
+        "tailored trousers, plain black leather sneakers",
+        "off-white cotton shirt over a light grey cardigan, dark straight "
+        "trousers, low practical shoes",
+        "dark navy blazer over a plain grey tee, black slim trousers, quiet "
+        "leather flats",
+    ),
+    "male": (
+        "heather-grey polo shirt, dark chino trousers, plain black trainers",
+        "navy cotton overshirt over a white tee, dark slim jeans, black "
+        "sneakers",
+        "light blue oxford shirt with rolled sleeves, charcoal trousers, "
+        "leather loafers",
+    ),
+    "neutral": (
+        "muted grey layered top, dark trousers, plain dark shoes",
+    ),
+}
+_PALETTE_OPTIONS: tuple[tuple[str, ...], ...] = (
+    ("charcoal grey", "off white", "muted steel blue"),
+    ("ink black", "warm grey", "faded denim blue"),
+    ("deep navy", "stone grey", "soft ivory"),
+    ("graphite", "cool grey", "pale blue-white"),
+)
+_TEMPERAMENT_MAP: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("焦虑", "紧张", "不安", "anxious", "nervous"),
+        "wound-up and watchful, always half a step from leaving",
+    ),
+    (
+        ("冷静", "沉稳", "克制", "calm", "restrained"),
+        "quiet and level, economising every movement",
+    ),
+    (
+        ("疲惫", "倦", "tired", "weary"),
+        "visibly worn down, moving on habit rather than will",
+    ),
+    (
+        ("愤怒", "愤", "angry", "furious"),
+        "coiled and sharp-edged, anger held just under the surface",
+    ),
+    (
+        ("温暖", "善良", "温柔", "warm", "kind"),
+        "gentle and open, an easy presence in the frame",
+    ),
+    (
+        ("坚毅", "决然", "determined", "resolute"),
+        "still and resolved, eyes doing more than the body",
+    ),
 )
 
 
@@ -135,6 +233,25 @@ def _fmt_clock(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _cn_num(n: int) -> str:
+    """Chinese numeral for section numbers (1–99)."""
+    if n < 1:
+        return "零"
+    if n < 10:
+        return _DIGITS[n - 1]
+    if n == 10:
+        return "十"
+    if n < 20:
+        return "十" + _DIGITS[n - 11]
+    tens, ones = divmod(n, 10)
+    return _DIGITS[tens - 1] + "十" + (_DIGITS[ones - 1] if ones else "")
+
+
+def _dedupe_stable(items: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Stable ordered dedupe (task #30): keeps first-seen order, drops repeats."""
+    return list(dict.fromkeys(str(item) for item in (items or []) if str(item).strip()))
+
+
 def _contains_placeholder(text: str) -> bool:
     folded = text.casefold()
     return any(pattern.casefold() in folded for pattern in PLACEHOLDER_PATTERNS)
@@ -149,6 +266,14 @@ def _ensure_no_placeholders(text: str) -> None:
                 f"GUIDE_PLACEHOLDER_DETECTED: forbidden placeholder '{pattern}' "
                 "present in generated guide text"
             )
+
+
+def _platform_term(profile: VideoModelProfile | None, key: str, default: str) -> str:
+    """Vendor UI wording for one internal concept (task #63/#64)."""
+    if profile is None:
+        return default
+    terms = profile.platform_terms or {}
+    return str(terms.get(key) or default)
 
 
 def _entry_name(entry: dict[str, Any]) -> str:
@@ -215,13 +340,8 @@ def _character_bible_entry(key: str, package: ProductionPackage) -> dict[str, An
 def _location_bible_entry(key: str, package: ProductionPackage) -> dict[str, Any] | None:
     if not key:
         return None
-    for entries in (package.location_visual_bible, package.location_list):
-        for entry in entries:
-            if isinstance(entry, dict):
-                keys = {str(entry.get(field, "")) for field in ("location_id", "id", "name")}
-                if key in keys:
-                    return entry
-    return None
+    entry, _ = resolve_location_entry(key, package)
+    return entry
 
 
 def _prop_bible_entry(key: str, package: ProductionPackage) -> dict[str, Any] | None:
@@ -255,36 +375,227 @@ def _shots_by_number(package: ProductionPackage) -> dict[int, Shot]:
 
 
 # ----------------------------------------------------------------------
-# Frame chain
+# CharacterVisualIdentity synthesis (task #11–#14)
 # ----------------------------------------------------------------------
-def build_frame_chain(clips: list[GenerationClip]) -> dict[str, Any]:
-    """Deterministic tail-frame chaining plan.
+_AGE_RE = re.compile(r"(\d{1,2})\s*(?:岁|years?\s*old|yo\b)")
+_FEMALE_RE = re.compile(r"女|她|female|woman|lady|母亲|姐姐|妹妹|阿姨|妻子")
+_MALE_RE = re.compile(r"男|他(?![们A-Za-z])|male|man|父亲|哥哥|弟弟|叔叔|丈夫|先生")
 
-    Clip 1 starts from no frame; clip N+1 starts from ``FRAME_N`` (the saved
-    tail frame of clip N); the last clip saves no continuation frame and ends
-    clean for subtitles / fade. Also returns per-clip ``frame_plan`` dicts
-    compatible with :func:`compile_copy_ready_prompt`.
+
+def _identity_cues(text: str) -> dict[str, bool]:
+    """Which concrete visual cue families a bible text already covers."""
+    lowered = text.casefold()
+    return {
+        "age": bool(_AGE_RE.search(text)) or bool(
+            re.search(r"少女|中年|老年|年轻|young|middle-aged|elderly", lowered)
+        ),
+        "face": bool(re.search(r"脸|面容|眉|眼|鼻|唇|酒窝|face|brow|eye|nose|lip", lowered)),
+        "hair": bool(re.search(r"发|hair|ponytail|bob|刘海", lowered)),
+        "costume": bool(
+            re.search(
+                r"衣|衫|裙|裤|西装|毛衣|外套|制服|鞋|帽|wear|shirt|suit|dress|coat|jacket|shoe",
+                lowered,
+            )
+        ),
+        "body": bool(
+            re.search(r"身高|体型|身形|瘦|胖|高|矮|build|tall|short|slim|slender", lowered)
+        ),
+    }
+
+
+def _seeded_pick[PickT](options: tuple[PickT, ...], seed_key: str, salt: str) -> PickT:
+    digest = hashlib.sha256(f"{salt}:{seed_key}".encode()).digest()
+    return options[int.from_bytes(digest[:4], "big") % len(options)]
+
+
+def synthesize_character_visual_identity(
+    project_id: str,
+    character_id: str,
+    name: str,
+    context_text: str,
+    color_palette: list[str] | None = None,
+) -> dict[str, Any]:
+    """Deterministic CharacterVisualIdentity for thin bibles (task #13).
+
+    Extracts every concrete cue the story text already states (age, gender,
+    wardrobe) and fills the gaps from stable hash-seeded option pools, so the
+    SAME character gets the SAME fixed visual identity in every episode —
+    never a silent fallback to a generic person.
+    """
+    seed_key = f"{project_id}:{character_id or name}"
+    text = context_text or ""
+    gender = "female" if _FEMALE_RE.search(text) else (
+        "male" if _MALE_RE.search(text) else "neutral"
+    )
+    if gender == "neutral":
+        gender = _seeded_pick(("female", "male"), seed_key, "gender")
+
+    age_match = _AGE_RE.search(text)
+    if age_match:
+        age = f"{int(age_match.group(1))} years old"
+    else:
+        age_options = tuple(str(value) for value in range(24, 39))
+        age = f"{_seeded_pick(age_options, seed_key, 'age')} years old"
+
+    palette_input = [str(item) for item in (color_palette or []) if str(item).strip()]
+    if palette_input:
+        picked_palette: tuple[str, ...] = tuple(palette_input)
+    else:
+        picked_palette = _seeded_pick(_PALETTE_OPTIONS, seed_key, "palette")
+
+    temperament = ""
+    lowered = text.casefold()
+    for keywords, value in _TEMPERAMENT_MAP:
+        if any(keyword in lowered for keyword in keywords):
+            temperament = value
+            break
+    if not temperament:
+        temperament = _seeded_pick(
+            tuple(value for _k, value in _TEMPERAMENT_MAP), seed_key, "temperament"
+        )
+
+    wardrobe_hint = ""
+    wardrobe_match = re.search(
+        r"(穿着|身着|戴着|wearing|wears)\s*([^。；;,.]{2,40})", text
+    )
+    if wardrobe_match:
+        wardrobe_hint = wardrobe_match.group(2).strip()
+    if wardrobe_hint:
+        costume = f"{wardrobe_hint} (keep this exact wardrobe every reuse)"
+    else:
+        costume = _seeded_pick(_COSTUME_OPTIONS[gender], seed_key, "costume")
+
+    return {
+        "age": age,
+        "gender": gender,
+        "face_shape": _seeded_pick(_FACE_OPTIONS, seed_key, "face"),
+        "eyes": _seeded_pick(_EYE_OPTIONS, seed_key, "eyes"),
+        "hair": _seeded_pick(_HAIR_OPTIONS, seed_key, "hair"),
+        "height": _seeded_pick(_HEIGHT_OPTIONS[gender], seed_key, "height"),
+        "body": _seeded_pick(_BODY_OPTIONS[gender], seed_key, "body"),
+        "costume": costume,
+        "color_palette": list(picked_palette),
+        "temperament": temperament,
+        "source": "synthesized",
+    }
+
+
+def _render_identity_lines(identity: dict[str, Any]) -> list[str]:
+    """Identity dict -> ordered English descriptor lines for prompt blocks."""
+    lines = [
+        f"Age: {identity.get('age', 'adult')}",
+        f"Face: {identity.get('face_shape', '')}".rstrip(": "),
+        f"Eyes: {identity.get('eyes', '')}".rstrip(": "),
+        f"Hair: {identity.get('hair', '')}".rstrip(": "),
+        f"Height: {identity.get('height', '')}".rstrip(": "),
+        f"Body: {identity.get('body', '')}".rstrip(": "),
+        f"Costume: {identity.get('costume', '')}".rstrip(": "),
+    ]
+    palette = identity.get("color_palette")
+    if isinstance(palette, list) and palette:
+        lines.append("Colour anchors: " + ", ".join(str(item) for item in palette))
+    if identity.get("temperament"):
+        lines.append(f"Temperament cues: {identity['temperament']}")
+    return [line for line in lines if line.split(": ", 1)[-1].strip()]
+
+
+def _identity_block_for_character(
+    asset: ProductionGuideAsset,
+    entry: dict[str, Any] | None,
+    package: ProductionPackage,
+) -> tuple[str, dict[str, Any]]:
+    """Merged identity text + the visual identity dict for one character.
+
+    Rich bibles keep their full text (source ``bible``). Thin bibles get a
+    synthesized fixed visual identity (task #13) recorded on the asset and
+    rendered into the prompt; extracted story cues always win over synthesized
+    defaults.
+    """
+    seed_text = _entry_description_block(entry) if entry else ""
+    fallback = [
+        str(line) for line in (asset.compiler_trace.get("fallback_context") or [])
+    ]
+    context = "\n".join([seed_text, *fallback])
+    cues = _identity_cues(context)
+    if sum(bool(value) for value in cues.values()) >= 3 and seed_text.strip():
+        return seed_text, {"source": "bible"}
+    identity = synthesize_character_visual_identity(
+        package.project_id,
+        asset.character_id or asset.name,
+        asset.name,
+        context,
+        color_palette=(entry or {}).get("color_palette")
+        if isinstance((entry or {}).get("color_palette"), list)
+        else None,
+    )
+    rendered = (
+        "Synthesized fixed visual identity for this character (reuse the SAME "
+        "identity in every clip and every episode):\n"
+        + "\n".join(f"- {line}" for line in _render_identity_lines(identity))
+    )
+    if seed_text.strip():
+        rendered = f"{seed_text}\n{rendered}"
+    return rendered, identity
+
+
+# ----------------------------------------------------------------------
+# Frame chain (location-aware, with scene start frames)
+# ----------------------------------------------------------------------
+def build_frame_chain(
+    clips: list[GenerationClip],
+    profile: VideoModelProfile | None = None,
+    episode_number: int = 1,
+) -> dict[str, Any]:
+    """Deterministic tail-frame chaining plan (task #19/#62).
+
+    Clips inside ONE location chain physically: clip N saves ``FRAME_NN``
+    which becomes clip N+1's start frame. A location change breaks the chain;
+    the new clip then either opens from a dedicated Scene Start Frame asset
+    (``@EPxx_CLIPnn_START``, when the model documents image-to-video support
+    and characters make identity lock worthwhile) or opens free as text-to-video.
     """
     ordered = _sorted_clips(clips)
     total = len(ordered)
+    # Scene start frames are only planned when the target model documents
+    # image-to-video (or first-frame) support; UNKNOWN means a hard gap.
+    supports_start_frames = (
+        profile is None
+        or profile.supports_image_to_video is True
+        or profile.supports_first_frame is True
+    )
     per_clip: dict[str, Any] = {}
     frame_plans: dict[str, Any] = {}
     diagram: list[str] = []
     for index, clip in enumerate(ordered):
         number = clip.clip_number
-        produces_next = index < total - 1
-        start_frame = None if index == 0 else f"FRAME_{index:02d}"
-        saved = f"FRAME_{index + 1:02d}" if produces_next else "无需保存接续帧"
+        previous = ordered[index - 1] if index > 0 else None
+        same_location = (
+            previous is not None
+            and bool(previous.location.strip())
+            and previous.location == clip.location
+            and bool(clip.location.strip())
+        )
+        # The previous clip only saves a frame when THIS clip continues it.
+        continues_chain = same_location and index > 0
+        produces_next = False
+        nxt = ordered[index + 1] if index + 1 < total else None
+        if nxt is not None and clip.location == nxt.location and bool(clip.location.strip()):
+            produces_next = True
+        start_frame = f"FRAME_{index:02d}" if continues_chain else None
+        scene_start_frame = None
+        if start_frame is None and supports_start_frames and clip.character_ids:
+            scene_start_frame = f"@EP{episode_number:02d}_CLIP{number:02d}_START"
+        saved = f"FRAME_{number:02d}" if produces_next else "无需保存接续帧"
         duration = max(0.0, clip.duration_seconds)
-        window_start = max(0.0, duration - 1.0)
-        window_end = max(0.0, duration - 0.5)
         per_clip[str(number)] = {
             "clip_number": number,
             "start_frame": start_frame,
+            "scene_start_frame": scene_start_frame,
             "produces_next_start_frame": produces_next,
             "end_frame_saved": saved,
             "selection_window": (
-                f"最后 0.5–1.0 秒（按时长适配：{window_start:.1f}s–{window_end:.1f}s 具体区间）"
+                f"最后 0.8–1.0 秒（按时长适配：{max(0.0, duration - 1.0):.1f}s–"
+                f"{max(0.0, duration - 0.2):.1f}s 具体区间）"
             ),
             "criteria": [
                 "主体完整、无变形、无多余肢体或残影",
@@ -301,16 +612,40 @@ def build_frame_chain(clips: list[GenerationClip]) -> dict[str, Any]:
             "carry_in_start_frame": start_frame,
             "produces_next_start_frame": produces_next,
         }
-        label = f"Clip {number:02d}"
-        diagram.append(f"{label} ──尾帧 {saved if produces_next else '（收尾）'}──▶")
-    if diagram:
-        diagram[-1] = f"Clip {ordered[-1].clip_number:02d} ──收尾（不产接续帧）"
+        if start_frame:
+            link = f"Clip {number:02d} ──尾帧 {saved}──▶"
+        elif scene_start_frame:
+            link = f"Clip {number:02d} ──独立开镜 {scene_start_frame}──▶"
+        elif produces_next:
+            link = f"Clip {number:02d} ──尾帧 {saved}──▶"
+        else:
+            link = f"Clip {number:02d} ──场景切换（不产接续帧）──▶"
+        diagram.append(link)
+    if diagram and ordered:
+        last = ordered[-1]
+        if not per_clip[str(last.clip_number)]["produces_next_start_frame"]:
+            diagram[-1] = f"Clip {last.clip_number:02d} ──收尾（不产接续帧）"
     return {
         "clips": per_clip,
         "frame_plans": frame_plans,
         "diagram": diagram,
         "total_clips": total,
     }
+
+
+def _clip_operational_mode(info: dict[str, Any]) -> str:
+    """Concrete per-clip generation mode (task #22): never '自动'."""
+    if info.get("start_frame"):
+        return "图生视频（上一段尾帧承接）"
+    if info.get("scene_start_frame"):
+        return "图生视频（独立开镜画面）"
+    return "文生视频"
+
+
+def _clip_short_mode(info: dict[str, Any]) -> str:
+    if info.get("start_frame") or info.get("scene_start_frame"):
+        return "图生视频"
+    return "文生视频"
 
 
 # ----------------------------------------------------------------------
@@ -347,6 +682,7 @@ def _make_asset(
     source_bible_refs: list[str] | None = None,
     status: str = "NEEDED",
     generation_prompt: str = "",
+    visual_identity: dict[str, Any] | None = None,
 ) -> ProductionGuideAsset:
     return ProductionGuideAsset(
         project_id=package.project_id,
@@ -364,6 +700,7 @@ def _make_asset(
         character_id=character_id,
         location_id=location_id,
         source_bible_refs=source_bible_refs or [],
+        visual_identity=visual_identity or {},
         compiler_trace=trace,
     )
 
@@ -378,7 +715,8 @@ def analyze_asset_necessity(
     No hardcoded story names: characters come from ``clip.character_ids``
     frequency plus shot sizes, locations from distinct ``clip.location``,
     props from ``clip.prop_ids`` frequency, one optional style asset from the
-    package-level visual direction, and ``FRAME_NN`` reference frames for every
+    package-level visual direction, Scene Start Frames for clips that open a
+    scene via image-to-video, and ``FRAME_NN`` capture instructions for every
     chained clip. Reference-asset prompts are filled before return so the
     checkpoint baseline is already complete.
     """
@@ -410,7 +748,7 @@ def analyze_asset_necessity(
         for clip in referencing:
             context.extend(_clip_context_lines(clip, production_package))
         reason = (
-            f"出现在 {count} 个 Clip"
+            f"出现在 {count} 个视频段"
             + ("，且含近景/中景" if has_near else "")
             + f" → {necessity}"
         )
@@ -443,14 +781,24 @@ def analyze_asset_necessity(
         if clip.location:
             loc_clips.setdefault(clip.location, []).append(clip)
     for location, referencing in loc_clips.items():
-        entry = _location_bible_entry(location, production_package)
-        name = _entry_name(entry) if entry else location
+        entry, sub = resolve_location_entry(location, production_package)
+        if entry and not sub:
+            name = _entry_name(entry) or location
+        else:
+            name = location if location else ((_entry_name(entry) if entry else "") or "location")
         count = len(referencing)
         necessity = "required" if count >= 2 else "recommended"
         context = []
         for clip in referencing:
             context.extend(_clip_context_lines(clip, production_package))
-        reason = f"出现在 {count} 个 Clip → {necessity}"
+        reason = f"出现在 {count} 个视频段 → {necessity}"
+        source_refs: list[str] = []
+        if entry:
+            entry_n = _entry_name(entry)
+            if entry_n:
+                source_refs.append(entry_n)
+            if name and name not in source_refs:
+                source_refs.append(name)
         assets.append(
             _make_asset(
                 production_package,
@@ -469,7 +817,7 @@ def analyze_asset_necessity(
                     "fallback_context": list(dict.fromkeys(context))[:6],
                 },
                 location_id=location,
-                source_bible_refs=[name] if entry else [],
+                source_bible_refs=source_refs,
             )
         )
 
@@ -488,7 +836,7 @@ def analyze_asset_necessity(
         context = []
         for clip in referencing:
             context.extend(_clip_context_lines(clip, production_package))
-        reason = f"被 {count} 个 Clip 引用 → {necessity}"
+        reason = f"被 {count} 个视频段引用 → {necessity}"
         assets.append(
             _make_asset(
                 production_package,
@@ -535,18 +883,55 @@ def analyze_asset_necessity(
             )
         )
 
-    # --- Reference frames (chained clips, all but last) -------------
-    chain = build_frame_chain(clips)
+    # --- Scene Start Frames (task #19/#20) ---------------------------
+    chain = build_frame_chain(clips, profile, prompt_package.episode_number)
+    for clip in clips:
+        info = chain["clips"].get(str(clip.clip_number), {})
+        scene_start = info.get("scene_start_frame")
+        if not scene_start:
+            continue
+        entry = _location_bible_entry(clip.location, production_package)
+        loc_name = _entry_name(entry) if entry else clip.location
+        context = _clip_context_lines(clip, production_package)
+        assets.append(
+            _make_asset(
+                production_package,
+                prompt_package,
+                asset_key=str(scene_start),
+                asset_type="start_frame",
+                name=f"视频{clip.clip_number:02d} 开镜画面",
+                purpose=(
+                    f"锁定视频 {clip.clip_number:02d} 的第一帧构图：角色、场景与动作起始状态"
+                    "合成一张可直接驱动图生视频的开镜图。"
+                ),
+                necessity="required",
+                reuse_scope="scene",
+                notes=[
+                    "这不是身份母图，而是本视频段专用的开场画面；"
+                    "生成后作为该段的 Start Frame 上传。",
+                    f"场景：{loc_name or '（见场景母图）'}。",
+                ],
+                trace={
+                    "necessity": "required",
+                    "reason": f"clip {clip.clip_number} opens a scene via image-to-video",
+                    "clip_number": clip.clip_number,
+                    "fallback_context": list(dict.fromkeys(context))[:6],
+                },
+                location_id=clip.location or None,
+            )
+        )
+
+    # --- Reference frames (chained clips, capture instructions) ------
     for number_str, info in chain["clips"].items():
         if not info["produces_next_start_frame"]:
             continue
         frame_name = str(info["end_frame_saved"])
         number = int(number_str)
         capture = (
-            f"在 Clip {number:02d} 生成完成后，从片尾挑选一帧保存为下一镜的 Start Frame。\n"
+            f"在视频 {number:02d} 生成完成后，从片尾挑选一帧保存为下一镜的 Start Frame。\n"
             f"选取区间：{info['selection_window']}\n"
             f"选取标准：{'；'.join(info['criteria'])}。\n"
-            f"保存命名：{frame_name}，用作 Clip {number + 1:02d} 的 Start Frame（物理连续性锚点）。"
+            f"保存命名：{frame_name}，用作视频 {number + 1:02d} 的 Start Frame（物理连续性锚点）。"
         )
         assets.append(
             _make_asset(
@@ -555,7 +940,7 @@ def analyze_asset_necessity(
                 asset_key=f"@{frame_name}",
                 asset_type="reference_frame",
                 name=frame_name,
-                purpose=f"承接 Clip {number:02d} 的收尾画面，作为 Clip {number + 1:02d} 的首帧。",
+                purpose=f"承接视频 {number:02d} 的收尾画面，作为视频 {number + 1:02d} 的首帧。",
                 necessity="required",
                 reuse_scope="episode",
                 notes=["这不是需要出图的素材，而是一条尾帧捕获指令。"],
@@ -620,9 +1005,13 @@ def _tail(asset: ProductionGuideAsset, purpose_line: str) -> list[str]:
     ]
 
 
-def _character_image_prompt(asset: ProductionGuideAsset, package: ProductionPackage) -> str:
+def _character_image_prompt(
+    asset: ProductionGuideAsset, package: ProductionPackage
+) -> tuple[str, dict[str, Any]]:
+    """(prompt, visual_identity) for one character master; the identity dict
+    is persisted on the asset copy by the caller (task #13/#14)."""
     entry = _character_bible_entry(asset.character_id or asset.name, package)
-    identity = _identity_or_context(asset, entry)
+    identity, visual_identity = _identity_block_for_character(asset, entry, package)
     style_line = _global_style_line(package)
     head = [
         "Create a clean, single-subject CHARACTER REFERENCE SHEET image. This one image is the "
@@ -650,6 +1039,10 @@ def _character_image_prompt(asset: ProductionGuideAsset, package: ProductionPack
         "colours, layering, and accessories identical throughout the episode unless the story "
         "explicitly changes them.",
         "",
+        "EXPRESSION:",
+        "Neutral, relaxed, camera-aware but not posing; the face must stay readable for later "
+        "close-up clips.",
+        "",
         "VISUAL STYLE:",
         style_line,
         "",
@@ -665,7 +1058,7 @@ def _character_image_prompt(asset: ProductionGuideAsset, package: ProductionPack
         f"This image is the character identity reference token {asset.asset_key}; attach it "
         f"whenever 「{asset.name}」 appears so the model locks onto one consistent person."
     )
-    return "\n".join(head + _tail(asset, purpose))
+    return "\n".join(head + _tail(asset, purpose)), visual_identity
 
 
 def _location_image_prompt(asset: ProductionGuideAsset, package: ProductionPackage) -> str:
@@ -762,14 +1155,73 @@ def _style_image_prompt(asset: ProductionGuideAsset, package: ProductionPackage)
     return "\n".join(head + _tail(asset, purpose))
 
 
-def _image_prompt_for(asset: ProductionGuideAsset, package: ProductionPackage) -> str:
+def _image_prompt_for(
+    asset: ProductionGuideAsset,
+    package: ProductionPackage,
+    profile: VideoModelProfile,
+) -> tuple[str, dict[str, Any]]:
+    """(complete image prompt, extra asset-field updates) for one asset."""
     if asset.asset_type == "character":
-        return _character_image_prompt(asset, package)
+        prompt, identity = _character_image_prompt(asset, package)
+        return prompt, ({"visual_identity": identity} if identity else {})
     if asset.asset_type == "location":
-        return _location_image_prompt(asset, package)
+        return _location_image_prompt(asset, package), {}
     if asset.asset_type == "prop":
-        return _prop_image_prompt(asset, package)
-    return _style_image_prompt(asset, package)
+        return _prop_image_prompt(asset, package), {}
+    if asset.asset_type == "start_frame":
+        return _start_frame_prompt_for(asset, package, profile), {}
+    return _style_image_prompt(asset, package), {}
+
+
+def _start_frame_prompt_for(
+    asset: ProductionGuideAsset, package: ProductionPackage, profile: VideoModelProfile
+) -> str:
+    """Complete Scene Start Frame prompt built from this clip's own data."""
+    trace = asset.compiler_trace or {}
+    clip_number = int(trace.get("clip_number") or 0)
+    # The clip context is re-derived from the trace + package shot list.
+    fallback = [str(line) for line in (trace.get("fallback_context") or [])]
+    entry = _location_bible_entry(asset.location_id or "", package)
+    location_identity = _identity_or_context(asset, entry)
+    style_line = _global_style_line(package)
+    aspect = asset.recommended_aspect_ratio or "16:9"
+    action_text = fallback[0] if fallback else "the opening action of this clip"
+    head = [
+        f"Create the OPENING STILL FRAME for video clip {clip_number:02d} of this episode. "
+        "This image is not a standalone illustration: it will be uploaded as the Start Frame "
+        "that the video model animates forward from, so it must capture the exact starting "
+        "state of the action.",
+        "",
+        "SUBJECT AND OPENING ACTION:",
+        action_text
+        + (
+            ". The subject is caught in the instant right before the main movement begins: "
+            "weight settled, gaze set, hands in their starting positions."
+        ),
+        "",
+        "ENVIRONMENT:",
+        location_identity,
+        "",
+        "CAMERA:",
+        "Framing, angle, and lens height must read as the first frame of a continuous shot; "
+        "compose so there is room for the action to unfold inside the frame.",
+        "",
+        "LIGHTING:",
+        "Match the location reference's time of day and light direction exactly; the first "
+        "video frame must not jump in exposure or colour from this still.",
+        "",
+        "COMPOSITION:",
+        f"Compose in {aspect} exactly as the clip will render; keep every key subject fully "
+        "inside the safe area.",
+        "",
+        "VISUAL STYLE:",
+        style_line,
+    ]
+    purpose = (
+        f"This image is the start-frame token {asset.asset_key}; upload it as the Start Frame "
+        f"of video {clip_number:02d} together with the character/location master references."
+    )
+    return "\n".join(head + _tail(asset, purpose))
 
 
 def build_reference_asset_prompts(
@@ -778,7 +1230,7 @@ def build_reference_asset_prompts(
     profile: VideoModelProfile,
 ) -> list[ProductionGuideAsset]:
     """Fill a COMPLETE copy-ready image prompt for every character/location/
-    prop/style asset and mark it ``PROMPT_READY``.
+    prop/style/start-frame asset and mark it ``PROMPT_READY``.
 
     ``reference_frame`` assets keep their capture instruction (they are not
     image prompts). Status never becomes ``BOUND`` because no real file
@@ -790,13 +1242,14 @@ def build_reference_asset_prompts(
         if asset.asset_type == "reference_frame":
             result.append(asset)
             continue
-        prompt = _image_prompt_for(asset, production_package)
+        prompt, extra_updates = _image_prompt_for(asset, production_package, profile)
         _ensure_no_placeholders(prompt)
-        result.append(
-            asset.model_copy(
-                update={"generation_prompt": prompt, "status": "PROMPT_READY"}
-            )
-        )
+        updates: dict[str, Any] = {
+            "generation_prompt": prompt,
+            "status": "PROMPT_READY",
+            **extra_updates,
+        }
+        result.append(asset.model_copy(update=updates))
     return result
 
 
@@ -826,16 +1279,20 @@ def build_subtitle_plan(production_package: ProductionPackage) -> list[dict[str,
 
 
 def build_screen_composite_plan(
-    clips: list[GenerationClip], production_package: ProductionPackage
+    clips: list[GenerationClip],
+    production_package: ProductionPackage,
+    profile: VideoModelProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Flag clips whose action/dialogue implies on-screen text.
 
     Distinguishes diegetic text that must be legible inside the generated
     frame (phone/email/screen/SMS) from non-diegetic UI overlays that should
     be composited in post (subtitles/notifications/timestamps) to avoid the
-    model producing garbled glyphs.
+    model producing garbled glyphs. Profiles without a documented stable
+    text capability default to post-compositing (task #35/#36).
     """
     shots = _shots_by_number(production_package)
+    native = (profile.screen_text_strategy == "native_screen_text") if profile else False
     plan: list[dict[str, Any]] = []
     for clip in _sorted_clips(clips):
         haystack = " ".join(
@@ -851,11 +1308,19 @@ def build_screen_composite_plan(
         overlay = sorted({kw for kw in _SCREEN_OVERLAY if kw.lower() in haystack})
         if not diegetic and not overlay:
             continue
-        if diegetic:
-            category = "画面真实可读文本"
+        if diegetic and native:
+            category = "画面真实可读文本（模型原生文字）"
             recommendation = (
-                "该镜头包含需在画面内出现的可读文本。优先在生成时保证清晰可读；若模型无法稳定"
-                "生成文字，则让画面留出干净区域，改由后期贴图/替换为真实可读文本，避免出现乱码。"
+                "该镜头包含需在画面内出现的可读文本，目标模型具备稳定文字生成能力："
+                "在 Prompt 中明确描述文字内容与位置；若生成结果出现乱码，仍回退为后期贴图。"
+            )
+        elif diegetic:
+            category = "画面真实可读文本（后期合成）"
+            recommendation = (
+                "该镜头包含需在画面内出现的可读文本。不要依赖视频模型生成中文文字："
+                "让画面只保留手机/屏幕的亮屏与手部动作，屏幕内容留出干净区域，"
+                "在剪辑软件中做屏幕跟踪 + UI 贴图，把邮件正文、时间戳等真实文字贴上去，"
+                "避免出现乱码。"
             )
         else:
             category = "后期 UI 叠加"
@@ -919,68 +1384,124 @@ def build_sound_plan(
         sfx_by_clip.setdefault(int(_as_float(clip_number, -1)), []).append(description)
     plan: list[dict[str, Any]] = []
     for clip in _sorted_clips(clips):
-        environment = [item.strip() for item in clip.audio_intent if item.strip()]
-        key_sfx = sfx_by_clip.get(clip.clip_number, [])
+        environment = _dedupe_stable(clip.audio_intent)
+        key_sfx = _dedupe_stable(sfx_by_clip.get(clip.clip_number, []))
         plan.append(
             {
                 "clip_number": clip.clip_number,
                 "environment": environment,
                 "key_sfx": key_sfx,
-                "transition": "与相邻 Clip 的环境声做 0.3–0.8 秒 audio crossfade，声音不要硬切。",
+                "transition": "与相邻视频段的环境声做 0.3–0.8 秒 audio crossfade，声音不要硬切。",
             }
         )
     return plan
 
 
+# Musical Director Agent (task #38–#40): one complete, copy-ready music prompt.
+_TEMPERAMENT_INSTRUMENTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("悬疑", "suspense", "紧张", "thriller"),
+        "sustained low strings, sparse felt piano, sub-bass pulses, and a "
+        "single high sustained violin tone",
+    ),
+    (
+        ("温暖", "warm", "治愈", "healing"),
+        "felt piano, nylon guitar, warm pad, soft clarinet",
+    ),
+    (
+        ("悲伤", "sad", "忧伤", "melancholy"),
+        "solo cello, slow piano arpeggios, airy strings pad",
+    ),
+    (
+        ("愤怒", "angry", "激烈", "intense"),
+        "low brass swells, marcato strings, tight percussion",
+    ),
+    ((), "piano, warm strings pad, light percussion"),
+)
+
+
+def _instrumentation_for(direction: str) -> str:
+    lowered = direction.casefold()
+    for keywords, value in _TEMPERAMENT_INSTRUMENTS:
+        if keywords and any(keyword in lowered for keyword in keywords):
+            return value
+    return _TEMPERAMENT_INSTRUMENTS[-1][1]
+
+
 def build_bgm_plan(
     production_package: ProductionPackage, clips: list[GenerationClip]
 ) -> dict[str, Any]:
+    """One COMPLETE music-generation prompt (task #38/#39).
+
+    Structure: OVERALL STYLE / INSTRUMENTATION / EMOTIONAL ARC (per clip with
+    timecodes) / FINAL 10 SECONDS / MIX / STRICT — never a bare
+    "underscore Clip 7" line.
+    """
     ranges, total = _clip_time_ranges(clips)
     direction = production_package.bgm_direction.strip()
     segments: list[dict[str, Any]] = []
-    emotion_arc: list[str] = []
-    lines = [
-        f"Create ONE continuous {total:.0f}-second instrumental background music track for this "
-        "episode. It is a single unified piece, not six separate cues.",
-        "",
-    ]
-    if direction:
-        lines += [f"Overall music direction: {direction}", ""]
-    lines += [
-        "Keep one consistent instrumentation and one continuous emotional arc from the first "
-        "frame to the last; the music must never restart or change character at a clip boundary.",
-        "",
-        "STRUCTURE:",
-    ]
+    arc_lines: list[str] = []
     for number, start, end in ranges:
         clip = next((c for c in clips if c.clip_number == number), None)
         beat = (clip.purpose.strip() if clip and clip.purpose.strip() else "on-screen action")
-        lines.append(
-            f"{_fmt_clock(start)}–{_fmt_clock(end)} (Clip {number:02d}): underscore {beat}."
+        arc_lines.append(
+            f"{_fmt_clock(start)}–{_fmt_clock(end)} (视频{number:02d}): {beat}"
         )
         segments.append(
             {"clip_number": number, "time": f"{_fmt_clock(start)}–{_fmt_clock(end)}", "beat": beat}
         )
-        emotion_arc.append(beat)
-    lines += [
+    final_start = max(0.0, total - 10.0)
+    style = direction or "restrained, cinematic underscore that follows the story's emotion"
+    final_header = (
+        f"FINAL 10 SECONDS ({_fmt_clock(final_start)}–{_fmt_clock(total)}):"
+        if total >= 12.0
+        else "ENDING:"
+    )
+    lines = [
+        f"Create a {total:.0f}-second instrumental score for this episode — ONE continuous "
+        "piece of music from the first frame to the last, never a collection of per-clip cues.",
         "",
-        "End naturally and quietly, leaving room for the closing image and any final subtitle.",
-        "No vocals. No choir. No abrupt trailer-style percussion hits at clip boundaries.",
+        "OVERALL STYLE:",
+        style
+        + ". The music must feel like a single composed work with one identity.",
+        "",
+        "INSTRUMENTATION:",
+        _instrumentation_for(direction),
+        "",
+        "EMOTIONAL ARC:",
+        *arc_lines,
+        "",
+        final_header,
+        "Land the ending: resolve or deliberately withhold resolution to match the final "
+        "image, then fade naturally so the closing frame and any final subtitle can breathe.",
+        "",
+        "MIX:",
+        "Background-music level: the score sits under dialogue and ambience, never covering "
+        "them; keep dynamics controlled so no clip boundary needs an abrupt level jump.",
+        "",
+        "STRICT:",
+        "No vocals. No choir. No lyrics. No spoken word. No sudden trailer-style percussion "
+        "hits at clip boundaries. The music never restarts or changes character mid-episode.",
     ]
     return {
         "total_duration_seconds": total,
         "prompt": "\n".join(lines),
         "segments": segments,
-        "emotion_arc": emotion_arc,
-        "note": "每 Clip 不单独生成 BGM，整集统一铺一条，从 00:00 连续播放到片尾。",
+        "emotion_arc": [segment["beat"] for segment in segments],
+        "note": (
+            "每段视频不单独生成 BGM：整集统一用下面这一条 Prompt 生成一整条配乐，"
+            "从 00:00 连续播放到片尾。"
+        ),
     }
 
 
 def build_editing_plan(
-    production_package: ProductionPackage, clips: list[GenerationClip]
+    production_package: ProductionPackage,
+    clips: list[GenerationClip],
+    profile: VideoModelProfile | None = None,
 ) -> dict[str, Any]:
     ordered = _sorted_clips(clips)
-    chain = build_frame_chain(ordered)
+    chain = build_frame_chain(ordered, profile, production_package.episode_number)
     transitions: list[dict[str, Any]] = []
     for index in range(len(ordered) - 1):
         current = ordered[index]
@@ -988,7 +1509,7 @@ def build_editing_plan(
         info = chain["clips"].get(str(current.clip_number), {})
         carries = bool(info.get("produces_next_start_frame"))
         same_scene = (
-            current.scene_number is not None and current.scene_number == nxt.scene_number
+            bool(current.location.strip()) and current.location == nxt.location
         )
         if carries and same_scene:
             cut_type = "硬切 CUT"
@@ -998,7 +1519,7 @@ def build_editing_plan(
             reason = "画面物理连续，但跨场景时允许极短叠化缓冲；不要做 1 秒叠化。"
         else:
             cut_type = "短叠化 3–6 帧（约 0.10–0.20 秒）"
-            reason = "无尾帧承接，用极短叠化过渡，避免生硬跳变。"
+            reason = "无尾帧承接（场景切换重新开镜），用极短叠化过渡，避免生硬跳变。"
         transitions.append(
             {
                 "from_clip": current.clip_number,
@@ -1011,7 +1532,7 @@ def build_editing_plan(
         "order": [clip.clip_number for clip in ordered],
         "transitions": transitions,
         "audio_crossfade": "每段环境声之间做 0.3–0.8 秒 audio crossfade。",
-        "bgm": "整条 BGM 从 00:00 连续铺到片尾，不跟着 Clip 切开。",
+        "bgm": "整条 BGM 从 00:00 连续铺到片尾，不跟着视频段切开。",
         "rules": [
             "画面优先硬切；只有轻微跳动才补 3–6 帧短叠化，绝不默认 1 秒叠化。",
             "声音不硬切：环境声之间统一 0.3–0.8 秒交叉淡入淡出。",
@@ -1033,10 +1554,12 @@ def build_final_checklist(
     loc_count = sum(1 for a in required_assets if a.asset_type == "location")
     prop_count = sum(1 for a in required_assets if a.asset_type == "prop")
     frame_count = sum(1 for a in required_assets if a.asset_type == "reference_frame")
+    start_frame_count = sum(1 for a in required_assets if a.asset_type == "start_frame")
     items = [
-        f"□ 人物身份一致：{char_count} 个角色母图在所有 Clip 中长相/身形/服装保持同一人。",
+        f"□ 人物身份一致：{char_count} 个角色母图在所有视频段中长相/身形/服装保持同一人。",
         f"□ 空间一致：{loc_count} 个场景母图的空间布局、光线、材质跨镜不漂移。",
         f"□ 道具一致：{prop_count} 个关键道具的形状/材质/颜色每次出现都相同。",
+        f"□ 开镜画面就绪：{start_frame_count} 张 Scene Start Frame 已生成并命名归档。",
         f"□ 尾帧链完整：{frame_count} 个接续帧按 FRAME_NN 命名，上一镜尾帧=下一镜首帧。",
         "□ 屏幕文本无乱码：所有画面内可读文本清晰，或已改为后期贴图/UI 叠加。",
     ]
@@ -1052,10 +1575,10 @@ def build_final_checklist(
         items.append("□ 对白音频：本集无台词，确认环境声与表演足够叙事。")
     items.append(
         f"□ BGM 连续：整集约 {bgm_plan.get('total_duration_seconds', 0):.0f} 秒铺一条统一配乐，"
-        "不在 Clip 边界断开。"
+        "不在视频段边界断开。"
     )
     items.append(
-        f"□ 成片交付：{len(clips)} 个 Clip 按顺序硬切/短叠化拼接，环境声 0.3–0.8 秒交叉淡化，"
+        f"□ 成片交付：{len(clips)} 个视频段按顺序硬切/短叠化拼接，环境声 0.3–0.8 秒交叉淡化，"
         "目标模型 "
         f"{prompt_package.target_video_model_display_name or prompt_package.target_profile_id}"
         f"，画幅 {prompt_package.aspect_ratio}。"
@@ -1111,7 +1634,7 @@ def _model_operation_lines(
         span = f"{low:g}–{high:g} 秒" if low is not None and high is not None else (
             f"最长 {high:g} 秒" if high is not None else f"最短 {low:g} 秒"
         )
-        lines.append(f"单镜时长限制：{span}；超时请拆成多个 Clip 再用尾帧链承接。")
+        lines.append(f"单镜时长限制：{span}；超时请拆成多个视频段再用尾帧链承接。")
     lines.append(f"目标画幅：{prompt_package.aspect_ratio}；整集统一，不要逐镜改画幅。")
     return lines
 
@@ -1214,8 +1737,9 @@ def build_executable_video_production_guide(
 ) -> ExecutableVideoProductionGuide:
     """Assemble the complete, deterministic production handbook.
 
-    analyze -> reference prompts -> frame chain -> per-clip copy-ready prompts
-    (via :func:`compile_copy_ready_prompt`, propagating
+    analyze -> reference prompts (incl. CharacterVisualIdentity + Scene Start
+    Frames) -> frame chain -> per-clip copy-ready prompts (via
+    :func:`compile_copy_ready_prompt`, propagating
     SHOOTING_LOCATION_CONTEXT_MISSING) -> section builders -> overview ->
     markdown. Identical inputs (with a fixed ``options['created_at']``) yield
     byte-identical markdown.
@@ -1228,30 +1752,75 @@ def build_executable_video_production_guide(
     )
     clips = [clip.model_copy(deep=True) for clip in _sorted_clips(prompt_package.clips)]
     assets_by_id = {asset.id: asset for asset in assets}
-    chain = build_frame_chain(clips)
+    chain = build_frame_chain(clips, profile, prompt_package.episode_number)
     frame_plans = chain["frame_plans"]
 
+    # CharacterVisualIdentity overrides for clips whose bible text is thin:
+    # the synthesized fixed identity is embedded into the copy-ready prompt's
+    # CHARACTER IDENTITY section instead of "match the reference images" only.
+    identity_by_character: dict[str, str] = {}
+    for asset in required_assets:
+        if asset.asset_type != "character" or not asset.character_id:
+            continue
+        entry = _character_bible_entry(asset.character_id, production_package)
+        merged, identity = _identity_block_for_character(asset, entry, production_package)
+        if identity.get("source") == "synthesized":
+            identity_by_character[asset.character_id] = merged
+
     compiled_clips: list[GenerationClip] = []
+    # User-facing master tokens per clip so the copy-ready prompt's REFERENCE
+    # INPUTS section stays consistent with the work order's upload list.
+    planned_key_index = _asset_key_index(required_assets)
     for clip in clips:
         frame_plan = dict(frame_plans.get(str(clip.clip_number), {}))
+        info = chain["clips"].get(str(clip.clip_number), {})
+        scene_start = str(info.get("scene_start_frame") or "").strip()
+        reference_tokens: list[str] = []
+        if scene_start:
+            frame_plan["scene_start_frame"] = scene_start
+            reference_tokens.append(scene_start)
+        for character_id in clip.character_ids:
+            key = planned_key_index.get(f"character:{character_id}")
+            if key and key not in reference_tokens:
+                reference_tokens.append(key)
+        if clip.location:
+            key = planned_key_index.get(f"location:{clip.location}")
+            if key and key not in reference_tokens:
+                reference_tokens.append(key)
+        frame_plan["reference_tokens"] = reference_tokens
         trace: dict[str, Any] = {}
         copy_ready = compile_copy_ready_prompt(
-            clip, profile, production_package, assets_by_id, frame_plan, trace
+            clip,
+            profile,
+            production_package,
+            assets_by_id,
+            frame_plan,
+            trace,
+            identity_overrides=identity_by_character,
         )
         _ensure_no_placeholders(copy_ready)
+        # Stable ordered dedupe (task #30): continuity lists never repeat rows.
         merged_trace = {**clip.compiler_trace, "copy_ready": trace}
+        start_key = scene_start or str(info.get("start_frame") or "")
         compiled_clips.append(
             clip.model_copy(
-                update={"copy_ready_prompt": copy_ready, "compiler_trace": merged_trace}
+                update={
+                    "copy_ready_prompt": copy_ready,
+                    "compiler_trace": merged_trace,
+                    "continuity_constraints": _dedupe_stable(clip.continuity_constraints),
+                    "start_frame_asset_key": start_key.lstrip("@"),
+                }
             )
         )
 
     subtitle_plan = build_subtitle_plan(production_package)
-    screen_composite_plan = build_screen_composite_plan(compiled_clips, production_package)
+    screen_composite_plan = build_screen_composite_plan(
+        compiled_clips, production_package, profile
+    )
     dialogue_plan = build_dialogue_plan(compiled_clips, profile)
     sound_plan = build_sound_plan(production_package, compiled_clips)
     bgm_plan = build_bgm_plan(production_package, compiled_clips)
-    editing_plan = build_editing_plan(production_package, compiled_clips)
+    editing_plan = build_editing_plan(production_package, compiled_clips, profile)
     final_checklist = build_final_checklist(
         production_package,
         prompt_package,
@@ -1267,7 +1836,7 @@ def build_executable_video_production_guide(
     for asset in required_assets:
         asset_counts[asset.asset_type] = asset_counts.get(asset.asset_type, 0) + 1
     episode_number = prompt_package.episode_number
-    episode_title = str(opts.get("episode_title") or f"EP{episode_number:02d}")
+    episode_title = str(opts.get("episode_title") or f"第{episode_number}集")
     shots_map = _shots_by_number(production_package)
     shot_narrative: dict[str, str] = {}
     for clip in compiled_clips:
@@ -1292,6 +1861,10 @@ def build_executable_video_production_guide(
         "shot_narrative": shot_narrative,
         "operation_notes": _model_operation_lines(profile, prompt_package),
         "base_params": _base_params(profile, prompt_package),
+        # Platform terminology + capability summary the renderer needs AFTER
+        # persistence (the guide stores no profile object).
+        "platform_terms": dict(profile.platform_terms),
+        "negative_prompt_supported": profile.supports_negative_prompt is True,
     }
     continuity_workflow = {
         "anchors": [
@@ -1304,6 +1877,11 @@ def build_executable_video_production_guide(
                 "name": "Environment Master",
                 "role": "空间锚点",
                 "desc": "锁定场景的空间布局、光线与材质，跨镜复用同一张环境图。",
+            },
+            {
+                "name": "Scene Start Frame",
+                "role": "开镜画面锚点",
+                "desc": "锁定本段视频第一帧的构图与起始动作，用图片生成后再驱动视频。",
             },
             {
                 "name": "Previous End Frame",
@@ -1329,7 +1907,7 @@ def build_executable_video_production_guide(
         aspect_ratio=prompt_package.aspect_ratio,
         prompt_language=prompt_package.prompt_language,
         status="ready",
-        title=f"EP{episode_number:02d} AI视频完整制作手册",
+        title=f"EP{episode_number:02d}《{episode_title}》AI视频完整制作方案",
         overview=overview,
         required_assets=required_assets,
         clip_workflows=compiled_clips,
@@ -1351,37 +1929,59 @@ def build_executable_video_production_guide(
         "asset_count": len(required_assets),
         "clip_count": len(compiled_clips),
         "total_duration_seconds": total_duration,
-        "sections": list(_SECTION_TITLES),
+        "sections": list(_SECTION_KEYS),
         "deterministic": True,
     }
     return guide
 
 
 # ----------------------------------------------------------------------
-# Markdown handbook renderer
+# Markdown handbook renderer (structure aligned with 《视频生成模型.md》)
 # ----------------------------------------------------------------------
-_SECTION_TITLES: dict[str, str] = {
-    "goal": "一、制作目标",
-    "model": "二、目标视频模型与基础参数",
-    "permanent_assets": "三、需要提前准备的永久参考素材",
-    "episode_assets": "四、本集专用场景/道具素材",
-    "overview": "五、本集视频结构总览",
-    "clip_work_orders": "六、逐 Clip 工单",
-    "continuity": "七、尾帧接续流程",
-    "subtitles": "八、字幕时间轴",
-    "dialogue_sound": "九、对白与音效时间轴（含画面合成建议）",
-    "bgm": "十、BGM",
-    "editing": "十一、剪辑与转场",
-    "final_order": "十二、最终成片顺序",
-    "checklist": "十三、最终检查清单",
-}
+_SECTION_KEYS = (
+    "goal",
+    "character_assets",
+    "location_assets",
+    "prop_ui_assets",
+    "episode_structure",
+    "clip_work_orders",
+    "frame_workflow",
+    "subtitles",
+    "screen_composite",
+    "dialogue_sound",
+    "sfx",
+    "bgm",
+    "editing",
+    "checklist",
+)
 
 _ASSET_TYPE_LABELS: dict[str, str] = {
     "character": "角色母图（身份锚点）",
     "location": "场景母图（空间锚点）",
     "prop": "道具参考图",
     "style": "全集风格基准图",
+    "start_frame": "Scene Start Frame（开镜画面）",
     "reference_frame": "尾帧捕获指令（不是图片）",
+}
+
+_ASSET_GENERATION_NOTE = {
+    "character": (
+        "用任意文生图工具（如即梦、Midjourney、Nano Banana）生成；"
+        "生成后按 asset_key 命名保存，全集及后续各集固定复用这一张。"
+    ),
+    "location": (
+        "用任意文生图工具生成；生成后按 asset_key 命名保存，"
+        "本集内该场景的所有镜头复用这一张。"
+    ),
+    "prop": (
+        "用任意文生图工具生成；生成后按 asset_key 命名保存，"
+        "出现该道具的镜头复用这一张。"
+    ),
+    "style": "用任意文生图工具生成；作为全集风格基准，可选拍摄。",
+    "start_frame": (
+        "用任意文生图工具生成；生成后作为该视频段的 Start Frame 上传到视频平台。"
+    ),
+    "reference_frame": "不需要生成图片：这是该视频段生成完成后的尾帧捕获指令。",
 }
 
 
@@ -1416,19 +2016,27 @@ def _asset_key_index(assets: list[ProductionGuideAsset]) -> dict[str, str]:
     for asset in assets:
         if asset.asset_type == "character" and asset.character_id:
             index[f"character:{asset.character_id}"] = asset.asset_key
-        elif asset.asset_type == "location" and asset.location_id:
-            index[f"location:{asset.location_id}"] = asset.asset_key
+        elif asset.asset_type == "location":
+            if asset.location_id:
+                index[f"location:{asset.location_id}"] = asset.asset_key
+            if asset.name:
+                index[f"location:{asset.name}"] = asset.asset_key
         elif asset.asset_type == "prop":
             index[f"prop:{asset.name.casefold()}"] = asset.asset_key
     return index
 
 
 def _clip_asset_keys(
-    clip: GenerationClip, index: dict[str, str], start_frame: str | None
+    clip: GenerationClip,
+    index: dict[str, str],
+    start_frame: str | None,
+    scene_start_frame: str | None,
 ) -> list[str]:
     """User-facing asset_key tokens one clip consumes (start frame first)."""
     keys: list[str] = []
-    if start_frame:
+    if scene_start_frame:
+        keys.append(str(scene_start_frame))
+    elif start_frame:
         keys.append(f"@{start_frame}")
     for character_id in clip.character_ids:
         key = index.get(f"character:{character_id}")
@@ -1445,28 +2053,65 @@ def _clip_asset_keys(
     return keys
 
 
-def _clip_mode_label(start_frame: str | None) -> str:
-    """Operational generation mode for one clip (derived from the chain)."""
-    return "图生视频（Start Frame 承接）" if start_frame else "文生视频（母图参考）"
+def _settings_line(clip: GenerationClip, info: dict[str, Any], keys: list[str]) -> str:
+    """Human-readable recommended settings (task #28): no snake_case, ONE
+    generation duration, platform-neutral labels."""
+    duration = max(0.0, clip.duration_seconds)
+    mode = _clip_short_mode(info)
+    quality = str(
+        (clip.recommended_settings or {}).get("quality_priority") or "balanced"
+    )
+    parts = [
+        f"时长 {duration:g} 秒",
+        f"比例 {clip.aspect_ratio}",
+        f"模式 {mode}",
+        f"质量 {_QUALITY_LABELS.get(quality, quality)}",
+        f"参考图 {len(keys)} 张",
+    ]
+    start = info.get("start_frame") or ""
+    if start:
+        parts.append(f"首帧 {start}")
+    return " ｜ ".join(parts)
 
 
-def _asset_block(section_number: int, position: int, asset: ProductionGuideAsset) -> list[str]:
-    """One reference-asset block: 用途/必需/范围/状态/fenced prompt/注意事项."""
-    type_label = _ASSET_TYPE_LABELS.get(asset.asset_type, asset.asset_type)
+def _asset_block(position: int, asset: ProductionGuideAsset) -> list[str]:
+    """One reference-asset block in 《视频生成模型.md》 style: 素材N、定位说明、
+    用途、生成方式、fenced 完整图片生成 Prompt."""
+    if asset.asset_type == "character":
+        positioning = (
+            f"这张图不是一个视频分镜。它是「{asset.name}」在整部作品中的永久身份参考，"
+            "后续所有出现该角色的镜头都应复用同一张图。"
+        )
+    elif asset.asset_type == "location":
+        positioning = (
+            f"这张图锁定「{asset.name}」的空间与视觉世界；本集所有发生在此的场景镜头"
+            "都引用这一张作为环境锚点。"
+        )
+    elif asset.asset_type == "start_frame":
+        positioning = (
+            "这张图是某一段视频专用的第一帧画面（不是身份母图）：生成后作为该段的"
+            "开镜画面（Start Frame）上传。"
+        )
+    elif asset.asset_type == "reference_frame":
+        positioning = "这不是需要生成的图片，而是一条尾帧捕获指令：在对应视频段生成完成后执行。"
+    else:
+        positioning = "这一素材用于锁定跨镜头一致性。"
     prompt_label = (
-        "尾帧捕获指令（Clip 生成完成后执行，不是图片生成）："
+        "尾帧捕获指令（视频生成完成后执行，不是图片生成）："
         if asset.asset_type == "reference_frame"
-        else "完整图片生成 Prompt（直接复制使用）："
+        else "完整图片生成 Prompt（直接复制到图片生成工具）："
     )
     lines = [
-        f"### {section_number}.{position} {asset.asset_key} · {type_label}",
+        f"### 素材{position}：{asset.asset_key}",
         "",
-        f"- 名称：{asset.name}",
+        positioning,
+        "",
+        f"- 名称：{asset.name}（{_ASSET_TYPE_LABELS.get(asset.asset_type, asset.asset_type)}）",
         f"- 用途：{_cell(asset.purpose)}",
         f"- 是否必需：{_NECESSITY_LABELS.get(asset.necessity, asset.necessity)}",
         f"- 使用范围：{_SCOPE_LABELS.get(asset.reuse_scope, asset.reuse_scope)}",
-        f"- 状态：{_STATUS_LABELS.get(asset.status, asset.status)}",
         f"- 保存命名：{asset.asset_key}",
+        f"- 生成方式：{_ASSET_GENERATION_NOTE.get(asset.asset_type, '用任意文生图工具生成。')}",
         "",
         prompt_label,
         "",
@@ -1483,78 +2128,154 @@ def _asset_block(section_number: int, position: int, asset: ProductionGuideAsset
 def _clip_work_order_block(
     clip: GenerationClip,
     info: dict[str, Any],
-    narrative: str,
     index: dict[str, str],
+    character_names: dict[str, str],
     display_name: str,
-    start: str,
-    end: str,
+    platform_terms: dict[str, str],
+    negative_supported: bool,
 ) -> list[str]:
-    """One per-clip work order: 使用素材, ONE fenced copy-ready prompt, then
-    the tail-frame follow-up actions (window / criteria / save name / usage)."""
-    raw_start = info.get("start_frame")
-    start_frame = str(raw_start) if raw_start else None
+    """One per-video work order (task #31): 使用方式 → Start Frame →
+    Ingredients → ONE fenced complete Prompt → 生成完成后 tail-frame action."""
+    start_frame = str(info.get("start_frame")) if info.get("start_frame") else None
+    scene_start = str(info.get("scene_start_frame")) if info.get("scene_start_frame") else None
     produces = bool(info.get("produces_next_start_frame"))
-    keys = _clip_asset_keys(clip, index, start_frame)
+    keys = _clip_asset_keys(clip, index, start_frame, scene_start)
     char_keys = [key for key in keys if key.startswith("@CHAR_")]
     loc_keys = [key for key in keys if key.startswith("@LOC_")]
     prop_keys = [key for key in keys if key.startswith("@PROP_")]
-    criteria = [str(item) for item in list(info.get("criteria") or [])]
-    saved = str(info.get("end_frame_saved") or "")
-    if produces and saved.startswith("FRAME_"):
-        save_line = f"{saved}，用作下一镜（Clip {clip.clip_number + 1:02d}）首帧"
-    else:
-        save_line = "无需保存接续帧（全集收尾，直接进入后期）"
-    lines = [
-        f"### Clip {clip.clip_number:02d} · {start}–{end}",
-        "",
-        f"- 来源分镜：{_cell(narrative)}",
-        f"- 核心内容：{_cell(clip.purpose or clip.visual_intent)}",
-        f"- 时长：{max(0.0, clip.duration_seconds):g} 秒",
-        f"- 生成模式：{_clip_mode_label(start_frame)}",
-        "- Start Frame："
-        + (
-            f"@{start_frame}（上一镜尾帧，物理连续性锚点）"
-            if start_frame
-            else "无（首镜自由开场）"
+    criteria = [
+        *(
+            f"{name} 脸部正确（与角色母图一致）"
+            for name in _clip_character_names(clip, character_names)
         ),
-        "- 身份锚点（Character Master）："
-        + ("、".join(char_keys) if char_keys else "（本镜无角色参考）"),
-        "- 空间锚点（Environment Master）："
-        + ("、".join(loc_keys) if loc_keys else "（本镜无场景参考）"),
-        "- 道具参考（Prop）：" + ("、".join(prop_keys) if prop_keys else "（无）"),
+        *(f"{prop} 位置与形状正确" for prop in (clip.prop_ids or [])),
+        "手部没有变形、没有多余肢体或残影",
+        "动作已基本停止，画面处于稳定可接续的姿态",
+        "没有字幕、水印、乱码文本叠在画面上",
+    ]
+    saved = str(info.get("end_frame_saved") or "")
+    mode = _clip_operational_mode(info)
+    lines: list[str] = [
+        "## 使用方式",
+        "",
+        f"生成模式：{mode}",
+        "",
+        f"平台操作（{display_name}）：",
+    ]
+    sf_term = platform_terms.get("start_frame") or "Start Frame"
+    ref_term = platform_terms.get("reference_images") or "参考图"
+    prompt_term = platform_terms.get("prompt_field") or "Prompt"
+    if scene_start:
+        lines.append(f"- {sf_term}：上传 {scene_start}（开镜画面，先用第四节素材 Prompt 生成）")
+    elif start_frame:
+        lines.append(f"- {sf_term}：上传 @{start_frame}（上一段保存的尾帧）")
+    if char_keys:
+        lines.append(f"- {ref_term}：上传 {'、'.join(char_keys)}（角色母图）")
+    if loc_keys:
+        lines.append(f"- {ref_term}：上传 {'、'.join(loc_keys)}（场景母图）")
+    if prop_keys:
+        lines.append(f"- {ref_term}：上传 {'、'.join(prop_keys)}（道具参考图）")
+    lines.extend(
+        [
+            f"- {prompt_term}：复制下方完整 Prompt（整段一起复制，包括 STRICT 部分）",
+            "",
+            f"建议设置：{_settings_line(clip, info, keys)}",
+            "",
+            "### Start Frame",
+            "",
+        ]
+    )
+    if scene_start:
+        lines.append(f"{scene_start}（独立开镜画面：先用素材区的图片 Prompt 生成这张图，再上传）")
+    elif start_frame:
+        lines.append(f"@{start_frame}（上一段视频保存的尾帧，物理连续性锚点）")
+    else:
+        lines.append("无（本段为文生视频自由开场，不依赖首帧）")
+    lines += [
+        "",
+        "### Ingredients / References",
+        "",
+    ]
+    if keys:
+        lines.extend(keys)
+    else:
+        lines.append("（本段无参考素材，仅凭 Prompt 描述生成）")
+    lines += [
+        "",
+        f"### Prompt {clip.clip_number}",
         "",
         (
-            f"操作：挂好上列参考素材，把下方 Prompt 原样复制到「{display_name}」生成本镜"
-            "（STRICT 部分不要改动）："
+            f"操作：挂好上列参考素材后，把下面整段 Prompt 原样复制到「{display_name}」"
+            "生成本段视频："
         ),
         "",
     ]
     lines.extend(_fence(clip.copy_ready_prompt))
+    lines.append("")
+    # 可选 Negative Prompt（task #26）：只在目标模型适合独立负面词时给出，
+    # 且完整 Prompt 不依赖它成立。
+    if negative_supported and clip.negative_prompt:
+        lines += ["可选 Negative Prompt（平台的负面词输入框，可留空）：", ""]
+        lines.extend(_fence(clip.negative_prompt))
+        lines.append("")
     lines += [
+        f"### 视频{clip.clip_number}生成完成以后",
         "",
-        "生成后操作（尾帧）：",
-        f"- 挑选区间：{_cell(info.get('selection_window'))}",
-        f"- 挑选标准：{'；'.join(criteria)}",
-        f"- 保存命名：{save_line}",
+        f"在本段视频的第 {max(0.0, clip.duration_seconds - 1.0):.1f}～"
+        f"{max(0.0, clip.duration_seconds - 0.2):.1f} 秒之间选择：",
         "",
     ]
+    lines.extend(f"- {criterion}" for criterion in _dedupe_stable(criteria))
+    if produces and saved.startswith("FRAME_"):
+        lines += [
+            "",
+            "保存为：",
+            "",
+            f"{saved}",
+            "",
+            f"作为视频 {clip.clip_number + 1} 的 Start Frame。",
+        ]
+    else:
+        lines += [
+            "",
+            "无需保存接续帧（下一段切换场景或全集收尾，直接进入下一段/后期）。",
+        ]
+    lines.append("")
     return lines
+
+
+def _clip_character_names(clip: GenerationClip, character_names: dict[str, str]) -> list[str]:
+    """Human names for the tail-frame criteria lines (deduplicated)."""
+    names: list[str] = []
+    for character_id in clip.character_ids:
+        name = str(character_names.get(character_id) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
     """Render the complete continuous handbook (deterministic, idempotent).
 
-    Chinese narration + English fenced prompt blocks; the model's capabilities
-    appear as operational instructions only (never capability JSON/flags);
-    source shots appear as narrative text; the only tokens that leak through
-    are user-facing ``asset_key`` strings and ``FRAME_NN`` labels. Built as a
-    single parts list joined once — no timestamps, no json.dumps, so identical
-    guide inputs yield byte-identical markdown.
+    Structure follows the user's reference 《视频生成模型.md》: permanent
+    character/location/prop assets FIRST with complete image prompts, then the
+    episode structure table, then one work order per 视频 N (使用方式 / Start
+    Frame / Ingredients / 完整 Prompt / 生成完成后), then the tail-frame
+    workflow, subtitle / UI composite / dialogue / SFX / BGM / editing /
+    checklist sections. Chinese narration + English fenced prompt blocks; the
+    model's capabilities appear as operational instructions only; the only
+    tokens that leak through are user-facing ``asset_key`` strings and
+    ``FRAME_NN`` labels. Identical guide inputs yield byte-identical markdown.
     """
     overview = dict(guide.overview)
     assets = guide.required_assets
     clips = _sorted_clips(guide.clip_workflows)
     index = _asset_key_index(assets)
+    character_names = {
+        asset.character_id: asset.name
+        for asset in assets
+        if asset.asset_type == "character" and asset.character_id
+    }
     ranges, total_duration = _clip_time_ranges(clips)
     range_by_clip = {number: (start, end) for number, start, end in ranges}
     chain_clips: dict[str, Any] = dict(guide.frame_chain.get("clips") or {})
@@ -1562,20 +2283,14 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         str(key): str(value)
         for key, value in dict(overview.get("shot_narrative") or {}).items()
     }
-    anchors = [
-        dict(anchor)
-        for anchor in list(guide.continuity_workflow.get("anchors") or [])
-        if isinstance(anchor, dict)
-    ]
     display_name = guide.target_video_model_display_name or str(
         overview.get("target_model") or ""
     )
-    asset_counts = dict(overview.get("asset_counts") or {})
-    char_count = int(asset_counts.get("character", 0))
-    loc_count = int(asset_counts.get("location", 0))
-    prop_count = int(asset_counts.get("prop", 0))
-    style_count = int(asset_counts.get("style", 0))
-    frame_count = int(asset_counts.get("reference_frame", 0))
+    platform_terms = {
+        str(key): str(value)
+        for key, value in dict(overview.get("platform_terms") or {}).items()
+    }
+    negative_supported = bool(overview.get("negative_prompt_supported"))
     base_params = dict(overview.get("base_params") or {})
     operation_notes = [
         str(line)
@@ -1583,57 +2298,59 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         if str(line).strip()
     ]
     editing = dict(guide.editing_plan)
+    episode_title = str(overview.get("episode_title") or f"第{guide.episode_number}集")
 
-    parts: list[str] = [f"# {guide.title}", ""]
+    # Section numbering: fixed pre-video sections 1–5, then one section per
+    # video (6..5+K), then the tail workflow + post sections.
+    clip_count = len(clips)
+
+    parts: list[str] = []
+    parts.append(f"# EP{guide.episode_number:02d}《{episode_title}》")
+    parts.append(f"# {display_name} AI视频完整制作方案")
+    parts.append("")
     parts.append(
-        "> 本手册是可直接执行的拍摄工单：先备齐参考素材，再逐 Clip 复制 Prompt 生成视频，"
-        "最后按后期计划合成成片。"
+        "> 本手册是可直接执行的完整制作方案：先备齐素材区的角色/场景/道具参考图，"
+        "再按「视频 N」的顺序逐段生成（每段复制完整 Prompt），"
+        "最后按后期章节合成成片。全程不需要回到系统查其它卡片。"
     )
     parts.append("")
     parts.append(
         f"**目标模型**：{display_name} ｜ **画幅**：{guide.aspect_ratio}"
-        f" ｜ **总时长**：{_fmt_clock(total_duration)} ｜ **Clip 数**：{len(clips)}"
+        f" ｜ **总时长**：{_fmt_clock(total_duration)} ｜ **视频段数**：{clip_count}"
     )
     parts.append("")
 
-    # 一、制作目标 ------------------------------------------------------
-    episode_title = str(overview.get("episode_title") or f"EP{guide.episode_number:02d}")
+    # 一、制作目标与基础设置 --------------------------------------------
     parts += [
-        f"## {_SECTION_TITLES['goal']}",
+        "## 一、制作目标与基础设置",
         "",
         (
             f"本集目标：用「{display_name}」生成 EP{guide.episode_number:02d}"
-            f"「{episode_title}」整集视频——共 {len(clips)} 个 Clip、约 "
+            f"「{episode_title}」整集视频——共 {clip_count} 个视频段、约 "
             f"{_fmt_clock(total_duration)}，画幅 {guide.aspect_ratio}。"
         ),
         "",
-        "执行顺序是「先素材、后视频、再后期」：",
+        "制作顺序固定为「先素材、后视频、再后期」：",
         "",
         (
-            f"1. 备料：生成第三节、第四节列出的全部参考素材并按 asset_key 命名归档"
-            f"（角色母图 {char_count} 张、场景母图 {loc_count} 张、道具参考 {prop_count} 张、"
-            f"风格基准 {style_count} 张、尾帧捕获指令 {frame_count} 条）。"
+            "1. 备料：先生成第二、三、四节列出的全部参考素材并按 asset_key 命名归档"
+            "（角色母图优先，它们在全集乃至后续各集固定复用）。"
         ),
-        "2. 逐镜生成：按第六节工单顺序逐 Clip 复制 Prompt 生成，上一镜尾帧 = 下一镜首帧。",
-        "3. 后期：按第八～十一节完成字幕、对白配音、音效铺设与 BGM。",
-        "4. 合成：按第十二节顺序拼接成片，导出前对照第十三节检查清单逐项验收。",
+        "2. 逐段生成：按「视频 N」章节顺序逐段复制 Prompt 生成，"
+        "同一场景内上一段尾帧 = 下一段首帧。",
+        "3. 后期：按字幕 / UI 合成 / 对白 / SFX / BGM 各节完成声音与画面后期。",
+        "4. 合成：按剪辑顺序拼接成片，导出前对照最终检查清单逐项验收。",
+        "",
+        "基础参数（整集固定，不要逐段更改）：",
         "",
     ]
-
-    # 二、目标视频模型与基础参数 ----------------------------------------
     param_rows = [
         ["目标模型", _cell(base_params.get("target_model") or display_name)],
         ["厂商", _cell(base_params.get("vendor"))],
         ["目标画幅", _cell(base_params.get("aspect_ratio") or guide.aspect_ratio)],
         ["支持画幅", _cell(base_params.get("supported_aspect_ratios"))],
-        ["单镜时长", _cell(base_params.get("duration"))],
+        ["单段时长", _cell(base_params.get("duration"))],
         ["Prompt 语言", _cell(base_params.get("prompt_language") or guide.prompt_language)],
-    ]
-    parts += [
-        f"## {_SECTION_TITLES['model']}",
-        "",
-        "基础参数（整集固定，不要逐镜更改）：",
-        "",
     ]
     parts += _md_table(["参数", "取值"], param_rows)
     parts += ["", "操作要点（把模型能力翻译成拍摄动作，逐条执行）：", ""]
@@ -1643,113 +2360,131 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         parts.append("- 按平台默认方式生成，Prompt 内不引用本平台不支持的能力。")
     parts.append("")
 
-    # 三、永久参考素材 --------------------------------------------------
-    permanent = [asset for asset in assets if asset.asset_type in ("character", "style")]
+    # 素材全局编号（素材1、素材2…贯穿二三四节） ---------------------------
+    asset_position = 0
+
+    # 二、先建立永久角色参考素材 ------------------------------------------
+    characters = [asset for asset in assets if asset.asset_type == "character"]
+    styles = [asset for asset in assets if asset.asset_type == "style"]
+    permanent = characters + styles
     parts += [
-        f"## {_SECTION_TITLES['permanent_assets']}",
+        "## 二、先建立永久角色参考素材",
         "",
         (
             "本节是「永久身份锚点」素材：角色母图锁定人物长相，风格基准图锁定整集画风，"
             "全集乃至后续各集复用同一张图。请先全部生成并按 asset_key 命名归档，"
-            "再开始生成视频。"
+            "再开始生成任何视频段。"
         ),
         "",
     ]
-    if permanent:
-        for position, asset in enumerate(permanent, start=1):
-            parts += _asset_block(3, position, asset)
-    else:
+    for asset in permanent:
+        asset_position += 1
+        parts += _asset_block(asset_position, asset)
+    if not permanent:
         parts += ["本集未识别到需预生成的永久参考素材。", ""]
 
-    # 四、本集专用素材 --------------------------------------------------
-    episode_assets = [
-        asset
-        for asset in assets
-        if asset.asset_type in ("location", "prop", "reference_frame")
-    ]
+    # 三、本集需要建立的场景参考素材 --------------------------------------
+    locations = [asset for asset in assets if asset.asset_type == "location"]
     parts += [
-        f"## {_SECTION_TITLES['episode_assets']}",
+        "## 三、本集需要建立的场景参考素材",
         "",
         (
-            "本节素材只服务本集：场景母图锁定空间（Environment Master），"
-            "道具参考图锁定关键物件；reference_frame 条目不是图片，"
-            "而是每条 Clip 生成完成后的尾帧捕获指令。"
+            "本节素材锁定本集的空间（Environment Master）：场景母图确定后，"
+            "凡在此场景发生的视频段都引用同一张。"
         ),
         "",
     ]
-    if episode_assets:
-        for position, asset in enumerate(episode_assets, start=1):
-            parts += _asset_block(4, position, asset)
-    else:
-        parts += ["本集未识别到专用场景/道具素材。", ""]
+    for asset in locations:
+        asset_position += 1
+        parts += _asset_block(asset_position, asset)
+    if not locations:
+        parts += ["本集未识别到专用场景素材。", ""]
 
-    # 五、结构总览 -------------------------------------------------------
-    overview_rows: list[list[str]] = []
+    # 四、关键道具 / UI / 屏幕与开镜画面素材 ------------------------------
+    others = [
+        asset
+        for asset in assets
+        if asset.asset_type in ("prop", "start_frame", "reference_frame")
+    ]
+    parts += [
+        "## 四、关键道具 / UI / 屏幕与开镜画面素材",
+        "",
+        (
+            "本节包含：关键道具参考图、各视频段的 Scene Start Frame（独立开镜画面），"
+            "以及「FRAME_NN 尾帧捕获指令」（不是图片，是每段生成完成后的动作）。"
+        ),
+        "",
+    ]
+    for asset in others:
+        asset_position += 1
+        parts += _asset_block(asset_position, asset)
+    if not others:
+        parts += ["本集未识别到道具/开镜画面素材。", ""]
+
+    # 五、整集视频结构 -----------------------------------------------------
+    structure_rows: list[list[str]] = []
     for clip in clips:
         start, end = range_by_clip.get(clip.clip_number, (0.0, 0.0))
         info = dict(chain_clips.get(str(clip.clip_number)) or {})
-        raw_start = info.get("start_frame")
-        start_frame = str(raw_start) if raw_start else None
-        keys = _clip_asset_keys(clip, index, start_frame)
-        join_label = "承接 " + str(start_frame) if start_frame else "首镜开场"
-        tail_label = (
-            f"；收尾存 {info.get('end_frame_saved')}"
-            if info.get("produces_next_start_frame")
-            else "；收尾不存帧"
-        )
-        overview_rows.append(
+        start_frame = str(info.get("start_frame")) if info.get("start_frame") else None
+        scene_start = str(info.get("scene_start_frame")) if info.get("scene_start_frame") else None
+        keys = _clip_asset_keys(clip, index, start_frame, scene_start)
+        structure_rows.append(
             [
-                f"Clip {clip.clip_number:02d}",
                 f"{_fmt_clock(start)}–{_fmt_clock(end)}",
-                _cell(shot_narrative.get(str(clip.clip_number), "—")),
+                f"视频 {clip.clip_number}",
                 _cell(clip.purpose or clip.visual_intent),
-                _clip_mode_label(start_frame),
+                _clip_short_mode(info),
                 "、".join(keys) if keys else "—",
-                join_label + tail_label,
             ]
         )
     parts += [
-        f"## {_SECTION_TITLES['overview']}",
+        "## 五、整集视频结构",
         "",
-        f"全集共 {len(clips)} 个 Clip，总时长约 {_fmt_clock(total_duration)}，"
+        f"全集共 {clip_count} 个视频段，总时长约 {_fmt_clock(total_duration)}，"
         "按以下顺序生成与拼接：",
         "",
     ]
     parts += _md_table(
-        ["Clip", "时间", "来源分镜", "核心内容", "模式", "使用素材", "接续方式"],
-        overview_rows,
+        ["时间", "视频段", "作用", "模式", "使用素材"],
+        structure_rows,
     )
     parts.append("")
 
-    # 六、逐 Clip 工单 ---------------------------------------------------
-    parts += [
-        f"## {_SECTION_TITLES['clip_work_orders']}",
-        "",
-        (
-            "按顺序逐镜生成。每个工单动作固定：挂参考图 → 原样复制 Prompt → 生成 → "
-            "按「生成后操作」挑选尾帧并保存 → 进入下一镜。"
-        ),
-        "",
-    ]
+    # 六..、视频 N 工单 ----------------------------------------------------
     for clip in clips:
         start, end = range_by_clip.get(clip.clip_number, (0.0, 0.0))
         info = dict(chain_clips.get(str(clip.clip_number)) or {})
+        parts.append(
+            f"## {_cn_num(5 + clip.clip_number)}、视频 {clip.clip_number}："
+            f"{_fmt_clock(start)}–{_fmt_clock(end)}"
+        )
+        parts.append("")
+        if shot_narrative.get(str(clip.clip_number)):
+            parts.append(f"来源分镜：{_cell(shot_narrative[str(clip.clip_number)])}")
+            parts.append("")
         parts += _clip_work_order_block(
             clip,
             info,
-            shot_narrative.get(str(clip.clip_number), "—"),
             index,
+            character_names,
             display_name,
-            _fmt_clock(start),
-            _fmt_clock(end),
+            platform_terms,
+            negative_supported,
         )
 
-    # 七、尾帧接续流程 ---------------------------------------------------
+    # 尾帧接首帧完整流程 ----------------------------------------------------
+    tail_number = _cn_num(6 + clip_count)
     parts += [
-        f"## {_SECTION_TITLES['continuity']}",
+        f"## {tail_number}、尾帧接首帧完整流程",
         "",
-        "整个连续性体系由三种锚点组成，各管一件事，不能混为一谈：",
+        "整个连续性体系由四种锚点组成，各管一件事，不能混为一谈：",
         "",
+    ]
+    anchors = [
+        dict(anchor)
+        for anchor in list(guide.continuity_workflow.get("anchors") or [])
+        if isinstance(anchor, dict)
     ]
     if anchors:
         anchor_rows = [
@@ -1758,28 +2493,29 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         ]
         parts += _md_table(["锚点", "作用", "说明"], anchor_rows)
     else:
-        parts.append("（按角色母图 / 场景母图 / 上一镜尾帧三类锚点管理连续性。）")
+        parts.append("（按角色母图 / 场景母图 / 开镜画面 / 上一镜尾帧四类锚点管理连续性。）")
     parts += ["", "尾帧链全景：", ""]
     parts += _fence("\n".join(str(line) for line in list(guide.frame_chain.get("diagram") or [])))
-    parts += ["", "逐镜衔接表：", ""]
+    parts += ["", "逐段衔接表：", ""]
     chain_rows: list[list[str]] = []
     for clip in clips:
         info = dict(chain_clips.get(str(clip.clip_number)) or {})
-        raw_start = info.get("start_frame")
-        start_frame = str(raw_start) if raw_start else None
+        start_frame = str(info.get("start_frame")) if info.get("start_frame") else None
+        scene_start = str(info.get("scene_start_frame")) if info.get("scene_start_frame") else None
+        first = scene_start or (f"@{start_frame}" if start_frame else "无（文生视频开场）")
         chain_rows.append(
             [
-                f"Clip {clip.clip_number:02d}",
-                f"@{start_frame}" if start_frame else "无（首镜）",
+                f"视频 {clip.clip_number}",
+                first,
                 str(info.get("end_frame_saved") or "—"),
                 _cell(info.get("selection_window")),
             ]
         )
-    parts += _md_table(["Clip", "首帧", "收尾保存", "挑选区间"], chain_rows)
+    parts += _md_table(["视频段", "首帧", "收尾保存", "挑选区间"], chain_rows)
     parts.append("")
 
-    # 八、字幕时间轴 -----------------------------------------------------
-    parts += [f"## {_SECTION_TITLES['subtitles']}", ""]
+    # 字幕时间轴 ------------------------------------------------------------
+    parts += [f"## {_cn_num(7 + clip_count)}、字幕时间轴", ""]
     if guide.subtitle_plan:
         parts += ["字幕全部在后期叠加，不要让视频模型把字幕烧进画面。对齐如下：", ""]
         subtitle_rows = [
@@ -1800,8 +2536,26 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         )
     parts.append("")
 
-    # 九、对白与音效时间轴 ------------------------------------------------
-    parts += [f"## {_SECTION_TITLES['dialogue_sound']}", ""]
+    # 手机 / 邮件 / UI 后期合成方案 -----------------------------------------
+    parts += [f"## {_cn_num(8 + clip_count)}、手机 / 邮件 / UI 后期合成方案", ""]
+    if guide.screen_composite_plan:
+        parts += ["逐段确认（画面内可读文本 / 后期 UI）：", ""]
+        for entry in guide.screen_composite_plan:
+            if not isinstance(entry, dict):
+                continue
+            number = int(entry.get("clip_number", 0) or 0)
+            matched = "、".join(str(item) for item in list(entry.get("matched") or []))
+            suffix = f"｜命中词：{matched}" if matched else ""
+            parts.append(
+                f"- **视频 {number:02d}**（{_cell(entry.get('category'))}{suffix}）"
+                f"：{_cell(entry.get('recommendation'))}"
+            )
+        parts.append("")
+    else:
+        parts += ["本集无画面内文本风险，无需特殊合成处理。", ""]
+
+    # 对白与环境音 ----------------------------------------------------------
+    parts += [f"## {_cn_num(9 + clip_count)}、对白与环境音", ""]
     if guide.dialogue_plan:
         parts += [f"对白策略：{_cell(guide.dialogue_plan[0].get('note'))}", ""]
         dialogue_rows: list[list[str]] = []
@@ -1813,7 +2567,7 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
             strategy = str(entry.get("strategy") or "")
             dialogue_rows.append(
                 [
-                    f"Clip {number:02d}",
+                    f"视频 {number}",
                     f"{_fmt_clock(start)}–{_fmt_clock(end)}",
                     _cell(entry.get("speaker")),
                     _cell(entry.get("line")),
@@ -1822,11 +2576,13 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
                     else "后期配音对齐口型",
                 ]
             )
-        parts += _md_table(["Clip", "台词时间", "说话人", "台词", "处理方式"], dialogue_rows)
+        parts += _md_table(["视频段", "台词时间", "说话人", "台词", "处理方式"], dialogue_rows)
         parts.append("")
     else:
         parts += ["本集无台词对白，确认环境声与表演足以支撑叙事。", ""]
-    parts += ["音效与环境声（逐镜铺设，声音不硬切）：", ""]
+
+    # SFX -------------------------------------------------------------------
+    parts += [f"## {_cn_num(10 + clip_count)}、SFX", "", "逐段铺设，声音不硬切：", ""]
     sound_rows: list[list[str]] = []
     for entry in guide.sound_plan:
         if not isinstance(entry, dict):
@@ -1837,42 +2593,29 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         key_sfx = "、".join(str(item) for item in list(entry.get("key_sfx") or []))
         sound_rows.append(
             [
-                f"Clip {number:02d}",
+                f"视频 {number}",
                 f"{_fmt_clock(start)}–{_fmt_clock(end)}",
                 environment or "（无）",
                 key_sfx or "（无）",
                 _cell(entry.get("transition")),
             ]
         )
-    parts += _md_table(["Clip", "时间", "环境声", "关键音效", "过渡处理"], sound_rows)
-    parts += ["", "画面合成建议（画面内可读文本 / 后期 UI）：", ""]
-    if guide.screen_composite_plan:
-        for entry in guide.screen_composite_plan:
-            if not isinstance(entry, dict):
-                continue
-            number = int(entry.get("clip_number", 0) or 0)
-            matched = "、".join(str(item) for item in list(entry.get("matched") or []))
-            suffix = f"｜命中词：{matched}" if matched else ""
-            parts.append(
-                f"- **Clip {number:02d}**（{_cell(entry.get('category'))}{suffix}）"
-                f"：{_cell(entry.get('recommendation'))}"
-            )
-        parts.append("")
-    else:
-        parts += ["本集无画面内文本风险，无需特殊合成处理。", ""]
+    parts += _md_table(["视频段", "时间", "环境声", "关键音效", "过渡处理"], sound_rows)
+    parts.append("")
 
-    # 十、BGM ------------------------------------------------------------
+    # BGM -------------------------------------------------------------------
     bgm_note = str(guide.bgm_plan.get("note") or "")
     bgm_prompt = str(guide.bgm_plan.get("prompt") or "")
     bgm_total = _as_float(guide.bgm_plan.get("total_duration_seconds"), total_duration)
     parts += [
-        f"## {_SECTION_TITLES['bgm']}",
+        f"## {_cn_num(11 + clip_count)}、BGM 完整生成 Prompt",
         "",
-        bgm_note or "整集铺一条统一配乐，不在 Clip 边界断开。",
+        bgm_note or "整集铺一条统一配乐，不在视频段边界断开。",
         "",
         (
-            f"用单独的音乐生成工具生成一整条约 {bgm_total:.0f} 秒的配乐，"
-            "从 00:00 连续铺到片尾，不要按 Clip 切开分段生成："
+            f"用单独的音乐生成工具（如 Suno / Udio / Stable Audio），"
+            f"把下面整段 Prompt 复制进去，生成一整条约 {bgm_total:.0f} 秒的配乐，"
+            "从 00:00 连续铺到片尾，不要按视频段切开分段生成："
         ),
         "",
     ]
@@ -1882,9 +2625,14 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         parts.append("本集未提供 BGM 生成 Prompt，请在音乐工具中按上方方向生成整条配乐。")
     parts.append("")
 
-    # 十一、剪辑与转场 ----------------------------------------------------
+    # 剪辑顺序与转场 --------------------------------------------------------
     rules = [str(rule) for rule in list(editing.get("rules") or [])]
-    parts += [f"## {_SECTION_TITLES['editing']}", "", "剪辑三原则：", ""]
+    parts += [
+        f"## {_cn_num(12 + clip_count)}、剪辑顺序与转场",
+        "",
+        "剪辑三原则：",
+        "",
+    ]
     if rules:
         parts += [f"- {rule}" for rule in rules]
     else:
@@ -1898,7 +2646,7 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         to_clip = int(transition.get("to_clip", 0) or 0)
         transition_rows.append(
             [
-                f"Clip {from_clip:02d} → Clip {to_clip:02d}",
+                f"视频 {from_clip} → 视频 {to_clip}",
                 _cell(transition.get("type")),
                 _cell(transition.get("reason")),
             ]
@@ -1906,25 +2654,17 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
     if transition_rows:
         parts += _md_table(["剪辑点", "方式", "原因"], transition_rows)
     else:
-        parts.append("单 Clip 成片，无剪辑点。")
+        parts.append("单段成片，无剪辑点。")
     parts.append("")
     if str(editing.get("audio_crossfade") or ""):
         parts.append(f"- 声音过渡：{editing.get('audio_crossfade')}")
     if str(editing.get("bgm") or ""):
         parts.append(f"- BGM 铺设：{editing.get('bgm')}")
-    parts.append("")
-
-    # 十二、最终成片顺序 --------------------------------------------------
+    parts += ["", "最终成片顺序（直接拼接，不再调整镜头次序）：", ""]
     order = [int(number) for number in list(editing.get("order") or [])]
     if not order:
         order = [clip.clip_number for clip in clips]
-    parts += [
-        f"## {_SECTION_TITLES['final_order']}",
-        "",
-        "按以下顺序直接拼接成片（不再调整镜头次序）：",
-        "",
-    ]
-    parts += _fence("\n".join(f"Clip {number:02d}" for number in order))
+    parts += _fence("\n".join(f"视频 {number}" for number in order))
     parts += [
         "",
         (
@@ -1934,8 +2674,13 @@ def render_guide_markdown(guide: ExecutableVideoProductionGuide) -> str:
         "",
     ]
 
-    # 十三、最终检查清单 --------------------------------------------------
-    parts += [f"## {_SECTION_TITLES['checklist']}", "", "成片导出前逐项打勾：", ""]
+    # 最终检查清单 ----------------------------------------------------------
+    parts += [
+        f"## {_cn_num(13 + clip_count)}、最终检查清单",
+        "",
+        "成片导出前逐项打勾：",
+        "",
+    ]
     parts += [str(item) for item in guide.final_checklist if str(item).strip()]
     parts.append("")
     return "\n".join(parts).rstrip() + "\n"

@@ -36,6 +36,16 @@ supports_negative_prompt: false
 negative_prompt_strategy: positive_phrasing_only
 # Conservative default: no official evidence of @named-reference syntax.
 reference_prompt_syntax: textual_anchor
+# Runway platform UI wording (task #63/#64): never hard-code Veo's
+# "Ingredients" vocabulary onto a different vendor's workflow.
+platform_terms:
+  start_frame: "Input Image"
+  reference_images: "References"
+  character_reference: "Character Reference"
+  location_reference: "Location Reference"
+  prompt_field: "Prompt"
+# In-frame readable text is unreliable; composite readable text in post.
+screen_text_strategy: post_composite
 prompt_language_preferences:
   - en
 prompt_strategy:

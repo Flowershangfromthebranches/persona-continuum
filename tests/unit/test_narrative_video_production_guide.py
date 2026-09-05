@@ -70,19 +70,22 @@ _COPY_READY_MARKERS = (
 )
 
 _SECTION_TITLES = (
-    "一、制作目标",
-    "二、目标视频模型与基础参数",
-    "三、需要提前准备的永久参考素材",
-    "四、本集专用场景/道具素材",
-    "五、本集视频结构总览",
-    "六、逐 Clip 工单",
-    "七、尾帧接续流程",
-    "八、字幕时间轴",
-    "九、对白与音效时间轴（含画面合成建议）",
-    "十、BGM",
-    "十一、剪辑与转场",
-    "十二、最终成片顺序",
-    "十三、最终检查清单",
+    "一、制作目标与基础设置",
+    "二、先建立永久角色参考素材",
+    "三、本集需要建立的场景参考素材",
+    "四、关键道具 / UI / 屏幕与开镜画面素材",
+    "五、整集视频结构",
+    "六、视频 1",
+    "七、视频 2",
+    "八、视频 3",
+    "九、尾帧接首帧完整流程",
+    "十、字幕时间轴",
+    "十一、手机 / 邮件 / UI 后期合成方案",
+    "十二、对白与环境音",
+    "十三、SFX",
+    "十四、BGM 完整生成 Prompt",
+    "十五、剪辑顺序与转场",
+    "十六、最终检查清单",
 )
 
 
@@ -132,10 +135,10 @@ def _build_fixtures(
             camera="high-angle",
             movement="slow pull",
             characters=[char_names[1]],
-            action=f"{char_names[1]}在空旷的工位之间停下，呼出一口气",
+            action=f"{char_names[1]}在{loc_names[1]}的围栏边停下，呼出一口气",
             dialogue="就这么定了",
-            location=loc_ids[0],
-            visual_intent=f"{char_names[1]}独自站在空旷的工位之间",
+            location=loc_ids[1],
+            visual_intent=f"{char_names[1]}独自站在{loc_names[1]}的围栏边",
             sfx=["远处城市低鸣"],
         ),
     ]
@@ -210,7 +213,6 @@ def _build_fixtures(
             dialogue=[{"speaker": char_names[0], "line": "你看到手机上的邮件了吗？"}],
             audio_intent=["雨声渐强"],
             continuity_constraints=[
-                "previous_clip_end_frame",
                 "手机屏幕上的时间显示为 23:47",
             ],
             purpose="开场悬念：神秘邮件抵达",
@@ -229,7 +231,7 @@ def _build_fixtures(
             environment_motion="走廊尽头的灯忽明忽暗",
             dialogue=[{"speaker": char_names[1], "line": "把它交给我"}],
             audio_intent=["脚步声接近"],
-            continuity_constraints=["previous_clip_end_frame"],
+            continuity_constraints=[],
             purpose="相遇与信物交接",
         ),
         GenerationClip(
@@ -237,16 +239,16 @@ def _build_fixtures(
             clip_number=3,
             source_shot_numbers=[3],
             duration_seconds=8.0,
-            location=loc_ids[0],
+            location=loc_ids[1],
             character_ids=[char_ids[1]],
             prop_ids=[],
-            visual_intent=f"{char_names[1]}独自站在空旷的工位之间",
+            visual_intent=f"{char_names[1]}独自站在{loc_names[1]}的围栏边",
             camera_intent="缓慢拉远至全景",
             subject_motion=f"{char_names[1]}呼出一口气，肩膀放松下来",
             environment_motion="云层在天窗外缓缓移动",
             dialogue=[],
             audio_intent=["远处城市低鸣"],
-            continuity_constraints=[],
+            continuity_constraints=["previous_clip_end_frame"],
             purpose="收束：决意与释然",
         ),
     ]
@@ -304,11 +306,11 @@ def test_analyze_classifies_assets_from_structure_not_names() -> None:
     locations = [asset for asset in assets if asset.asset_type == "location"]
     assert {asset.location_id for asset in locations} == {"office", "rooftop"}
     office = next(asset for asset in locations if asset.location_id == "office")
-    assert office.necessity == "required"  # referenced by 2 clips
+    assert office.necessity == "recommended"  # referenced by 1 clip
     assert office.asset_key.startswith("@LOC_")
     assert office.asset_key.endswith("_MASTER")
     rooftop = next(asset for asset in locations if asset.location_id == "rooftop")
-    assert rooftop.necessity == "recommended"  # referenced by 1 clip
+    assert rooftop.necessity == "required"  # referenced by 2 clips
 
     props = [asset for asset in assets if asset.asset_type == "prop"]
     assert len(props) == 1
@@ -320,17 +322,34 @@ def test_analyze_classifies_assets_from_structure_not_names() -> None:
     assert styles[0].necessity == "optional"
     assert styles[0].asset_key == "@STYLE_MASTER"
 
+    # Scene Start Frames (task #19/#20): clips 1 and 2 open scenes via
+    # image-to-video (characters present + generic profile supports i2v).
+    starts = [asset for asset in assets if asset.asset_type == "start_frame"]
+    assert {asset.asset_key for asset in starts} == {
+        "@EP01_CLIP01_START",
+        "@EP01_CLIP02_START",
+    }
+    for start in starts:
+        assert start.necessity == "required"
+        assert start.status == "PROMPT_READY"
+        assert "OPENING STILL FRAME" in start.generation_prompt
+        assert "SUBJECT AND OPENING ACTION" in start.generation_prompt
+        assert start.asset_key in start.generation_prompt
+    clip1_start = next(a for a in starts if a.asset_key == "@EP01_CLIP01_START")
+    assert clip1_start.compiler_trace["clip_number"] == 1
+
+    # Reference frames: only clip 2 chains into clip 3 (same location).
     frames = [asset for asset in assets if asset.asset_type == "reference_frame"]
-    assert {asset.name for asset in frames} == {"FRAME_01", "FRAME_02"}
+    assert {asset.name for asset in frames} == {"FRAME_02"}
     for frame in frames:
         assert frame.status == "NEEDED"  # capture instruction, not an image
         assert "Start Frame" in frame.generation_prompt
         assert "保存命名：" in frame.generation_prompt
         assert "片尾" in frame.generation_prompt
-    frame_01 = next(asset for asset in frames if asset.name == "FRAME_01")
-    assert "Clip 01" in frame_01.generation_prompt
-    assert frame_01.compiler_trace["source_clip"] == 1
-    assert frame_01.compiler_trace["target_clip"] == 2
+    frame_02 = next(asset for asset in frames if asset.name == "FRAME_02")
+    assert "视频 02" in frame_02.generation_prompt
+    assert frame_02.compiler_trace["source_clip"] == 2
+    assert frame_02.compiler_trace["target_clip"] == 3
 
 
 def test_analyze_classification_survives_fixture_rename() -> None:
@@ -351,7 +370,8 @@ def test_analyze_classification_survives_fixture_rename() -> None:
     assert sorted(by_type["location"]) == ["recommended", "required"]
     assert by_type["prop"] == ["recommended"]
     assert by_type["style"] == ["optional"]
-    assert sorted(by_type["reference_frame"]) == ["required", "required"]
+    assert sorted(by_type["start_frame"]) == ["required", "required"]
+    assert by_type["reference_frame"] == ["required"]
     keys = {asset.asset_key for asset in assets}
     assert "@CHAR_老陈_MASTER" in keys  # CJK names stay verbatim in the key
     assert "@LOC_码头仓库_MASTER" in keys
@@ -413,24 +433,29 @@ def test_build_reference_asset_prompts_refills_blank_assets_deterministically(
 # ----------------------------------------------------------------------
 # Frame chain
 # ----------------------------------------------------------------------
-def test_frame_chain_links_three_clips() -> None:
-    _production, prompt_package, _profile = _build_fixtures()
+def test_frame_chain_location_aware_with_scene_starts() -> None:
+    """Chaining is location-aware (task #19/#62): same-location clips chain via
+    FRAME tokens; a scene change opens a dedicated Scene Start Frame instead
+    of physically continuing the previous shot."""
+    _production, prompt_package, profile = _build_fixtures()
     clips = sorted(prompt_package.clips, key=lambda clip: clip.clip_number)
-    chain = build_frame_chain(clips)
+    chain = build_frame_chain(clips, profile, 1)
     first = chain["clips"]["1"]
     assert first["start_frame"] is None
-    assert first["produces_next_start_frame"] is True
-    assert first["end_frame_saved"] == "FRAME_01"
+    assert first["scene_start_frame"] == "@EP01_CLIP01_START"  # opens the episode
+    assert first["produces_next_start_frame"] is False  # next clip changes scene
     second = chain["clips"]["2"]
-    assert second["start_frame"] == "FRAME_01"
+    assert second["start_frame"] is None  # office -> rooftop scene change
+    assert second["scene_start_frame"] == "@EP01_CLIP02_START"
     assert second["produces_next_start_frame"] is True
     assert second["end_frame_saved"] == "FRAME_02"
     third = chain["clips"]["3"]
-    assert third["start_frame"] == "FRAME_02"
+    assert third["start_frame"] == "FRAME_02"  # same location: chain continues
+    assert third["scene_start_frame"] is None
     assert third["produces_next_start_frame"] is False
-    assert chain["frame_plans"]["2"] == {
-        "carry_in_start_frame": "FRAME_01",
-        "produces_next_start_frame": True,
+    assert chain["frame_plans"]["3"] == {
+        "carry_in_start_frame": "FRAME_02",
+        "produces_next_start_frame": False,
     }
     assert chain["total_clips"] == 3
     assert chain["diagram"][-1].startswith("Clip 03")
@@ -452,6 +477,7 @@ def test_build_executable_guide_full_structure() -> None:
     assert guide.target_profile_id == profile.id
     assert guide.stale is False
     assert guide.title.startswith("EP01")
+    assert guide.title.endswith("AI视频完整制作方案")
 
     overview = guide.overview
     assert overview["clip_count"] == 3
@@ -461,23 +487,23 @@ def test_build_executable_guide_full_structure() -> None:
     assert overview["base_params"]["target_model"] == profile.display_name
     # textual_anchor profiles translate into operational wording, not flags.
     assert any("文字锚点" in line for line in overview["operation_notes"])
+    assert overview["platform_terms"]["start_frame"] == "Start Frame"
     assert overview["shot_narrative"]["1"]
 
-    # runtime_trace carries the section KEYS; the rendered titles live in
-    # the markdown (asserted in the idempotency test below).
     assert list(guide.runtime_trace["sections"]) == [
         "goal",
-        "model",
-        "permanent_assets",
-        "episode_assets",
-        "overview",
+        "character_assets",
+        "location_assets",
+        "prop_ui_assets",
+        "episode_structure",
         "clip_work_orders",
-        "continuity",
+        "frame_workflow",
         "subtitles",
+        "screen_composite",
         "dialogue_sound",
+        "sfx",
         "bgm",
         "editing",
-        "final_order",
         "checklist",
     ]
 
@@ -489,15 +515,24 @@ def test_build_executable_guide_full_structure() -> None:
         for marker in _COPY_READY_MARKERS:
             assert marker in clip.copy_ready_prompt, (number, marker)
         _assert_no_placeholders(clip.copy_ready_prompt)
+        # Stable ordered dedupe (task #30): no repeated constraint rows.
+        constraints = clip.continuity_constraints
+        assert len(constraints) == len(set(constraints)), constraints
+        # One resolved user-facing start-frame token per clip (task #12).
+        assert clip.start_frame_asset_key, number
     # Scene / character identity text comes from the bibles (self-contained).
     assert CHAR_TEXTS[0] in by_number[1].copy_ready_prompt
     assert LOC_TEXTS[0] in by_number[1].copy_ready_prompt
     assert "你看到手机上的邮件了吗" in by_number[1].copy_ready_prompt
+    # Clip 1 opens via its scene start frame token.
+    assert by_number[1].start_frame_asset_key == "EP01_CLIP01_START"
+    assert "@EP01_CLIP01_START" in by_number[1].copy_ready_prompt
+    # Clip 2 changes scene: its own start frame, not a carried frame.
+    assert by_number[2].start_frame_asset_key == "EP01_CLIP02_START"
     assert CHAR_TEXTS[1] in by_number[2].copy_ready_prompt
     assert LOC_TEXTS[1] in by_number[2].copy_ready_prompt
-    assert "START FRAME: use the provided START FRAME image" in (
-        by_number[2].copy_ready_prompt
-    )
+    # Clip 3 chains physically from clip 2's tail frame.
+    assert by_number[3].start_frame_asset_key == "FRAME_02"
     assert "START FRAME: use the provided START FRAME image" in (
         by_number[3].copy_ready_prompt
     )
@@ -505,14 +540,16 @@ def test_build_executable_guide_full_structure() -> None:
 
     frame_chain = guide.frame_chain["clips"]
     assert frame_chain["1"]["start_frame"] is None
-    assert frame_chain["2"]["start_frame"] == "FRAME_01"
+    assert frame_chain["1"]["scene_start_frame"] == "@EP01_CLIP01_START"
+    assert frame_chain["2"]["start_frame"] is None
+    assert frame_chain["2"]["scene_start_frame"] == "@EP01_CLIP02_START"
     assert frame_chain["3"]["start_frame"] == "FRAME_02"
     assert frame_chain["3"]["produces_next_start_frame"] is False
 
     # Screen composite: clip 1 mentions 手机/邮件 → diegetic readable text.
     screen = guide.screen_composite_plan
     assert screen and screen[0]["clip_number"] == 1
-    assert screen[0]["category"] == "画面真实可读文本"
+    assert screen[0]["category"].startswith("画面真实可读文本")
     assert {"手机", "邮件"} & set(screen[0]["matched"])
 
     # Subtitle plan mirrors the subtitle track.
@@ -531,8 +568,11 @@ def test_build_executable_guide_full_structure() -> None:
     assert sound_by_clip[3]["key_sfx"] == ["远处城市低鸣"]
     assert sound_by_clip[1]["environment"] == ["雨声渐强"]
 
+    # BGM: one COMPLETE music prompt (task #38/#39).
     bgm = guide.bgm_plan
     assert len(bgm["prompt"]) > 300
+    for section in ("OVERALL STYLE:", "INSTRUMENTATION:", "EMOTIONAL ARC:", "MIX:", "STRICT:"):
+        assert section in bgm["prompt"], section
     assert "00:00" in bgm["prompt"]
     assert bgm["total_duration_seconds"] == 19.0
     assert [segment["clip_number"] for segment in bgm["segments"]] == [1, 2, 3]
@@ -548,12 +588,27 @@ def test_build_executable_guide_full_structure() -> None:
     _assert_no_placeholders(guide.markdown_document)
 
 
-def test_guide_markdown_renders_all_thirteen_sections_idempotently() -> None:
+def test_guide_markdown_renders_all_sections_idempotently() -> None:
     production, prompt_package, profile = _build_fixtures()
     guide = _build_guide(production, prompt_package, profile)
     markdown = guide.markdown_document
     for title in _SECTION_TITLES:
-        assert title in markdown
+        assert title in markdown, title
+    # 《视频生成模型.md》 structure markers (task #8/#10/#31).
+    assert markdown.startswith("# EP01《")
+    assert "AI视频完整制作方案" in markdown.splitlines()[1]
+    assert "### 素材1：@CHAR_" in markdown
+    assert "这张图不是一个视频分镜" in markdown
+    assert "完整图片生成 Prompt（直接复制到图片生成工具）：" in markdown
+    assert "## 使用方式" in markdown
+    assert "生成模式：" in markdown
+    assert "### Start Frame" in markdown
+    assert "### Ingredients / References" in markdown
+    assert "### Prompt 1" in markdown
+    assert "### 视频2生成完成以后" in markdown
+    assert "保存为：" in markdown
+    assert "作为视频 3 的 Start Frame。" in markdown  # clip 2 chains into clip 3
+    assert "尾帧接首帧完整流程" in markdown
     assert render_guide_markdown(guide) == markdown
 
 
@@ -658,3 +713,113 @@ def test_apply_clip_prompt_enrichment_merges_by_clip_id_and_rejects_placeholders
     )
     # Inputs are never mutated.
     assert clip.copy_ready_prompt == baseline_prompt
+
+
+# ----------------------------------------------------------------------
+# CharacterVisualIdentity synthesis (task #13/#14)
+# ----------------------------------------------------------------------
+def test_thin_bible_triggers_synthesized_visual_identity() -> None:
+    """A character whose bible lacks concrete visual cues gets a FIXED
+    synthesized identity (age/face/hair/body/costume), never a generic
+    'East Asian woman' placeholder — and the same seed always yields the
+    same identity (reuse across episodes)."""
+    from persona_continuum.narrative.video_production_guide import (
+        synthesize_character_visual_identity,
+    )
+
+    first = synthesize_character_visual_identity(
+        "proj_guide", "fang", "方宁", "办公室职员，神情焦虑"
+    )
+    second = synthesize_character_visual_identity(
+        "proj_guide", "fang", "方宁", "办公室职员，神情焦虑"
+    )
+    assert first == second  # deterministic per (project, character)
+    assert first["source"] == "synthesized"
+    for field in (
+        "age",
+        "gender",
+        "face_shape",
+        "eyes",
+        "hair",
+        "height",
+        "body",
+        "costume",
+        "color_palette",
+        "temperament",
+    ):
+        assert first[field], field
+    # Extracted story cues win over seeded defaults.
+    aged = synthesize_character_visual_identity(
+        "proj_guide", "fang", "方宁", "29岁，穿着深灰色连帽衫"
+    )
+    assert aged["age"] == "29 years old"
+    assert "连帽衫" in aged["costume"]
+    # Different characters get different designs.
+    other = synthesize_character_visual_identity(
+        "proj_guide", "lin", "林薇", "办公室职员，神情焦虑"
+    )
+    assert other != first
+
+
+def test_guide_synthesizes_identity_for_thin_bible_character() -> None:
+    production, prompt_package, profile = _build_fixtures()
+    # Thin out one character's bible and enrich the other: the thin entry
+    # must get a fixed synthesized identity, the rich one stays untouched.
+    thin_bible = [
+        {"character_id": "lin_wan", "name": "林晚", "visual_description": "职员"},
+        {
+            **production.character_visual_bible[1],
+            "visual_description": (
+                CHAR_TEXTS[1] + "身高175，黑色短发，眼神坚毅，体型偏瘦"
+            ),
+        },
+    ]
+    production = production.model_copy(
+        update={"character_visual_bible": thin_bible}
+    )
+    guide = _build_guide(production, prompt_package, profile)
+    thin = next(
+        asset
+        for asset in guide.required_assets
+        if asset.character_id == "lin_wan"
+    )
+    assert thin.visual_identity.get("source") == "synthesized"
+    assert thin.visual_identity.get("age")
+    assert "Synthesized fixed visual identity" in thin.generation_prompt
+    # The copy-ready prompt embeds the synthesized identity too (task #11).
+    clip1 = next(
+        clip for clip in guide.clip_workflows if clip.clip_number == 1
+    )
+    assert "Synthesized fixed visual identity" in clip1.copy_ready_prompt
+    # Rich bibles stay untouched (no synthesis).
+    rich = next(
+        asset
+        for asset in guide.required_assets
+        if asset.character_id == "a_kai"
+    )
+    assert rich.visual_identity.get("source") != "synthesized"
+    assert CHAR_TEXTS[1] in rich.generation_prompt
+
+
+def test_build_guide_with_sub_locations_succeeds() -> None:
+    """Clips with hierarchical sub-locations (e.g. 智源科技大厦·运营部开放工位)
+    resolve against parent bible entries and build complete guides without error."""
+    production, prompt_package, profile = _build_fixtures(
+        loc_ids=("loc_mindcore_hq", "loc_crossroad"),
+        loc_names=("智源科技总部大楼（MindCore Tower）", "滨海大道十字路口"),
+    )
+    clips_with_sub_locs = [
+        prompt_package.clips[0].model_copy(update={"location": "智源科技大厦·运营部开放工位"}),
+        prompt_package.clips[1].model_copy(update={"location": "智源科技大厦·茶水间外走廊"}),
+        prompt_package.clips[2].model_copy(update={"location": "智源科技大厦外·街角至十字路口"}),
+    ]
+    prompt_package = prompt_package.model_copy(update={"clips": clips_with_sub_locs})
+    guide = _build_guide(production, prompt_package, profile)
+
+    assert guide.status == "ready"
+    assert len(guide.clip_workflows) == 3
+    for clip in guide.clip_workflows:
+        assert clip.copy_ready_prompt
+        assert "ENVIRONMENT IDENTITY" in clip.copy_ready_prompt
+        assert clip.location in clip.copy_ready_prompt
+
