@@ -123,7 +123,8 @@ life stages，按事件时间而不是发表年份映射证据；主动执行失
 
 FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT = """
 你的目标是为 Persona Continuum 构建具有作品正史（Canon）严格约束的已有作品角色数字人格。
-1. 首先确认作品与角色身份，区分官方正史（Canon）、官方补充资料（Official Supplement）与粉丝/社区二创解读（Fan Interpretation）。
+1. 首先确认作品与角色身份，区分官方正史（Canon）、官方补充资料
+（Official Supplement）与粉丝/社区二创解读（Fan Interpretation）。
 2. 优先检索原著剧情、官方设定集、卡面剧情、角色台词对白、创作者访谈。
 3. 研究角色在作品各主线篇章/个人线中的心理与行为变化、关系模式、防御机制、核心价值观与潜在矛盾。
 4. 绝对严禁将同人二创、玩家社区猜测当作官方设定；对 Canon 存疑或剧情未揭示内容明确标注 uncertainty。
@@ -1335,7 +1336,9 @@ class PersonaCreationOrchestrator:
             user_defined_facts=str(user_defined_facts).strip() if user_defined_facts else None,
             research_mode=str(research_mode or "auto"),
             web_scope=str(web_scope) if web_scope else None,
-            research_instructions=str(research_instructions).strip() if research_instructions else None,
+            research_instructions=(
+                str(research_instructions).strip() if research_instructions else None
+            ),
             persona_id=persona.id,
             compilation_task_id=task.id,
             research_policy=policy,
@@ -2919,8 +2922,18 @@ class PersonaCreationOrchestrator:
             self._tasks.pop(job_id, None)
 
     async def _research_public(self, job: PersonaCreationJob) -> None:
-        from persona_continuum.application.identity_resolver import IdentityResolver, ResearchQueryBuilder
-        from persona_continuum.domain.identity import IdentitySpec, SubjectKind
+        from persona_continuum.application.identity_resolver import (
+            IdentityResolver,
+            ResearchQueryBuilder,
+        )
+        from persona_continuum.domain.identity import (
+            IdentitySpec,
+            LifeStatus,
+            PrivacyScope,
+            ResearchMode,
+            SubjectKind,
+            WebResearchScope,
+        )
 
         # Phase 1: Identity Resolution
         spec = IdentitySpec(
@@ -2928,12 +2941,12 @@ class PersonaCreationOrchestrator:
             aliases=job.aliases,
             subject_kind=SubjectKind(getattr(job, "subject_kind", "real_person") or "real_person"),
             work_or_universe=job.work_or_universe,
-            life_status=getattr(job, "life_status", "unknown") or "unknown",
-            privacy_scope=getattr(job, "privacy_scope", "public") or "public",
+            life_status=LifeStatus(job.life_status or LifeStatus.UNKNOWN),
+            privacy_scope=PrivacyScope(job.privacy_scope or PrivacyScope.PUBLIC),
             identity_context=job.identity_context,
             user_defined_facts=job.user_defined_facts,
-            research_mode=getattr(job, "research_mode", "auto") or "auto",
-            web_scope=getattr(job, "web_scope", None),
+            research_mode=ResearchMode(job.research_mode or ResearchMode.AUTO),
+            web_scope=WebResearchScope(job.web_scope) if job.web_scope else None,
             research_instructions=job.research_instructions,
         )
         resolved = IdentityResolver.resolve_spec(spec)
@@ -2953,8 +2966,12 @@ class PersonaCreationOrchestrator:
         raw_negative = list(plan.get("negative_evidence_queries") or [])
 
         plan["queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_queries)
-        plan["contradiction_search_queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_contradiction)
-        plan["negative_evidence_queries"] = ResearchQueryBuilder.build_queries(spec, resolved, raw_negative)
+        plan["contradiction_search_queries"] = ResearchQueryBuilder.build_queries(
+            spec, resolved, raw_contradiction
+        )
+        plan["negative_evidence_queries"] = ResearchQueryBuilder.build_queries(
+            spec, resolved, raw_negative
+        )
 
         life_stage_model = LifeStageModel.from_plan(plan)
         job.life_stages = [stage.model_dump(mode="json") for stage in life_stage_model.life_stages]
@@ -3675,15 +3692,31 @@ class PersonaCreationOrchestrator:
         return plan
 
     async def _research_plan(self, job: PersonaCreationJob) -> dict[str, Any]:
-        is_fictional = getattr(job, "subject_kind", "") == "fictional_character" or bool(job.work_or_universe)
-        system_prompt = FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT if is_fictional else PUBLIC_RESEARCH_SYSTEM_PROMPT
+        is_fictional = (
+            job.subject_kind == "fictional_character" or bool(job.work_or_universe)
+        )
+        system_prompt = (
+            FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT
+            if is_fictional
+            else PUBLIC_RESEARCH_SYSTEM_PROMPT
+        )
 
         instructions = [
-            "跨越剧情篇章/阶段生成研究查询（原著出场、主线推进、个人支线、重大转折与高光）" if is_fictional else "跨越人物生命和事业阶段生成研究查询",
-            "包含官方设定、原著对白/剧情、官方访谈、剧情冲突、人设争议与性格转变" if is_fictional else "包含第一人称、官方、传记、长期报道、批评、失败、争议和观点变化",
+            (
+                "跨越剧情篇章/阶段生成研究查询（原著出场、主线推进、个人支线、重大转折与高光）"
+                if is_fictional
+                else "跨越人物生命和事业阶段生成研究查询"
+            ),
+            (
+                "包含官方设定、原著对白/剧情、官方访谈、剧情冲突、人设争议与性格转变"
+                if is_fictional
+                else "包含第一人称、官方、传记、长期报道、批评、失败、争议和观点变化"
+            ),
             "不要把转载同源内容或同人二创作为独立 Canon 来源",
-            "动态识别角色的重要剧情阶段（Canon stages）；每个阶段返回 id、title、start、end、significance、required_evidence",
-            "主动规划 contradiction_search_queries 和 negative_evidence_queries（如人设矛盾、谎言与真实意图、剧情挫败）",
+            "动态识别角色的重要剧情阶段（Canon stages）；每个阶段返回 id、title、start、"
+            "end、significance、required_evidence",
+            "主动规划 contradiction_search_queries 和 negative_evidence_queries"
+            "（如人设矛盾、谎言与真实意图、剧情挫败）",
         ]
         if job.work_or_universe:
             instructions.append(f"必须明确围绕作品世界观《{job.work_or_universe}》进行检索，排除无关同名实体")
@@ -5273,7 +5306,7 @@ class PersonaCreationOrchestrator:
                 if source_id and source_id not in merged.get("source_ids", []):
                     merged.setdefault("source_ids", []).append(source_id)
 
-        # Absolute guarantee: ensure all referenced source_ids in claims and memories are in source_ids
+        # Ensure every source referenced by claims or memories appears in source_ids.
         referenced_source_ids = {
             str(c.get("source_id"))
             for c in (merged.get("claims") or []) + (merged.get("memories") or [])
@@ -5872,9 +5905,17 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         await self._emit(job, "persona_interview_question", **question)
 
     async def _ingest_configured_materials(self, job: PersonaCreationJob) -> None:
-        # If user explicitly provided user_defined_facts, ingest them as authoritative initial Evidence
-        if job.user_defined_facts and job.persona_id and not any("user_defined_facts" in str(s) for s in job.source_ids):
-            provenance_kind = "fictional_author_defined" if getattr(job, "subject_kind", "") in {"fictional_character", "original_character"} else "user_provided"
+        # Treat explicit user facts as the initial authoritative evidence.
+        if (
+            job.user_defined_facts
+            and job.persona_id
+            and not any("user_defined_facts" in str(s) for s in job.source_ids)
+        ):
+            provenance_kind = (
+                "fictional_author_defined"
+                if job.subject_kind in {"fictional_character", "original_character"}
+                else "user_provided"
+            )
             try:
                 source = self.continuum.personas.add_source_text(
                     job.persona_id,
@@ -7848,16 +7889,40 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             failure_json=(dict(loads(row["failure_json"])) if row["failure_json"] else None),
             agent_call_audits=list(loads(row["agent_call_audits_json"] or "[]")),
             checkpoints=list(loads(row["checkpoints_json"] or "[]")),
-            subject_kind=str(row["subject_kind"]) if "subject_kind" in row_keys and row["subject_kind"] else "real_person",
+            subject_kind=(
+                str(row["subject_kind"])
+                if "subject_kind" in row_keys and row["subject_kind"]
+                else "real_person"
+            ),
             work_or_universe=row["work_or_universe"] if "work_or_universe" in row_keys else None,
-            life_status=str(row["life_status"]) if "life_status" in row_keys and row["life_status"] else "unknown",
-            privacy_scope=str(row["privacy_scope"]) if "privacy_scope" in row_keys and row["privacy_scope"] else "public",
+            life_status=(
+                str(row["life_status"])
+                if "life_status" in row_keys and row["life_status"]
+                else "unknown"
+            ),
+            privacy_scope=(
+                str(row["privacy_scope"])
+                if "privacy_scope" in row_keys and row["privacy_scope"]
+                else "public"
+            ),
             identity_context=row["identity_context"] if "identity_context" in row_keys else None,
-            user_defined_facts=row["user_defined_facts"] if "user_defined_facts" in row_keys else None,
-            research_mode=str(row["research_mode"]) if "research_mode" in row_keys and row["research_mode"] else "auto",
+            user_defined_facts=(
+                row["user_defined_facts"] if "user_defined_facts" in row_keys else None
+            ),
+            research_mode=(
+                str(row["research_mode"])
+                if "research_mode" in row_keys and row["research_mode"]
+                else "auto"
+            ),
             web_scope=row["web_scope"] if "web_scope" in row_keys else None,
-            research_instructions=row["research_instructions"] if "research_instructions" in row_keys else None,
-            resolved_identity=dict(loads(row["resolved_identity_json"] or "{}")) if "resolved_identity_json" in row_keys and row["resolved_identity_json"] else None,
+            research_instructions=(
+                row["research_instructions"] if "research_instructions" in row_keys else None
+            ),
+            resolved_identity=(
+                dict(loads(row["resolved_identity_json"] or "{}"))
+                if "resolved_identity_json" in row_keys and row["resolved_identity_json"]
+                else None
+            ),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )

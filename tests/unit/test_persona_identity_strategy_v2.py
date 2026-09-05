@@ -1,16 +1,14 @@
-import pytest
-from persona_continuum.domain.identity import (
-    IdentitySpec,
-    ResolvedIdentity,
-    SubjectKind,
-    LifeStatus,
-    PrivacyScope,
-    ResearchMode,
-    WebResearchScope,
-)
 from persona_continuum.application.identity_resolver import (
     IdentityResolver,
     ResearchQueryBuilder,
+)
+from persona_continuum.domain.identity import (
+    IdentitySpec,
+    LifeStatus,
+    PrivacyScope,
+    ResearchMode,
+    SubjectKind,
+    WebResearchScope,
 )
 
 

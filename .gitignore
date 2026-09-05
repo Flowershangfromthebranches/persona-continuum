@@ -14,8 +14,10 @@ build/
 *.zip
 personas/
 exports/
-!examples/taibuge/personas/
-!examples/taibuge/personas/*.persona.zip
+/conversations/
+/transcripts/
+/rooms/
+/memories/
 .persona-continuum/
 .env
 .env.*
@@ -24,6 +26,8 @@ exports/
 .commandcode/
 .qoder/
 .workbuddy-ai/
+.workbuddy/
+skills/cli-research-probe-diagnosis/
 /narrative-shooting-pipeline-report.canvas.*
 .agents/
 docs/superpowers/
