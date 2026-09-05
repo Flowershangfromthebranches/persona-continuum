@@ -94,7 +94,11 @@ class IdentitySpec(BaseModel):
         else:
             p_type = PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON
             if self.research_mode in {ResearchMode.WEB, ResearchMode.AUTO}:
-                mode = "public_research" if self.subject_kind == SubjectKind.FICTIONAL_CHARACTER else "fictional"
+                mode = (
+                    "public_research"
+                    if self.subject_kind == SubjectKind.FICTIONAL_CHARACTER
+                    else "fictional"
+                )
             elif self.research_mode == ResearchMode.HYBRID:
                 mode = "public_research"
             elif self.research_mode == ResearchMode.GUIDED_INTERVIEW:
@@ -134,7 +138,11 @@ class IdentitySpec(BaseModel):
             status = LifeStatus.DECEASED
             privacy = PrivacyScope.PRIVATE
         else:
-            kind = SubjectKind.FICTIONAL_CHARACTER if extra.get("work_or_universe") else SubjectKind.SYNTHETIC_PERSONA
+            kind = (
+                SubjectKind.FICTIONAL_CHARACTER
+                if extra.get("work_or_universe")
+                else SubjectKind.SYNTHETIC_PERSONA
+            )
             status = LifeStatus.NOT_APPLICABLE
             privacy = PrivacyScope.NOT_APPLICABLE
 

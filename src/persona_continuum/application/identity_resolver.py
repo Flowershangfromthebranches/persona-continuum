@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from persona_continuum.domain.identity import (
     IdentitySpec,
     ResolvedIdentity,
@@ -41,8 +38,11 @@ class ResearchQueryBuilder:
             if not q:
                 continue
 
-            if spec.subject_kind == SubjectKind.ORIGINAL_CHARACTER or scope == WebResearchScope.BACKGROUND_ONLY:
-                # OC rule: strip the character's personal name to avoid finding unrelated real people with the same name.
+            if (
+                spec.subject_kind == SubjectKind.ORIGINAL_CHARACTER
+                or scope == WebResearchScope.BACKGROUND_ONLY
+            ):
+                # Strip an OC's personal name to avoid unrelated real-person matches.
                 # Transform personal biographical queries into background/context research.
                 name = resolved.canonical_name or spec.display_name
                 background_query = q.replace(name, "").strip()
@@ -108,9 +108,14 @@ class IdentityResolver:
             subject_kind=spec.subject_kind,
             work_or_universe=work,
             life_status=spec.life_status,
-            confidence=0.95 if (work or spec.identity_context or spec.subject_kind == SubjectKind.REAL_PERSON) else 0.75,
+            confidence=(
+                0.95
+                if work
+                or spec.identity_context
+                or spec.subject_kind == SubjectKind.REAL_PERSON
+                else 0.75
+            ),
             positive_search_terms=positive_terms,
             negative_search_terms=negative_terms,
             summary=spec.identity_context or work or "",
         )
-

@@ -84,12 +84,11 @@ Web UI 与平行世界共用 `PersonaCreationOrchestrator`。创建任务可暂�
 - **Narrative Studio**：分离作者真相、角色知识和观众知识；预测分支在显式提交前不进入正史，
   并可生成面向 AI 视频制作的 Production Package。
 
-### 太卜阁可下载示例
+### 隐私安全的公开版本
 
-[`examples/taibuge/`](examples/taibuge/) 提供六个可导入的编译 Persona 包、内置
-“太卜阁 · 术数综合会诊”房间模板的使用说明，以及一次经过选择的房间对话演示。新建房间
-现在默认完全空白；选择模板后会按名称匹配这六位 Persona，使用者只需选择本机 Agent Host、
-模型和 Reasoning Effort。
+公开仓库不包含任何本地 Persona 包、人格材料、记忆、对话记录、房间状态、数据库、运行日志
+或诊断记录。新建房间默认完全空白；只有使用者主动选择模板或手动添加席位后才会写入配置。
+内置模板只提供通用的角色与协作配置，不附带可导入人格或真实对话数据。
 
 本版本不提供平行世界或叙事创作的用户演示与模板。术数/算命演算仅供娱乐与传统文化研究，
 请勿过度迷信；不构成投资、医疗、法律或其他专业建议。
@@ -166,13 +165,14 @@ OpenAI-compatible, cloud embedding, Zep Cloud, or other paid model APIs. The
 running Agent host performs natural-language research and reasoning, then
 submits structured artifacts to the local MCP server.
 
-## Downloadable Taibuge Demo
+## Privacy-Safe Public Release
 
-[`examples/taibuge/`](examples/taibuge/) contains six importable compiled Persona
-archives, instructions for the built-in `太卜阁 · 术数综合会诊` Room template,
-and one selected Room conversation demo. A new Room now opens completely blank.
-After selecting the template, the UI matches the six Personas by name; users
-only need to select a local Agent Host, model, and Reasoning Effort.
+The public repository contains no local Persona archives, persona source
+material, memories, conversation transcripts, Room state, databases, runtime
+logs, or diagnostic records. A new Room opens completely blank; configuration
+is applied only after the user explicitly selects a template or adds seats.
+Built-in templates contain generic role and collaboration settings only, with
+no importable Personas or real conversation data.
 
 This release provides no end-user demo or template for Parallel World or
 Narrative Studio. Divination output is for entertainment and traditional-culture
