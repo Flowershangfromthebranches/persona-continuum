@@ -7,10 +7,13 @@ its original provenance.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -18,14 +21,15 @@ from pydantic import BaseModel, Field
 
 from persona_continuum.agent.context_capability import (
     PLANNING_CONTEXT_WINDOW_TOKENS,
-    compute_preferred_working_context,
     compute_usable_budget,
     default_model_capability_registry,
 )
+from persona_continuum.agent.phase_policy import PhaseContextPolicy
 from persona_continuum.agent.prompt_transport import (
     PromptTransportCapability,
     capability_for_mode,
 )
+from persona_continuum.application.material_chat import CHAT_SOURCE_KINDS
 
 
 class ResolvedExecutionProfile(BaseModel):
@@ -47,6 +51,12 @@ class ResolvedExecutionProfile(BaseModel):
     planning_context_window: int = PLANNING_CONTEXT_WINDOW_TOKENS
     usable_context_budget: int | None = None
     preferred_working_context: int | None = None
+    remaining_context_tokens: int | None = None
+    remaining_context_verified: bool = False
+    remaining_context_source: str | None = None
+    phase_working_target: int | None = None
+    native_context_window: int | None = None
+    runtime_effective_context: int | None = None
     max_output_tokens: int | None = None
     supported_reasoning_efforts: list[str] = Field(default_factory=list)
     selected_reasoning_effort: str | None = None
@@ -57,6 +67,15 @@ class ResolvedExecutionProfile(BaseModel):
     prompt_transport: PromptTransportCapability | None = None
     persistent_session: bool = False
     parallel_safe: bool = False
+    adapter_session_mode: str = "unknown"
+    workload_context_scope: str = "unknown"
+    parallel_turns_same_session: bool = False
+    parallel_independent_sessions: bool = False
+    max_parallel_independent_sessions: int = 1
+    effective_independent_session_concurrency: int = 1
+    # Persistent verified capability resolved for this runtime (state, source,
+    # max_verified, current_recommended).  Telemetry only; never a model limit.
+    independent_session_capability: dict[str, Any] = Field(default_factory=dict)
     structured_output_mode: str = "prompt"
     streaming_mode: str = "unknown"
     model_selection_mode: str = "unknown"
@@ -65,6 +84,19 @@ class ResolvedExecutionProfile(BaseModel):
     web_fetch: bool = False
     browser: bool = False
     execution_locality: str = "unknown"
+
+    def classification_worker_count(self, configured_max: int = 4) -> int:
+        """Workers for independent AnalysisWindow sessions, never same-session turns."""
+
+        cap = max(1, int(configured_max or 1))
+        scope = str(self.workload_context_scope or "").casefold()
+        if scope == "persistent" and not self.parallel_turns_same_session:
+            return 1
+        if scope in {"per_window", "per_request"}:
+            if self.parallel_independent_sessions or self.parallel_safe:
+                return min(cap, max(1, int(self.effective_independent_session_concurrency or 1)))
+            return 1
+        return cap if self.parallel_safe else 1
 
     @property
     def effective_or_planning_window(self) -> int:
@@ -85,6 +117,35 @@ class ResolvedExecutionProfile(BaseModel):
         planning_context_window: int | None = None,
     ) -> ResolvedExecutionProfile:
         raw = dict(snapshot or {})
+        binding = raw.get("runtime_binding_snapshot")
+        if isinstance(binding, dict):
+            raw.setdefault("context_window", binding.get("context_window"))
+            raw.setdefault("remaining_context_tokens", binding.get("remaining_context_tokens"))
+            raw.setdefault(
+                "remaining_context_verified", binding.get("remaining_context_verified")
+            )
+            if binding.get("context_window_source"):
+                raw.setdefault("context_window_source", binding.get("context_window_source"))
+            raw.setdefault("effective_model", binding.get("effective_model"))
+        effective_caps = raw.get("effective_model_capabilities")
+        if isinstance(effective_caps, dict):
+            for key in (
+                "native_context_window",
+                "effective_context_window",
+                "remaining_context_tokens",
+                "remaining_context_verified",
+                "remaining_context_source",
+                "usable_context_budget",
+                "preferred_working_context",
+                "phase_working_target",
+                "context_capability_source",
+                "context_verified",
+                "prompt_transport",
+            ):
+                if effective_caps.get(key) is not None:
+                    raw.setdefault(key, effective_caps.get(key))
+            if effective_caps.get("effective_context_window") is not None:
+                raw.setdefault("context_window", effective_caps.get("effective_context_window"))
         capabilities = raw.get("capabilities")
         if not isinstance(capabilities, dict):
             capabilities = {}
@@ -101,7 +162,8 @@ class ResolvedExecutionProfile(BaseModel):
                 {},
             )
         context_value = (
-            model.get("context_window")
+            raw.get("effective_context_window")
+            or model.get("context_window")
             or raw.get("context_window")
             or capabilities.get("context_window")
         )
@@ -121,7 +183,7 @@ class ResolvedExecutionProfile(BaseModel):
             )
             if registry_window is not None:
                 context_window = registry_window
-                context_source = "model_registry"
+                context_source = "provider_official_registry"
             else:
                 context_window = None
                 context_source = "unknown"
@@ -134,9 +196,47 @@ class ResolvedExecutionProfile(BaseModel):
         persistent = bool(
             capabilities.get("persistent_session", raw.get("persistent_session", False))
         )
+        workload_scope = str(
+            raw.get("workload_context_scope")
+            or capabilities.get("workload_context_scope")
+            or ""
+        ).strip().casefold()
+        adapter_mode = str(
+            raw.get("adapter_session_mode")
+            or capabilities.get("adapter_session_mode")
+            or ""
+        ).strip().casefold()
+        parallel_turns = bool(capabilities.get("parallel_turns_same_session", False))
+        parallel_independent = bool(
+            raw.get("parallel_independent_sessions")
+            or capabilities.get("parallel_independent_sessions")
+            or False
+        )
+        max_independent = (
+            _positive_int(
+                raw.get("max_parallel_independent_sessions")
+                or capabilities.get("max_parallel_independent_sessions")
+            )
+            or 1
+        )
+        capability_raw = raw.get("independent_session_capability")
+        independent_capability = dict(capability_raw) if isinstance(capability_raw, dict) else {}
         parallel_value = capabilities.get("parallel_safe", raw.get("parallel_safe"))
-        # Stateless execution is independently callable unless explicitly denied.
-        parallel_safe = bool(not persistent if parallel_value is None else parallel_value)
+        if parallel_value is not None:
+            parallel_safe = bool(parallel_value)
+        elif workload_scope == "persistent":
+            parallel_safe = bool(parallel_turns)
+        elif workload_scope in {"per_window", "per_request"}:
+            parallel_safe = bool(parallel_independent) or (not persistent)
+        else:
+            # Legacy: a persistent-capable adapter is not parallel unless declared.
+            parallel_safe = bool(not persistent)
+        if workload_scope == "persistent" and not parallel_turns:
+            effective_independent = 1
+        elif parallel_independent or parallel_safe:
+            effective_independent = max(1, int(max_independent))
+        else:
+            effective_independent = 1
         raw_research = raw.get("research")
         research: dict[str, Any] = raw_research if isinstance(raw_research, dict) else {}
         # The resolved Adapter/Protocol transport capability travels with the
@@ -152,17 +252,33 @@ class ResolvedExecutionProfile(BaseModel):
             except (TypeError, ValueError):
                 prompt_transport = None
         elif isinstance(transport_raw, str) and transport_raw.strip():
-            prompt_transport = capability_for_mode(
-                transport_raw, source="snapshot_declared"
-            )
+            prompt_transport = capability_for_mode(transport_raw, source="snapshot_declared")
         return cls(
             adapter_id=str(raw.get("adapter_id") or raw.get("id") or "") or None,
             model_id=str(raw.get("effective_model") or raw.get("model_id") or model.get("id") or "")
             or None,
             context_window=context_window,
-            context_window_source=context_source,
-            context_capability_source=context_source,
-            context_verified=context_window is not None and context_source != "unknown",
+            context_window_source=str(
+                raw.get("context_capability_source") or context_source
+            ),
+            context_capability_source=str(
+                raw.get("context_capability_source") or context_source
+            ),
+            context_verified=bool(
+                raw.get("context_verified")
+                if "context_verified" in raw
+                else (
+                    context_window is not None
+                    and context_source
+                    not in {
+                        "unknown",
+                        "project_static_registry",
+                        "model_registry",
+                        "fallback_policy",
+                        "planning_fallback",
+                    }
+                )
+            ),
             planning_context_window=max(
                 1,
                 _positive_int(planning_context_window)
@@ -172,10 +288,22 @@ class ResolvedExecutionProfile(BaseModel):
             usable_context_budget=(
                 compute_usable_budget(context_window) if context_window is not None else None
             ),
-            preferred_working_context=compute_preferred_working_context(
-                context_window,
-                compute_usable_budget(context_window) if context_window is not None else None,
+            remaining_context_tokens=_positive_int(
+                raw.get("remaining_context_tokens") or model.get("remaining_context_tokens")
             ),
+            remaining_context_source=str(raw.get("remaining_context_source") or "") or None,
+            remaining_context_verified=bool(raw.get("remaining_context_verified"))
+            and str(raw.get("remaining_context_source") or "runtime_reported")
+            in {"", "runtime_reported"},
+            native_context_window=_positive_int(
+                raw.get("native_context_window") or model.get("native_context_window")
+            )
+            or context_window,
+            runtime_effective_context=_positive_int(
+                raw.get("effective_context_window") or raw.get("runtime_effective_context")
+            )
+            or context_window,
+            preferred_working_context=None,
             max_output_tokens=_positive_int(
                 model.get("max_output_tokens") or raw.get("max_output_tokens")
             ),
@@ -187,6 +315,13 @@ class ResolvedExecutionProfile(BaseModel):
             prompt_transport=prompt_transport,
             persistent_session=persistent,
             parallel_safe=parallel_safe,
+            adapter_session_mode=adapter_mode or "unknown",
+            workload_context_scope=workload_scope or "unknown",
+            parallel_turns_same_session=parallel_turns,
+            parallel_independent_sessions=parallel_independent,
+            max_parallel_independent_sessions=max(1, int(max_independent)),
+            effective_independent_session_concurrency=max(1, int(effective_independent)),
+            independent_session_capability=independent_capability,
             structured_output_mode=str(
                 capabilities.get("structured_output_mode")
                 or ("native" if capabilities.get("structured_output") else "prompt")
@@ -213,6 +348,31 @@ class AnalysisWindow(BaseModel):
     speaker_context: list[str] = Field(default_factory=list)
     temporal_context: list[str] = Field(default_factory=list)
     conversation_context: dict[str, Any] = Field(default_factory=dict)
+    # Episode spans contained in this window (episode-aware packing, P0.3-B).
+    # One entry per episode that contributed at least one unit; start/end are
+    # the span of THIS window's units, so a budget-split episode reports the
+    # contained slice rather than the full original span.
+    episodes: list[dict[str, Any]] = Field(default_factory=list)
+    flush_reason: str | None = None
+
+
+class EpisodeSpan(BaseModel):
+    """A semantic/context atomic conversation block (P0.3-B).
+
+    Built with the same rules as the persisted ConversationEpisode view
+    (source + conversation identity, then a time-gap boundary), but it is a
+    *planning* structure: an episode bounds what counts as one continuous
+    conversation, never how many model calls are made.  Dispatch packing may
+    place many episodes into one AnalysisWindow.
+    """
+
+    id: str
+    source_id: str
+    conversation_id: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    is_chat: bool = True
+    unit_ids: list[str] = Field(default_factory=list)
 
 
 class MaterialPromptState(StrEnum):
@@ -257,6 +417,7 @@ def material_batch_target_tokens(
     phase_usable_budget: int,
     serialization_margin_ratio: float = 0.08,
     floor_tokens: int = 256,
+    phase_policy: PhaseContextPolicy | None = None,
 ) -> int:
     """Single Material Classification batch target, in tokens.
 
@@ -272,10 +433,26 @@ def material_batch_target_tokens(
     explicitly allows it.
     """
 
+    remaining = profile.remaining_context_tokens
+    hard = remaining
+    if hard is None:
+        hard = profile.runtime_effective_context or profile.context_window
+    working = profile.phase_working_target
+    if working is None and phase_policy is not None:
+        working = phase_policy.working_target(
+            hard,
+            phase="material_classification",
+            usable_budget=phase_usable_budget,
+            verified=bool(profile.context_verified),
+            persistent_session=bool(profile.persistent_session),
+            fresh_stateless=not profile.persistent_session,
+        )
+    if working is not None:
+        profile.phase_working_target = working
+        profile.preferred_working_context = working
     candidates = [max(0, int(phase_usable_budget))]
-    preferred = profile.preferred_working_context
-    if preferred is not None:
-        candidates.append(max(0, int(preferred)))
+    if working is not None:
+        candidates.append(max(0, int(working)))
     transport = profile.prompt_transport
     if transport is not None:
         candidates.append(transport.prompt_token_budget())
@@ -283,11 +460,184 @@ def material_batch_target_tokens(
     return max(int(floor_tokens), target)
 
 
+# Envelope keys always present on a classification request.  Counted once as
+# base overhead so packing does not wait until Prompt Size Guard to discover
+# JSON punctuation, ids, and contracts.
+_CLASSIFY_ENVELOPE = {
+    "_participant_id": "persona_material_intelligence:aw_xxxxxxxxxxxxxxxx",
+    "analysis_window": {"id": "aw_xxxxxxxxxxxxxxxx", "source_ids": [], "episode_count": 0},
+    "episodes": [],
+    "target_units": [],
+    "context_units": [],
+    "units": [],
+    "episode_contract": (
+        "Episodes are independent conversation blocks: never connect "
+        "question/answer or reference relations across episodes; "
+        "preserve original order inside each episode."
+    ),
+    "source_context": {},
+    "allowed_dimensions": [],
+    "output_contract": (
+        "Return only target turns that contain independent persona "
+        "evidence. Omitted target turns are considered reviewed with "
+        "no independent evidence. Do not return reviewed_ids."
+    ),
+}
+_EPISODE_OVERHEAD_SAMPLE = {
+    "episode_id": "ep_xxxxxxxxxxxxxxxx",
+    "source_id": "source_xxxxxxxxxxxxxxxx",
+    "start_time": "2023-05-01T09:00:00+00:00",
+    "end_time": "2023-05-01T11:00:00+00:00",
+    "unit_ids": [],
+}
+_EPISODE_MARKERS = (
+    "[EPISODE_BEGIN id=ep_xxxxxxxxxxxxxxxx source_id=source_xxxxxxxx "
+    "start_time=2023-05-01T09:00:00+00:00 end_time=2023-05-01T11:00:00+00:00]"
+    "[EPISODE_END id=ep_xxxxxxxxxxxxxxxx]"
+)
+
+
+@dataclass(slots=True)
+class ClassificationRequestTokenEstimator:
+    """Approximate the final classification request, not just turn.text.
+
+    Prefer a mild overestimate.  Tokenizer-accurate equality is not required;
+    Prompt Size Guard remains the last safety net.
+    """
+
+    estimate_tokens: Callable[[Any], int]
+    margin_ratio: float = 0.08
+
+    def base_tokens(
+        self,
+        *,
+        system_prompt: str = "",
+        schema: Any = None,
+        source_context: Any = None,
+        extra_contracts: Sequence[str] = (),
+        allowed_dimensions: Sequence[str] = (),
+    ) -> int:
+        parts: list[Any] = [
+            system_prompt,
+            schema,
+            source_context or {},
+            dict(_CLASSIFY_ENVELOPE),
+            list(allowed_dimensions),
+            *list(extra_contracts),
+        ]
+        raw = sum(max(0, int(self.estimate_tokens(part) or 0)) for part in parts if part)
+        return int(raw * (1.0 + max(0.0, min(0.2, self.margin_ratio))))
+
+    def episode_overhead(self) -> int:
+        return max(
+            1,
+            int(self.estimate_tokens(_EPISODE_OVERHEAD_SAMPLE) or 0)
+            + int(self.estimate_tokens(_EPISODE_MARKERS) or 0),
+        )
+
+    def turn_tokens(self, row: dict[str, Any]) -> int:
+        # Row JSON plus the same id in target_units and episode.unit_ids.
+        ident = str(row.get("id") or "")
+        raw = int(self.estimate_tokens(row) or 0)
+        ident_tokens = int(self.estimate_tokens(ident) or 0)
+        return max(
+            1,
+            int((raw + ident_tokens * 2 + 10) * (1.0 + max(0.0, min(0.2, self.margin_ratio)))),
+        )
+
+    def estimate_request(
+        self,
+        *,
+        system_prompt: str = "",
+        schema: Any = None,
+        source_context: Any = None,
+        extra_contracts: Sequence[str] = (),
+        allowed_dimensions: Sequence[str] = (),
+        rows: Sequence[dict[str, Any]] = (),
+        episode_count: int = 1,
+    ) -> int:
+        total = self.base_tokens(
+            system_prompt=system_prompt,
+            schema=schema,
+            source_context=source_context,
+            extra_contracts=extra_contracts,
+            allowed_dimensions=allowed_dimensions,
+        )
+        total += self.episode_overhead() * max(0, int(episode_count))
+        total += sum(self.turn_tokens(dict(row)) for row in rows)
+        return total
+
+
 class MaterialPipelineMetrics(BaseModel):
     raw_evidence_units: int = 0
     unique_evidence_units: int = 0
     duplicate_evidence_units: int = 0
     analysis_windows: int = 0
+    # Large Conversation Pipeline V2 accounting.  These counts describe the
+    # chat -> Material Intelligence entry only; raw provenance rows are never
+    # merged or removed to make a number look better.
+    raw_message_count: int = 0
+    target_message_count: int = 0
+    context_message_count: int = 0
+    conversation_turn_count: int = 0
+    target_turn_count: int = 0
+    classification_worker_count: int = 0
+    effective_classification_workers: int = 0
+    active_classification_workers: int = 0
+    peak_active_classification_workers: int = 0
+    active_independent_sessions: int = 0
+    peak_independent_sessions: int = 0
+    workload_context_scope: str = "unknown"
+    adapter_session_mode: str = "unknown"
+    parallel_turns_same_session: bool = False
+    parallel_independent_sessions: bool = False
+    max_parallel_independent_sessions: int = 1
+    runtime_pool_leases: int = 0
+    runtime_pool_wait_ms: float = 0.0
+    context_capability_revision: int = 0
+    context_remaining_revision: int = 0
+    remaining_source: str | None = None
+    remaining_verified: bool = False
+    average_active_classification_workers: float = 0.0
+    classification_worker_seconds: float = 0.0
+    window_queue_depth: int = 0
+    peak_window_queue_depth: int = 0
+    window_queue_capacity: int = 0
+    classification_windows_dispatched: int = 0
+    # Adaptive concurrency retry telemetry.  A concurrency-limit window is
+    # requeued after a bounded downgrade; quota/payment failures are never
+    # downgraded and are counted separately.
+    window_retries: int = 0
+    window_retry_limit: int = 0
+    concurrency_downgrades: int = 0
+    concurrency_downgrade_events: list[dict[str, Any]] = Field(default_factory=list)
+    # Concurrency generation/epoch: one downgrade per generation, so a wave of
+    # simultaneous rejections cannot walk the ladder more than once.
+    concurrency_generation: int = 0
+    effective_concurrency: int = 0
+    stale_rejection_count: int = 0
+    stale_replayed_windows: int = 0
+    terminal_concurrency_failures: int = 0
+    rate_limit_replays: int = 0
+    provider_failure_kind: str | None = None
+    last_concurrency_failure_kind: str | None = None
+    non_retriable_capacity_failures: int = 0
+    independent_session_capability: dict[str, Any] = Field(default_factory=dict)
+    semantic_gate_mode: str = "full"
+    semantic_selected: int = 0
+    semantic_skipped: int = 0
+    semantic_skipped_messages: int = 0
+    semantic_reserve_selected: int = 0
+    semantic_bypass_count: int = 0
+    classification_windows_total: int = 0
+    classification_windows_completed: int = 0
+    target_turns_reviewed: int = 0
+    evidence_turns_extracted: int = 0
+    reviewed_no_independent_evidence: int = 0
+    average_turns_per_window: float = 0.0
+    max_turns_per_window: int = 0
+    agent_calls: int = 0
+    style_profile_status: str = "not_applicable"
     relation_candidate_groups: int = 0
     relation_candidate_evidence: int = 0
     deterministic_fusions: int = 0
@@ -315,7 +665,150 @@ class MaterialPipelineMetrics(BaseModel):
     transport_mode: str | None = None
     transport_max_prompt_bytes: int | None = None
     rebatched_windows: int = 0
+    rebatch_reasons: dict[str, int] = Field(default_factory=dict)
+    initial_analysis_windows: int = 0
+    packing_accuracy: float = 0.0
+    rebatched_window_ratio: float = 0.0
+    estimated_prompt_tokens_samples: list[int] = Field(default_factory=list, exclude=True)
+    actual_prompt_tokens_samples: list[int] = Field(default_factory=list, exclude=True)
+    estimation_error_samples: list[float] = Field(default_factory=list, exclude=True)
+    estimated_prompt_tokens_p50: float = 0.0
+    estimated_prompt_tokens_p95: float = 0.0
+    actual_prompt_tokens_p50: float = 0.0
+    actual_prompt_tokens_p95: float = 0.0
+    estimation_error_p50: float = 0.0
+    estimation_error_p95: float = 0.0
     chunked_oversized_units: int = 0
+    token_budget_utilization: float = 0.0
+    turn_cap_hit_count: int = 0
+    episode_cap_hit_count: int = 0
+    transport_cap_hit_count: int = 0
+    context_cap_hit_count: int = 0
+    native_context: int | None = None
+    runtime_effective: int | None = None
+    usable_context: int | None = None
+    phase_working_target: int | None = None
+    transport_token_budget: int | None = None
+    actual_prompt_tokens: int | None = None
+    utilization: float | None = None
+    # Episode-aware window packing (P0.3-C).  Averages/percentiles are
+    # derived from the raw samples via ``finalize_window_metrics``; samples
+    # themselves stay out of serialized payloads.
+    episodes_total: int = 0
+    episodes_per_window_avg: float = 0.0
+    episodes_per_window_max: int = 0
+    prompt_budget_utilization_avg: float = 0.0
+    prompt_budget_utilization_p50: float = 0.0
+    prompt_budget_utilization_p95: float = 0.0
+    episodes_per_window_samples: list[int] = Field(default_factory=list, exclude=True)
+    prompt_budget_utilization_samples: list[float] = Field(default_factory=list, exclude=True)
+
+    def stamp_execution_profile(
+        self, profile: ResolvedExecutionProfile, *, configured_max: int = 4
+    ) -> None:
+        self.workload_context_scope = str(profile.workload_context_scope or "unknown")
+        self.adapter_session_mode = str(profile.adapter_session_mode or "unknown")
+        self.parallel_turns_same_session = bool(profile.parallel_turns_same_session)
+        self.parallel_independent_sessions = bool(profile.parallel_independent_sessions)
+        self.max_parallel_independent_sessions = max(
+            1, int(profile.max_parallel_independent_sessions or 1)
+        )
+        workers = profile.classification_worker_count(configured_max)
+        self.classification_worker_count = workers
+        self.effective_classification_workers = workers
+        if profile.independent_session_capability:
+            self.independent_session_capability = dict(profile.independent_session_capability)
+        self.remaining_source = profile.remaining_context_source
+        self.remaining_verified = bool(profile.remaining_context_verified)
+        try:
+            from persona_continuum.performance.runtime_pool import default_runtime_pool
+
+            snap = default_runtime_pool().snapshot()
+            self.runtime_pool_leases = int(snap.get("active_leases") or 0)
+            self.runtime_pool_wait_ms = float(snap.get("wait_ms_total") or 0.0)
+        except Exception:
+            pass
+
+    def record_analysis_windows(
+        self, windows: Sequence[AnalysisWindow], *, target_tokens: int
+    ) -> None:
+        """Accumulate episode-packing counters for one dispatch batch."""
+
+        stats = window_episode_metrics(windows, target_tokens=target_tokens)
+        self.token_budget_utilization = float(stats.get("prompt_budget_utilization_avg") or 0.0)
+        for window in windows:
+            reason = str(getattr(window, "flush_reason", "") or "")
+            if reason == "unit_cap":
+                self.turn_cap_hit_count += 1
+            elif reason == "episode_cap":
+                self.episode_cap_hit_count += 1
+            elif reason == "token_budget":
+                self.context_cap_hit_count += 1
+        self.episodes_total += int(stats["episodes_total"])
+        self.episodes_per_window_samples.extend(
+            len(window.episodes) for window in windows
+        )
+        self.prompt_budget_utilization_samples.extend(
+            min(1.0, window.token_estimate / max(1, int(target_tokens))) for window in windows
+        )
+
+    def finalize_window_metrics(self) -> None:
+        """Derive avg/max/percentile aggregates from the raw samples."""
+
+        samples = self.episodes_per_window_samples
+        self.episodes_per_window_avg = round(
+            sum(samples) / len(samples), 6
+        ) if samples else 0.0
+        self.episodes_per_window_max = max(samples, default=0)
+        utils = sorted(self.prompt_budget_utilization_samples)
+
+        def percentile(fraction: float) -> float:
+            if not utils:
+                return 0.0
+            index = min(len(utils) - 1, max(0, int(round(fraction * (len(utils) - 1)))))
+            return round(utils[index], 6)
+
+        self.prompt_budget_utilization_avg = round(
+            sum(utils) / len(utils), 6
+        ) if utils else 0.0
+        self.prompt_budget_utilization_p50 = percentile(0.50)
+        self.prompt_budget_utilization_p95 = percentile(0.95)
+        self.initial_analysis_windows = max(self.initial_analysis_windows, self.analysis_windows)
+        calls = max(1, int(self.agent_calls or 0))
+        windows = max(1, int(self.initial_analysis_windows or self.analysis_windows or 0))
+        self.packing_accuracy = round(
+            (self.initial_analysis_windows or self.analysis_windows) / calls, 6
+        ) if (self.initial_analysis_windows or self.analysis_windows) else 0.0
+        self.rebatched_window_ratio = round(self.rebatched_windows / windows, 6)
+
+        def token_percentile(values: list[int] | list[float], fraction: float) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(values)
+            index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+            return round(float(ordered[index]), 6)
+
+        self.estimated_prompt_tokens_p50 = token_percentile(
+            self.estimated_prompt_tokens_samples, 0.50
+        )
+        self.estimated_prompt_tokens_p95 = token_percentile(
+            self.estimated_prompt_tokens_samples, 0.95
+        )
+        self.actual_prompt_tokens_p50 = token_percentile(self.actual_prompt_tokens_samples, 0.50)
+        self.actual_prompt_tokens_p95 = token_percentile(self.actual_prompt_tokens_samples, 0.95)
+        self.estimation_error_p50 = token_percentile(self.estimation_error_samples, 0.50)
+        self.estimation_error_p95 = token_percentile(self.estimation_error_samples, 0.95)
+
+    def record_rebatch(self, reason: str) -> None:
+        self.rebatched_windows += 1
+        key = str(reason or "UNKNOWN")
+        self.rebatch_reasons[key] = self.rebatch_reasons.get(key, 0) + 1
+
+    def record_prompt_estimate(self, estimated: int, actual: int) -> None:
+        self.estimated_prompt_tokens_samples.append(max(0, int(estimated)))
+        self.actual_prompt_tokens_samples.append(max(0, int(actual)))
+        if actual > 0:
+            self.estimation_error_samples.append((int(estimated) - int(actual)) / float(actual))
 
 
 class DeduplicationResult(BaseModel):
@@ -335,6 +828,11 @@ class PreLLMDeduplicator:
         updated: list[Any] = []
         for unit in units:
             normalized = str(getattr(unit, "normalized_text", "") or "")
+            if getattr(unit, "source_kind", None) in {"chat", "chat_import", "guided_interview"}:
+                canonical_units.append(unit)
+                support[str(unit.id)].append(str(unit.id))
+                updated.append(unit)
+                continue
             canonical = canonical_by_normalized.get(normalized) if normalized else None
             match_type = "exact" if canonical is not None else None
             if canonical is None and normalized:
@@ -388,28 +886,183 @@ class PreLLMDeduplicator:
         )
 
 
+def build_conversation_episodes(
+    units: Sequence[Any],
+    *,
+    episode_gap_seconds: int = 7200,
+) -> list[EpisodeSpan]:
+    """Segment chat items into semantic atomic conversation episodes.
+
+    An episode boundary is a real conversation boundary: source identity,
+    conversation identity, or a silent gap longer than ``episode_gap_seconds``
+    between two chat units.  Non-chat units form same-source spans (document
+    structure is bounded by source identity only; the pack step applies the
+    legacy half-full source-change rule).  Boundary rules mirror the persisted
+    ConversationEpisode view; this function never merges or reorders
+    provenance rows.
+    """
+
+    spans: list[EpisodeSpan] = []
+    current: list[Any] = []
+    current_is_chat = True
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            first = current[0]
+            last = current[-1]
+            conversation = getattr(first, "conversation_id", None)
+            spans.append(
+                EpisodeSpan(
+                    id=_sha(
+                        "episode|"
+                        f"{first.source_id}|{conversation}|{getattr(first, 'id', len(spans))}"
+                    )[:16],
+                    source_id=str(first.source_id),
+                    conversation_id=str(conversation) if conversation else None,
+                    start_time=_time_str(first),
+                    end_time=_time_str(last),
+                    is_chat=current_is_chat,
+                    unit_ids=[str(item.id) for item in current],
+                )
+            )
+        current = []
+
+    previous_source: str | None = None
+    previous_conversation: str | None = None
+    previous_time: datetime | None = None
+    for unit in units:
+        source = str(unit.source_id)
+        is_chat = str(getattr(unit, "source_kind", None) or "") in CHAT_SOURCE_KINDS
+        conversation_raw = getattr(unit, "conversation_id", None)
+        conversation = str(conversation_raw) if conversation_raw else None
+        current_time = _parse_time(unit)
+        boundary = bool(current) and (
+            is_chat != current_is_chat
+            or source != previous_source
+            or (
+                is_chat
+                and current_is_chat
+                and conversation != previous_conversation
+            )
+        )
+        if (
+            not boundary
+            and is_chat
+            and previous_time is not None
+            and current_time is not None
+            and previous_time.tzinfo == current_time.tzinfo
+        ):
+            boundary = (
+                current_time - previous_time
+            ).total_seconds() > max(0, int(episode_gap_seconds))
+        if boundary:
+            flush()
+        if not current:
+            current_is_chat = is_chat
+        current.append(unit)
+        previous_source = source
+        previous_conversation = conversation
+        previous_time = current_time or previous_time
+    flush()
+    return spans
+
+
 def build_analysis_windows(
     units: Sequence[Any],
     *,
     estimate_tokens: Callable[[str], int],
     target_tokens: int,
-    max_units: int = 160,
+    max_units: int | None = None,
+    estimate_unit_tokens: Callable[[Any], int] | None = None,
+    episode_gap_seconds: int = 7200,
+    max_episodes_per_window: int | None = None,
+    episode_flush: bool = False,
+    base_tokens: int = 0,
+    episode_overhead_tokens: int = 0,
 ) -> list[AnalysisWindow]:
-    """Pack atomic evidence into reasoning windows without merging ledger rows."""
+    """Pack analysis items into reasoning windows without merging ledger rows.
+
+    The primary constraints are the token budget and the conversation/source
+    boundary; ``max_units`` is only a loose safety ceiling on *target* units.
+    ``None`` removes the count cap entirely (the caller must still enforce the
+    Prompt Size Guard).  For chat material the sequence may contain both
+    target and context ConversationTurns: only ``evidence_source`` turns count
+    against the cap, so a long context-only tail never triggers an extra
+    flush.
+
+    Episode-aware packing (P0.3-B/C): chat items are first segmented into
+    :class:`EpisodeSpan` semantic atomic blocks.  A time-gap episode boundary
+    does NOT force a model dispatch flush — multiple episodes are packed into
+    the same window until the token budget, the target ceiling, or
+    ``max_episodes_per_window`` is reached.  Set ``episode_flush=True`` to
+    reproduce the legacy pre-P0.3 behavior (one window flush per gap) for
+    A/B benchmarks.  Source/conversation identity changes still flush: that
+    boundary protection is semantic, not budget bookkeeping.
+
+    Every window's ``text`` marks each chat episode with
+    ``EPISODE_BEGIN``/``EPISODE_END`` so the model can never treat episodes
+    as one continuous conversation; ``window.episodes`` carries the same
+    structure for the request payload.
+    """
 
     windows: list[AnalysisWindow] = []
+    target = max(256, int(target_tokens))
+    base = max(0, int(base_tokens or 0))
+    episode_overhead = max(0, int(episode_overhead_tokens or 0))
+    episode_cap = None if max_episodes_per_window is None else max(1, int(max_episodes_per_window))
+    pending_reason = "end"
+    spans = build_conversation_episodes(
+        units,
+        episode_gap_seconds=episode_gap_seconds,
+    )
+    span_by_id = {span.id: span for span in spans}
+    members_by_span: dict[str, list[Any]] = {span.id: [] for span in spans}
+    unit_by_id = {str(unit.id): unit for unit in units}
+
     current: list[Any] = []
     current_tokens = 0
-    target = max(256, int(target_tokens))
+    current_targets = 0
+    current_span_ids: list[str] = []
 
-    def flush() -> None:
-        nonlocal current, current_tokens
+    def flush(reason: str = "end") -> None:
+        nonlocal current, current_tokens, current_targets, current_span_ids, pending_reason
         if not current:
             return
+        pending_reason = reason
         ids = [str(item.id) for item in current]
-        text = "\n".join(
-            f"[EVIDENCE_ID={item.id} SOURCE_ID={item.source_id}] {item.text}" for item in current
-        )
+        episode_entries: list[dict[str, Any]] = []
+        chunks: list[str] = []
+        for span_id_value in current_span_ids:
+            span = span_by_id.get(span_id_value)
+            members = members_by_span.get(span_id_value, [])
+            if not members:
+                continue
+            if span is not None and span.is_chat:
+                chunks.append(
+                    f"[EPISODE_BEGIN id={span.id} source_id={span.source_id} "
+                    f"start_time={_time_str(members[0])} end_time={_time_str(members[-1])}]"
+                )
+                chunks.extend(
+                    f"[EVIDENCE_ID={item.id} SOURCE_ID={item.source_id}] {item.text}"
+                    for item in members
+                )
+                chunks.append(f"[EPISODE_END id={span.id}]")
+            else:
+                chunks.extend(
+                    f"[EVIDENCE_ID={item.id} SOURCE_ID={item.source_id}] {item.text}"
+                    for item in members
+                )
+            episode_entries.append(
+                {
+                    "episode_id": span_id_value,
+                    "source_id": str(members[0].source_id),
+                    "start_time": _time_str(members[0]),
+                    "end_time": _time_str(members[-1]),
+                    "unit_ids": [str(item.id) for item in members],
+                }
+            )
+        text = "\n".join(chunks)
         windows.append(
             AnalysisWindow(
                 id=f"aw_{_sha('|'.join(ids))[:16]}",
@@ -431,31 +1084,115 @@ def build_analysis_windows(
                         if value
                     }
                 ),
-                conversation_context={"atomic_unit_count": len(current)},
+                conversation_context={
+                    "atomic_unit_count": len(current),
+                    "episode_count": len(episode_entries),
+                },
+                episodes=episode_entries,
+                flush_reason=pending_reason,
             )
         )
+        for span_id_value in current_span_ids:
+            members_by_span[span_id_value] = []
         current = []
-        current_tokens = 0
+        current_tokens = base
+        current_targets = 0
+        current_span_ids = []
 
-    previous_source: str | None = None
-    for unit in units:
-        rendered = f"[EVIDENCE_ID={unit.id} SOURCE_ID={unit.source_id}] {unit.text}"
-        tokens = estimate_tokens(rendered)
-        source = str(unit.source_id)
-        source_break = (
-            previous_source is not None
-            and source != previous_source
-            and current_tokens >= target // 2
-        )
-        if current and (
-            len(current) >= max_units or current_tokens + tokens > target or source_break
-        ):
-            flush()
-        current.append(unit)
-        current_tokens += tokens
-        previous_source = source
+    current_tokens = base
+    for span in spans:
+        span_units = [unit_by_id[item_id] for item_id in span.unit_ids]
+        is_chat = span.is_chat
+        if current and is_chat:
+            # Episode boundary: legacy mode flushed every gap (the P0.3-A
+            # behavior being removed); packed mode flushes only when a
+            # packing ceiling is already reached.  Episodes from different
+            # sources/conversations may share one window — the EPISODE
+            # markers carry the identity protection the old flush provided.
+            if episode_flush:
+                flush("episode_boundary")
+            elif max_units is not None and current_targets >= max(int(max_units), 1):
+                flush("unit_cap")
+            elif episode_cap is not None and len(current_span_ids) >= episode_cap:
+                flush("episode_cap")
+        elif current and not is_chat and current_tokens >= target // 2:
+            # Legacy document behavior: a source change flushes a half-full
+            # window so tiny document tails do not each own a dispatch.
+            flush("source_boundary")
+        for unit in span_units:
+            rendered = f"[EVIDENCE_ID={unit.id} SOURCE_ID={unit.source_id}] {unit.text}"
+            tokens = (
+                estimate_unit_tokens(unit) if estimate_unit_tokens else estimate_tokens(rendered)
+            )
+            unit_is_target = (
+                str(getattr(unit, "semantic_role", "evidence_source")) != "context_only"
+            )
+            extra_episode = episode_overhead if span.id not in current_span_ids else 0
+            if current and (
+                max_units is not None
+                and unit_is_target
+                and current_targets >= max(int(max_units), 1)
+            ):
+                flush("unit_cap")
+                extra_episode = episode_overhead
+            elif current and current_tokens + tokens + extra_episode > target:
+                flush("token_budget")
+                extra_episode = episode_overhead
+            members_by_span.setdefault(span.id, []).append(unit)
+            if span.id not in current_span_ids:
+                current_span_ids.append(span.id)
+                current_tokens += extra_episode
+            current.append(unit)
+            current_targets += int(unit_is_target)
+            current_tokens += tokens
     flush()
     return windows
+
+
+def _parse_time(unit: Any) -> datetime | None:
+    raw_time = getattr(unit, "timestamp", None)
+    if not raw_time:
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+    return None
+
+
+def _time_str(unit: Any) -> str | None:
+    value = getattr(unit, "end_time", None) or getattr(unit, "timestamp", None)
+    return str(value) if value else None
+
+
+def window_episode_metrics(
+    windows: Sequence[AnalysisWindow],
+    *,
+    target_tokens: int,
+) -> dict[str, Any]:
+    """Episode packing quality counters for one set of windows (P0.3-C)."""
+
+    per_window_episodes = [len(window.episodes) for window in windows]
+    episodes_total = sum(per_window_episodes)
+    budget = max(1, int(target_tokens))
+    utilization = [min(1.0, window.token_estimate / budget) for window in windows]
+
+    def percentile(values: list[float], fraction: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+        return round(ordered[index], 6)
+
+    return {
+        "windows": len(windows),
+        "episodes_total": episodes_total,
+        "episodes_per_window_avg": round(episodes_total / len(windows), 6) if windows else 0.0,
+        "episodes_per_window_max": max(per_window_episodes, default=0),
+        "prompt_budget_utilization_avg": round(sum(utilization) / len(utilization), 6)
+        if utilization
+        else 0.0,
+        "prompt_budget_utilization_p50": percentile(utilization, 0.50),
+        "prompt_budget_utilization_p95": percentile(utilization, 0.95),
+    }
 
 
 class GlobalCandidateIndex:
@@ -571,11 +1308,14 @@ __all__ = [
     "AnalysisWindow",
     "CandidateGroup",
     "DeduplicationResult",
+    "EpisodeSpan",
     "GlobalCandidateIndex",
     "MaterialPipelineMetrics",
     "MaterialPromptState",
     "PreLLMDeduplicator",
     "ResolvedExecutionProfile",
     "build_analysis_windows",
+    "build_conversation_episodes",
     "material_batch_target_tokens",
+    "window_episode_metrics",
 ]

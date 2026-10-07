@@ -23,6 +23,7 @@ from persona_continuum.agent.models import (
     AgentProbeResult,
     AgentSessionConfig,
     AgentStatus,
+    AgentTurn,
     EffectiveModelCapabilities,
     ReasoningCapabilityMode,
 )
@@ -31,7 +32,9 @@ from persona_continuum.agent.response_collector import (
     AgentOutputError,
     AgentRuntimeError,
     AgentSessionStartError,
+    AgentStructuredOutputError,
     AgentTransportError,
+    PromptTransportLimitExceededError,
     ReasoningBindingRejectedError,
     RuntimeUnavailableError,
     sanitize_diagnostic,
@@ -64,7 +67,11 @@ from persona_continuum.application.job_progress import (
     percent_for_stage,
     progress_now,
 )
-from persona_continuum.application.material_intelligence import MATERIAL_AGENT_SYSTEM_PROMPTS
+from persona_continuum.application.material_intelligence import (
+    MATERIAL_AGENT_OUTPUT_SCHEMAS,
+    MATERIAL_AGENT_SYSTEM_PROMPTS,
+    PersonaEvidenceIndex,
+)
 from persona_continuum.application.research_backend import (
     ResearchBackend,
     ResearchBackendResolver,
@@ -123,8 +130,8 @@ life stages，按事件时间而不是发表年份映射证据；主动执行失
 
 FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT = """
 你的目标是为 Persona Continuum 构建具有作品正史（Canon）严格约束的已有作品角色数字人格。
-1. 首先确认作品与角色身份，区分官方正史（Canon）、官方补充资料
-（Official Supplement）与粉丝/社区二创解读（Fan Interpretation）。
+1. 首先确认作品与角色身份，区分官方正史（Canon）、官方补充资料（Official Supplement）
+   与粉丝/社区二创解读（Fan Interpretation）。
 2. 优先检索原著剧情、官方设定集、卡面剧情、角色台词对白、创作者访谈。
 3. 研究角色在作品各主线篇章/个人线中的心理与行为变化、关系模式、防御机制、核心价值观与潜在矛盾。
 4. 绝对严禁将同人二创、玩家社区猜测当作官方设定；对 Canon 存疑或剧情未揭示内容明确标注 uncertainty。
@@ -152,7 +159,7 @@ class PersonaModelAnalysisNotExecutedError(PersonaCreationError):
 
 # Bumped whenever the dimension extraction prompt or its evidence rendering
 # changes shape: stale batch checkpoints must never be silently reused.
-DIMENSION_EXTRACTION_PROMPT_VERSION = "3"
+DIMENSION_EXTRACTION_PROMPT_VERSION = "4"
 
 
 # Canonical component -> evidence dimensions that may support a bounded repair.
@@ -171,6 +178,10 @@ TARGETED_REPAIR_DIMENSIONS: dict[str, tuple[str, ...]] = {
     "emotional_triggers": ("affect_relationship_defense",),
     "attachment_patterns": ("affect_relationship_defense",),
     "needs_and_desires": ("values_desires_contradictions",),
+    "dominant_traits": (
+        "values_desires_contradictions", "affect_relationship_defense", "expression_dna"
+    ),
+    "embodied_identity": ("identity_and_timeline", "expression_dna"),
     "defenses": ("affect_relationship_defense",),
     "expression_style": ("expression_dna",),
     "vocabulary": ("expression_dna",),
@@ -564,6 +575,7 @@ class PersonaCreationJob(BaseModel):
     life_status: str = "unknown"
     privacy_scope: str = "public"
     identity_context: str | None = None
+    persona_notes: str = ""
     user_defined_facts: str | None = None
     research_mode: str = "auto"
     web_scope: str | None = None
@@ -578,6 +590,13 @@ class PersonaCreationJob(BaseModel):
         if not isinstance(value, dict):
             return value
         data: dict[str, Any] = dict(value)
+        if "persona_notes" not in data:
+            config = data.get("job_config") or {}
+            data["persona_notes"] = config.get("persona_notes", "\n".join(
+                str(data[key]) for key in (
+                    "identity_context", "user_defined_facts", "research_instructions"
+                ) if data.get(key)
+            ))
         progress_value = data.get("progress")
         progress: dict[str, Any] = progress_value if isinstance(progress_value, dict) else {}
         for field in (
@@ -651,8 +670,38 @@ class WorldPersonaCompletionResult(BaseModel):
     matches: list[PersonaMatch] = Field(default_factory=list)
 
 
+_TRANSIENT_AGENT_RETRY_CODES = frozenset(
+    {
+        "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+        "AGENT_TRANSPORT_ERROR",
+        "AGENT_SESSION_START_FAILED",
+        "RUNTIME_UNAVAILABLE",
+        "AGENT_OUTPUT_ERROR",
+    }
+)
+
+
+def _is_transient_agent_failure(exc: AgentRuntimeError) -> bool:
+    """Network/auth blips that a fresh CLI session can recover from.
+
+    Timeouts and invalid-argument failures are excluded: they already waited
+    or will fail the same way.  Structured-output errors belong to the
+    schema/split-retry path, not a blind re-dispatch.
+    """
+
+    if not bool(getattr(exc, "retriable", True)):
+        return False
+    if isinstance(exc, AgentStructuredOutputError):
+        return False
+    code = str(getattr(exc, "code", "") or "")
+    diagnostic_code = str((getattr(exc, "diagnostics", None) or {}).get("code") or "")
+    return code in _TRANSIENT_AGENT_RETRY_CODES or diagnostic_code in _TRANSIENT_AGENT_RETRY_CODES
+
+
 class PersonaCreationOrchestrator:
     WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+    TRANSIENT_AGENT_RETRY_ATTEMPTS = 3
+    TRANSIENT_AGENT_RETRY_BACKOFF_SECONDS = (2.0, 4.0)
 
     """Application-layer runtime for all Persona creation and enrichment paths.
 
@@ -861,7 +910,11 @@ class PersonaCreationOrchestrator:
                 job.job_config.get("planning_context_window")
             ),
         )
-        job.job_config["effective_model_capabilities"] = capabilities.model_dump(mode="json")
+        payload = capabilities.model_dump(mode="json")
+        adapter = self.continuum.agent_registry.get_adapter(job.agent_id)
+        if adapter is not None:
+            payload["prompt_transport"] = resolve_prompt_transport_capability(adapter).as_dict()
+        job.job_config["effective_model_capabilities"] = payload
         return capabilities
 
     def _job_id_of(self, job: PersonaCreationJob | str) -> str:
@@ -959,6 +1012,41 @@ class PersonaCreationOrchestrator:
             **extra,
         )
 
+    def _transport_capped_working_context(
+        self,
+        job: PersonaCreationJob,
+        capabilities: EffectiveModelCapabilities,
+    ) -> int | None:
+        """Cap one-pass evidence by the adapter's prompt transport budget.
+
+        Model context (e.g. 1M) and prompt transport (e.g. 57KB argv) are
+        different ceilings.  Dimension extraction must plan against both,
+        otherwise a 1M model packs a prompt the carrier cannot send.
+        """
+
+        remaining = capabilities.remaining_context_tokens
+        hard = remaining if remaining is not None else capabilities.effective_context_window
+        policy = self.continuum.agent_runtime_executor.context_budget_manager.phase_policy
+        preferred = policy.working_target(
+            hard,
+            phase="persona_compilation",
+            usable_budget=capabilities.usable_context_budget,
+            verified=(
+                bool(capabilities.remaining_context_verified)
+                if remaining is not None
+                else bool(capabilities.context_verified)
+            ),
+            persistent_session=bool(capabilities.persistent_session),
+            fresh_stateless=not capabilities.persistent_session,
+        )
+        adapter = self.continuum.agent_registry.get_adapter(job.agent_id)
+        if adapter is None:
+            return preferred
+        transport_tokens = resolve_prompt_transport_capability(adapter).prompt_token_budget()
+        if preferred is None:
+            return int(transport_tokens)
+        return min(int(preferred), int(transport_tokens))
+
     def _split_oversized_evidence(
         self,
         items: list[dict[str, Any]],
@@ -971,6 +1059,7 @@ class PersonaCreationOrchestrator:
         base_text: str,
         expected_output: Any,
         max_chunks: int = 8,
+        max_evidence_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic-chunk evidence units that alone exceed a batch budget.
 
@@ -987,6 +1076,8 @@ class PersonaCreationOrchestrator:
             system_prompt
         )
         raw_available = budget.evidence_token_budget - base_tokens
+        if max_evidence_tokens is not None:
+            raw_available = min(raw_available, int(max_evidence_tokens) - base_tokens)
         if raw_available <= 0:
             return list(items)
         available = max(1, int(raw_available * 0.9))
@@ -995,7 +1086,30 @@ class PersonaCreationOrchestrator:
             if context_manager.estimate_tokens(render(item)) <= available:
                 result.append(item)
                 continue
-            content = str(item.get("content") or "")
+
+            current_item = dict(item)
+            # Check metadata overhead (verbatim, intelligence, headers) without content
+            overhead = context_manager.estimate_tokens(render({**current_item, "content": ""}))
+            if overhead >= available * 0.7:
+                # Bounded compaction of intelligence and verbatim samples if overhead dominates
+                intel = current_item.get("intelligence")
+                if isinstance(intel, list) and len(intel) > 2:
+                    current_item["intelligence"] = intel[:2]
+                elif isinstance(intel, dict) and len(intel) > 4:
+                    current_item["intelligence"] = self._compact_audit_intelligence(intel)
+                verbatim = current_item.get("verbatim_samples")
+                if isinstance(verbatim, list) and len(verbatim) > 2:
+                    current_item["verbatim_samples"] = verbatim[:2]
+                overhead = context_manager.estimate_tokens(render({**current_item, "content": ""}))
+                if overhead >= available:
+                    current_item["intelligence"] = {}
+                    current_item["verbatim_samples"] = []
+                    overhead = context_manager.estimate_tokens(
+                        render({**current_item, "content": ""})
+                    )
+
+            content_available = max(100, available - overhead)
+            content = str(current_item.get("content") or "")
             paragraphs = [p for p in re.split(r"\n\s*\n", content) if p.strip()]
             if not paragraphs:
                 paragraphs = [content]
@@ -1004,18 +1118,18 @@ class PersonaCreationOrchestrator:
             current_tokens = 0
             for paragraph in paragraphs:
                 paragraph_tokens = context_manager.estimate_tokens(paragraph)
-                if paragraph_tokens > available:
+                if paragraph_tokens > content_available:
                     if current:
                         chunks.append("\n\n".join(current))
                         current, current_tokens = [], 0
-                    hard_size = max(200, available * 4)
+                    hard_size = max(200, content_available * 4)
                     pieces = [
                         paragraph[i : i + hard_size]
                         for i in range(0, len(paragraph), hard_size)
                     ]
                     chunks.extend(pieces)
                     continue
-                if current and current_tokens + paragraph_tokens > available:
+                if current and current_tokens + paragraph_tokens > content_available:
                     chunks.append("\n\n".join(current))
                     current, current_tokens = [], 0
                 current.append(paragraph)
@@ -1029,7 +1143,7 @@ class PersonaCreationOrchestrator:
                 continue
             total = len(chunks)
             for index, chunk in enumerate(chunks, start=1):
-                sub = dict(item)
+                sub = dict(current_item)
                 sub["content"] = f"[CHUNK {index}/{total}]\n{chunk}"
                 sub["chunk_range"] = f"{index}/{total}"
                 result.append(sub)
@@ -1203,6 +1317,7 @@ class PersonaCreationOrchestrator:
         life_status: str | None = None,
         privacy_scope: str | None = None,
         identity_context: str | None = None,
+        persona_notes: str | None = None,
         user_defined_facts: str | None = None,
         research_mode: str | None = None,
         web_scope: str | None = None,
@@ -1212,6 +1327,10 @@ class PersonaCreationOrchestrator:
         if not name:
             raise PersonaCreationError("display_name_required")
         p_type = PersonaType(persona_type)
+        from persona_continuum.application.persona_notes import notes_allow_web, parse_persona_notes
+
+        notes = str(persona_notes or "").strip()
+        guidance = parse_persona_notes(notes)
         mode = str(creation_mode).lower()
         mode = {
             "public": "public_research",
@@ -1242,6 +1361,20 @@ class PersonaCreationOrchestrator:
             else:
                 persisted_job_config[key] = safe_acp_stream_limit(raw_value)
         job_config = persisted_job_config
+        if persona_notes is not None:
+            job_config["persona_notes"] = notes
+            job_config["user_guidance"] = guidance
+        private_local = bool(materials) and (
+            privacy_scope == "private" or p_type.value.startswith("private_")
+        ) and (subject_kind or "real_person") == "real_person"
+        if private_local and not notes_allow_web(notes):
+            mode = "private_materials"
+            research_mode = "local"
+            web_scope = "none"
+            job_config["source_priority"] = "local_evidence_first"
+        elif private_local and notes_allow_web(notes):
+            mode = "public_research"
+            research_mode = "hybrid"
         self._validate_mode(p_type, mode, input_mode)
 
         duplicate = self._find_duplicate(name, aliases or [])
@@ -1333,6 +1466,10 @@ class PersonaCreationOrchestrator:
             life_status=str(life_status or "unknown"),
             privacy_scope=str(privacy_scope or "public"),
             identity_context=str(identity_context).strip() if identity_context else None,
+            persona_notes=notes if persona_notes is not None else "\n".join(
+                str(item) for item in (identity_context, user_defined_facts, research_instructions)
+                if item
+            ),
             user_defined_facts=str(user_defined_facts).strip() if user_defined_facts else None,
             research_mode=str(research_mode or "auto"),
             web_scope=str(web_scope) if web_scope else None,
@@ -1379,6 +1516,7 @@ class PersonaCreationOrchestrator:
             job.source_ids = [source.id for source in existing_sources]
             job.source_count = len(job.source_ids)
         self._save(job)
+        self._bind_job_material_uploads(job, list(materials or []))
         if start_worker:
             self.start_job(job.id)
         return job
@@ -1959,6 +2097,11 @@ class PersonaCreationOrchestrator:
             job.worker_finished_at = None
             job.touch_worker(WorkerState.STARTING)
             self._save(job)
+            existing_task = self._tasks.get(job_id)
+            if existing_task is not None and not existing_task.done():
+                existing_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await existing_task
             self.start_job(job_id)
         return self.get_job(job_id)
 
@@ -2270,6 +2413,8 @@ class PersonaCreationOrchestrator:
         with contextlib.suppress(Exception):
             await self.close_research_backends(job_id)
         await self.close_job_persistence(job_id)
+        with contextlib.suppress(Exception):
+            self._cleanup_job_material_uploads(job)
         await self._emit(job, "persona_creation_cancelled")
         return job
 
@@ -2295,6 +2440,7 @@ class PersonaCreationOrchestrator:
         if consent:
             job.job_config["remote_material_consent"] = True
         self._save(job)
+        self._bind_job_material_uploads(job, list(materials or []))
         if job.status in {"waiting_for_materials", "paused"}:
             await self.resume_job(job.id)
         return self.get_job(job.id)
@@ -2718,15 +2864,9 @@ class PersonaCreationOrchestrator:
             # to a high-confidence digital persona.  It may still be compiled
             # as an explicitly visible draft so the user can continue adding
             # materials/interview answers without losing provenance.
-            if (
-                job.persona_type.value.startswith("private_")
-                and job.source_count < 3
-                and job.creation_mode in {"private_materials", "guided_interview"}
-            ):
-                await self._request_interview_question(job)
-
-            if job.creation_mode in {"private_materials", "guided_interview"} and not coverage.get(
-                "dimensions_complete"
+            if job.creation_mode in {"private_materials", "guided_interview"} and (
+                (job.persona_type.value.startswith("private_") and job.source_count < 3)
+                or not coverage.get("dimensions_complete")
             ):
                 await self._request_interview_question(job)
 
@@ -2932,7 +3072,6 @@ class PersonaCreationOrchestrator:
             PrivacyScope,
             ResearchMode,
             SubjectKind,
-            WebResearchScope,
         )
 
         # Phase 1: Identity Resolution
@@ -2941,12 +3080,14 @@ class PersonaCreationOrchestrator:
             aliases=job.aliases,
             subject_kind=SubjectKind(getattr(job, "subject_kind", "real_person") or "real_person"),
             work_or_universe=job.work_or_universe,
-            life_status=LifeStatus(job.life_status or LifeStatus.UNKNOWN),
-            privacy_scope=PrivacyScope(job.privacy_scope or PrivacyScope.PUBLIC),
-            identity_context=job.identity_context,
+            life_status=LifeStatus(getattr(job, "life_status", "unknown") or "unknown"),
+            privacy_scope=PrivacyScope(getattr(job, "privacy_scope", "public") or "public"),
+            identity_context=job.identity_context or "\n".join(
+                job.job_config.get("user_guidance", {}).get("identity_hint", [])
+            ) or None,
             user_defined_facts=job.user_defined_facts,
-            research_mode=ResearchMode(job.research_mode or ResearchMode.AUTO),
-            web_scope=WebResearchScope(job.web_scope) if job.web_scope else None,
+            research_mode=ResearchMode(getattr(job, "research_mode", "auto") or "auto"),
+            web_scope=getattr(job, "web_scope", None),
             research_instructions=job.research_instructions,
         )
         resolved = IdentityResolver.resolve_spec(spec)
@@ -3693,7 +3834,8 @@ class PersonaCreationOrchestrator:
 
     async def _research_plan(self, job: PersonaCreationJob) -> dict[str, Any]:
         is_fictional = (
-            job.subject_kind == "fictional_character" or bool(job.work_or_universe)
+            getattr(job, "subject_kind", "") == "fictional_character"
+            or bool(job.work_or_universe)
         )
         system_prompt = (
             FICTIONAL_CANON_RESEARCH_SYSTEM_PROMPT
@@ -3713,10 +3855,14 @@ class PersonaCreationOrchestrator:
                 else "包含第一人称、官方、传记、长期报道、批评、失败、争议和观点变化"
             ),
             "不要把转载同源内容或同人二创作为独立 Canon 来源",
-            "动态识别角色的重要剧情阶段（Canon stages）；每个阶段返回 id、title、start、"
-            "end、significance、required_evidence",
-            "主动规划 contradiction_search_queries 和 negative_evidence_queries"
-            "（如人设矛盾、谎言与真实意图、剧情挫败）",
+            (
+                "动态识别角色的重要剧情阶段（Canon stages）；"
+                "每个阶段返回 id、title、start、end、significance、required_evidence"
+            ),
+            (
+                "主动规划 contradiction_search_queries 和 negative_evidence_queries"
+                "（如人设矛盾、谎言与真实意图、剧情挫败）"
+            ),
         ]
         if job.work_or_universe:
             instructions.append(f"必须明确围绕作品世界观《{job.work_or_universe}》进行检索，排除无关同名实体")
@@ -3724,6 +3870,11 @@ class PersonaCreationOrchestrator:
             instructions.append(f"身份消歧约束：{job.identity_context}")
         if job.research_instructions:
             instructions.append(f"特定研究要求：{job.research_instructions}")
+        if job.persona_notes:
+            instructions.append(
+                "用户备注属于研究指引，不能直接作为人物事实；仅明确确认的事实可标记为"
+                f" user_supplied，身份提示需消歧：{job.persona_notes}"
+            )
 
         prompt = {
             "display_name": job.display_name,
@@ -3922,29 +4073,43 @@ class PersonaCreationOrchestrator:
             or 3,
         )
         semaphore = asyncio.Semaphore(concurrency_limit)
+        dimension_exceptions: dict[str, BaseException] = {}
 
         def processed_map() -> dict[str, list[str]]:
             raw = job.job_config.get("dimension_processed_sources")
             return {str(k): [str(v) for v in (val or [])] for k, val in (raw or {}).items()}
 
         processed = processed_map()
+        # One index per pass: its snapshot loads once and is shared by every
+        # dimension.  Evidence is not written while dimensions are extracted.
+        evidence_index = (
+            self.material_intelligence.get_index(persona_id)
+            if self.material_intelligence is not None
+            else None
+        )
+        retrieval_limit = (
+            safe_int(
+                getattr(self.continuum.config, "persona_dimension_retrieval_items", 48),
+                default=48,
+                minimum=8,
+            )
+            or 48
+        )
 
-        def plan_dimension(dimension: str) -> tuple[list[dict[str, Any]], list[str], str]:
+        async def retrieve_for_dimension(dimension: str) -> list[dict[str, Any]]:
+            if evidence_index is None:
+                return []
+            # Ranking a large ledger is CPU-bound; keep the event loop free so
+            # agent streams, heartbeats and the Web UI are not starved.
+            return await asyncio.to_thread(
+                evidence_index.retrieve, dimension, top_k=retrieval_limit, diversity=True
+            )
+
+        def plan_dimension(
+            dimension: str, retrieved: list[dict[str, Any]]
+        ) -> tuple[list[dict[str, Any]], list[str], str]:
             """Return (evidence_items, delta_source_ids, mode)."""
 
-            retrieved: list[dict[str, Any]] = []
-            if self.material_intelligence is not None:
-                retrieval_limit = (
-                    safe_int(
-                        getattr(self.continuum.config, "persona_dimension_retrieval_items", 48),
-                        default=48,
-                        minimum=8,
-                    )
-                    or 48
-                )
-                retrieved = self.material_intelligence.get_index(persona_id).retrieve(
-                    dimension, top_k=retrieval_limit, diversity=True
-                )
             units: list[dict[str, Any]] = []
             seen_unit_ids: set[str] = set()
             for item in retrieved:
@@ -4039,7 +4204,9 @@ class PersonaCreationOrchestrator:
                 participant = f"{dimension}:audit" if final_audit else str(dimension)
                 try:
                     self._raise_if_pause_requested(job)
-                    items, delta_ids, mode = plan_dimension(dimension)
+                    items, delta_ids, mode = plan_dimension(
+                        dimension, await retrieve_for_dimension(dimension)
+                    )
                     if mode == "skipped_no_delta":
                         return None
                     await self._emit(
@@ -4072,7 +4239,6 @@ class PersonaCreationOrchestrator:
                         current_done = set(all_source_ids)
                     else:
                         current_done.update(delta_ids)
-                    processed[dimension] = sorted(current_done)
                     # A completed dimension is durable immediately: validated,
                     # compiled, persisted, and announced before the gather
                     # continues, so a later failure never re-pays for it.
@@ -4083,6 +4249,7 @@ class PersonaCreationOrchestrator:
                         mode=mode,
                         final_audit=final_audit,
                     )
+                    processed[dimension] = sorted(current_done)
                     return {
                         "dimension": dimension,
                         "artifact": validated,
@@ -4093,6 +4260,7 @@ class PersonaCreationOrchestrator:
                 except Exception as exc:
                     # Single-dimension failure must not destroy task state;
                     # other dimensions continue and the next round retries.
+                    dimension_exceptions[dimension] = exc
                     errors = job.job_config.setdefault("dimension_errors", {})
                     errors[dimension] = str(exc)[:500]
                     self._save(job)
@@ -4107,7 +4275,11 @@ class PersonaCreationOrchestrator:
                 finally:
                     await self._drop_job_session(job.id, participant)
 
-        tasks = [asyncio.create_task(run_dimension(d)) for d in REQUIRED_DIMENSIONS]
+        tasks = [
+            asyncio.create_task(run_dimension(d))
+            for d in REQUIRED_DIMENSIONS
+            if d not in reused_dimensions
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for outcome in results:
             if isinstance(outcome, _PauseRequested):
@@ -4125,6 +4297,14 @@ class PersonaCreationOrchestrator:
         }
         succeeded = set(by_dim) | set(reused_dimensions)
         new_failures = job.job_config.get("dimension_errors") or {}
+
+        def _raise_all_dimensions_failed(errors: dict[str, Any]) -> None:
+            first_exc = next(iter(dimension_exceptions.values()), None)
+            if isinstance(first_exc, AgentRuntimeError):
+                raise first_exc
+            first_error = next(iter(errors.values()), "dimension_extraction_failed")
+            raise PersonaCreationError(str(first_error))
+
         if final_audit:
             # The audit pass is quality-critical: it may only pass forward when
             # every dimension either succeeded now or already has coverage.
@@ -4136,14 +4316,12 @@ class PersonaCreationOrchestrator:
                 and safe_int(job.dimension_progress.get(dim, 0), default=0, minimum=0) == 0
             ]
             if len(incomplete) >= len(REQUIRED_DIMENSIONS):
-                first_error = next(iter(still_failing.values()), "dimension_extraction_failed")
-                raise PersonaCreationError(first_error)
+                _raise_all_dimensions_failed(still_failing)
         elif not succeeded and all(
             safe_int(job.dimension_progress.get(dim, 0), default=0, minimum=0) == 0
             for dim in REQUIRED_DIMENSIONS
         ):
-            first_error = next(iter(new_failures.values()), "dimension_extraction_failed")
-            raise PersonaCreationError(first_error)
+            _raise_all_dimensions_failed(new_failures)
         # Failures recorded this pass that later succeeded are cleared.
         if succeeded:
             cleared = {dim: err for dim, err in new_failures.items() if dim in succeeded}
@@ -4410,21 +4588,24 @@ class PersonaCreationOrchestrator:
                     },
                 }
             else:
-                # Bound the payload by the agent's transport ceiling so the
-                # audit never dispatches a prompt the transport guard must
-                # reject (model context is a separate, much larger budget).
+                # Model context and transport are independent limits; even
+                # a streaming adapter may have an unknown/small model window.
                 adapter = self.continuum.agent_registry.get_adapter(job.agent_id)
                 transport = (
                     resolve_prompt_transport_capability(adapter)
                     if adapter is not None
                     else None
                 )
-                payload = self._global_audit_payload(
+                # Ledger ranking and token planning are CPU-bound on a large
+                # corpus; build the payload off the event loop.
+                payload = await asyncio.to_thread(
+                    self._global_audit_payload,
                     job,
                     artifacts,
                     transport_safe_bytes=(
                         transport.safe_prompt_bytes if transport is not None else None
                     ),
+                    model=self._effective_model_capabilities(job),
                 )
                 evidence_result, consistency_result = await asyncio.gather(
                     self._run_final_audit_pass(job, "evidence", payload, attempt=attempt),
@@ -4537,15 +4718,9 @@ class PersonaCreationOrchestrator:
         artifacts: dict[str, dict[str, Any]],
         *,
         transport_safe_bytes: int | None = None,
+        model: EffectiveModelCapabilities | None = None,
     ) -> dict[str, Any]:
-        """Build the final-audit payload, compacting to the transport budget.
-
-        ``transport_safe_bytes`` is the adapter's transport ceiling, not the
-        model context window: an ARGV-only CLI may only carry ~57KB even when
-        the model holds 1M tokens.  When the first-pass payload exceeds it the
-        payload is rebuilt at progressively tighter compaction levels instead
-        of dispatching a prompt the transport guard must reject.
-        """
+        """Compact against both limits, including instructions and output schema."""
 
         config_ledger_limit = (
             safe_int(
@@ -4579,29 +4754,55 @@ class PersonaCreationOrchestrator:
             (4, 1, 0.2),
         )
         payload: dict[str, Any] = {}
-        for level, (ledger_limit, claims_limit, text_scale) in enumerate(compaction_levels):
+        context_manager = getattr(
+            self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
+        )
+        evidence_index = (
+            self.material_intelligence.get_index(job.persona_id)
+            if self.material_intelligence is not None and job.persona_id
+            else None
+        )
+        for ledger_limit, claims_limit, text_scale in compaction_levels:
             payload = self._build_audit_payload(
                 job,
                 artifacts,
+                evidence_index=evidence_index,
                 ledger_limit=ledger_limit,
                 claims_limit=claims_limit,
                 text_scale=text_scale,
             )
-            if transport_safe_bytes is None or level == len(compaction_levels) - 1:
-                break
+            turns = [self._final_audit_turn(kind, payload) for kind in ("evidence", "consistency")]
+            budgets = [
+                context_manager.plan(
+                    turn, model=model, phase=f"final_{kind}_audit", enforce=False
+                )
+                for kind, turn in zip(("evidence", "consistency"), turns, strict=True)
+            ]
             encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-            if (
+            transport_fits = transport_safe_bytes is None or (
                 len(encoded) + _GLOBAL_AUDIT_ENVELOPE_HEADROOM_BYTES
                 <= int(transport_safe_bytes)
-            ):
-                break
-        return payload
+            )
+            if transport_fits and all(budget.within_budget for budget in budgets):
+                return payload
+        # Do not dispatch an oversized last compaction level as if it fitted.
+        for kind, turn in zip(("evidence", "consistency"), turns, strict=True):
+            context_manager.plan(turn, model=model, phase=f"final_{kind}_audit", enforce=True)
+        raise PromptTransportLimitExceededError(
+            "Final audit payload exceeds the prompt transport budget",
+            phase="final_evidence_audit",
+            diagnostics={
+                "transport_safe_prompt_bytes": transport_safe_bytes,
+                "estimated_prompt_bytes": len(encoded) + _GLOBAL_AUDIT_ENVELOPE_HEADROOM_BYTES,
+            },
+        )
 
     def _build_audit_payload(
         self,
         job: PersonaCreationJob,
         artifacts: dict[str, dict[str, Any]],
         *,
+        evidence_index: PersonaEvidenceIndex | None = None,
         ledger_limit: int,
         claims_limit: int,
         text_scale: float,
@@ -4615,14 +4816,18 @@ class PersonaCreationOrchestrator:
             )
             for dimension, artifact in artifacts.items()
         }
-        if self.material_intelligence is not None and job.persona_id:
-            index = self.material_intelligence.get_index(job.persona_id)
+        if evidence_index is None and self.material_intelligence is not None and job.persona_id:
+            evidence_index = self.material_intelligence.get_index(job.persona_id)
+        if evidence_index is not None:
+            index = evidence_index
             ledger = [
                 {
                     "id": item.get("id"),
                     "text": self._audit_text(item.get("text"), ledger_text_limit),
                     "source_ids": item.get("source_ids") or [],
-                    "evidence_ids": item.get("evidence_ids") or [],
+                    **self._compact_audit_references(
+                        item.get("evidence_ids") or [], text_scale=text_scale
+                    ),
                     "dimension_scores": item.get("dimension_scores") or {},
                     "intelligence": self._compact_audit_intelligence(
                         item.get("intelligence"), text_scale
@@ -4661,8 +4866,7 @@ class PersonaCreationOrchestrator:
             }
             missing_ids = referenced_ids - included_ids
             if missing_ids:
-                unit_by_id = {item.id: item for item in index.units()}
-                fused_by_id = {item.id: item for item in index.fused()}
+                unit_by_id, fused_by_id = index.lookup_semantic(missing_ids)
                 for evidence_id in sorted(missing_ids):
                     unit = unit_by_id.get(evidence_id)
                     if unit is not None:
@@ -4706,6 +4910,20 @@ class PersonaCreationOrchestrator:
     @staticmethod
     def _scaled_audit_limit(base: int, scale: float) -> int:
         return max(40, int(base * scale))
+
+    @staticmethod
+    def _compact_audit_references(
+        evidence_ids: list[str], *, text_scale: float
+    ) -> dict[str, Any]:
+        # A fused record can reference thousands of messages. Its stable id
+        # resolves the complete local chain; the audit receives a labelled sample.
+        limit = max(2, int(8 * text_scale))
+        sampled = evidence_ids[:limit]
+        return {
+            "evidence_ids": sampled,
+            "evidence_id_count": len(evidence_ids),
+            "omitted_evidence_id_count": max(0, len(evidence_ids) - len(sampled)),
+        }
 
     @staticmethod
     def _audit_text(value: Any, limit: int) -> str:
@@ -4796,7 +5014,9 @@ class PersonaCreationOrchestrator:
                 )
                 for item in (artifact.get("conflicts") or [])[:4]
             ],
-            "uncertainty": artifact.get("uncertainty") or {},
+            "uncertainty": cls._compact_audit_value(
+                artifact.get("uncertainty") or {}, conflict_limit, max_items=nested_item_limit
+            ),
             "component_summary": cls._audit_text(
                 components, cls._scaled_audit_limit(800, text_scale)
             ),
@@ -4822,14 +5042,8 @@ class PersonaCreationOrchestrator:
             ]
         return cls._audit_text(value, limit) if isinstance(value, str) else value
 
-    async def _run_final_audit_pass(
-        self,
-        job: PersonaCreationJob,
-        audit_type: str,
-        payload: dict[str, Any],
-        *,
-        attempt: int,
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _final_audit_turn(audit_type: str, payload: dict[str, Any]) -> AgentTurn:
         if audit_type == "evidence":
             instruction = (
                 "检查事实准确性、claim/source linkage、时间线、冲突、negative evidence、"
@@ -4846,19 +5060,36 @@ class PersonaCreationOrchestrator:
                 "生平或逐字样本时，若 artifact 已诚实保留缺口，应判 pass 并记录 coverage gap；"
                 "只有错误归因、无来源断言、结构损坏或未处理的真实矛盾才需返工。"
             )
+        return AgentTurn(
+            user_message=json.dumps(
+                {"audit_type": audit_type, "instruction": instruction, **payload},
+                ensure_ascii=False,
+                default=str,
+            ),
+            system_prompt=(
+                "你是 Persona Continuum 严格最终质量门禁。只能依据输入 Ledger 与 artifacts；"
+                "不得把推断或模拟延续当成历史事实。返回符合 schema 的单个 JSON 对象。"
+                "Ledger 的 omitted_evidence_id_count 标明省略的引用数量，完整来源链按条目 id "
+                "保存在本地；引用样本不代表全部证据，不要把省略的引用当成缺失来源。"
+            ),
+            expected_output=FINAL_AUDIT_SCHEMA,
+        )
+
+    async def _run_final_audit_pass(
+        self,
+        job: PersonaCreationJob,
+        audit_type: str,
+        payload: dict[str, Any],
+        *,
+        attempt: int,
+    ) -> dict[str, Any]:
+        turn = self._final_audit_turn(audit_type, payload)
         participant_id = f"final_{audit_type}_audit:{attempt}"
         try:
             result = await self._agent_json(
                 job,
-                user_message=json.dumps(
-                    {"audit_type": audit_type, "instruction": instruction, **payload},
-                    ensure_ascii=False,
-                    default=str,
-                ),
-                system_prompt=(
-                    "你是 Persona Continuum 严格最终质量门禁。只能依据输入 Ledger 与 artifacts；"
-                    "不得把推断或模拟延续当成历史事实。返回符合 schema 的单个 JSON 对象。"
-                ),
+                user_message=turn.user_message,
+                system_prompt=turn.system_prompt or "",
                 participant_id=participant_id,
                 phase=f"final_{audit_type}_audit",
                 schema=FINAL_AUDIT_SCHEMA,
@@ -4961,6 +5192,12 @@ class PersonaCreationOrchestrator:
             )
         sources = list(self.continuum.personas.get_sources(job.persona_id))
         source_by_id = {source.id: source for source in sources}
+        # Shared by every repair worker; evidence is read-only during repair.
+        evidence_index = (
+            self.material_intelligence.get_index(job.persona_id)
+            if self.material_intelligence is not None
+            else None
+        )
         context_manager = getattr(
             self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
         )
@@ -4990,12 +5227,12 @@ class PersonaCreationOrchestrator:
                 )
                 current_artifact = current_artifacts.get(dimension, {})
 
-                def retrieved_evidence_items() -> list[dict[str, Any]]:
+                async def retrieved_evidence_items() -> list[dict[str, Any]]:
                     retrieved = (
-                        self.material_intelligence.get_index(job.persona_id or "").retrieve(
-                            dimension, top_k=32, diversity=True
+                        await asyncio.to_thread(
+                            evidence_index.retrieve, dimension, top_k=32, diversity=True
                         )
-                        if self.material_intelligence is not None
+                        if evidence_index is not None
                         else []
                     )
                     return [
@@ -5023,9 +5260,9 @@ class PersonaCreationOrchestrator:
                         # An empty or claim-less artifact has no claim slice
                         # to repair from; without the index fallback the
                         # targeted repair could never rebuild anything.
-                        evidence_items = retrieved_evidence_items()
+                        evidence_items = await retrieved_evidence_items()
                 else:
-                    evidence_items = retrieved_evidence_items()
+                    evidence_items = await retrieved_evidence_items()
                 if not evidence_items:
                     if target_components:
                         return {
@@ -5306,7 +5543,7 @@ class PersonaCreationOrchestrator:
                 if source_id and source_id not in merged.get("source_ids", []):
                     merged.setdefault("source_ids", []).append(source_id)
 
-        # Ensure every source referenced by claims or memories appears in source_ids.
+        # Guarantee: ensure all referenced source_ids in claims/memories are in source_ids
         referenced_source_ids = {
             str(c.get("source_id"))
             for c in (merged.get("claims") or []) + (merged.get("memories") or [])
@@ -5472,6 +5709,44 @@ class PersonaCreationOrchestrator:
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
         return [unit for _, _, unit in scored[:limit]]
 
+    @staticmethod
+    def _normalize_batch_artifact_sources(
+        artifact: ResearchArtifact,
+        batch: list[dict[str, Any]],
+        known_sources: set[str],
+        *,
+        dimension: str,
+    ) -> ResearchArtifact:
+        """Resolve evidence IDs only through an unambiguous batch source mapping."""
+        if artifact.dimension != dimension:
+            raise PersonaCreationError(f"artifact_dimension_mismatch:{dimension}")
+        evidence_sources: dict[str, set[str]] = {}
+        batch_sources: set[str] = set()
+        for item in batch:
+            source_ids = set(item.get("source_ids") or []) & known_sources
+            batch_sources.update(source_ids)
+            evidence_id = str(item.get("evidence_id") or "")
+            if evidence_id:
+                evidence_sources.setdefault(evidence_id, set()).update(source_ids)
+
+        def resolve(source_id: str | None) -> str:
+            if source_id in batch_sources:
+                return str(source_id)
+            candidates = evidence_sources.get(str(source_id), set()) if source_id else batch_sources
+            if len(candidates) == 1:
+                return next(iter(candidates))
+            raise PersonaCreationError(f"artifact_source_unresolved:{dimension}")
+
+        # Work on a copy so an invalid cached artifact remains untouched until
+        # the caller discards that batch and obtains a fresh model result.
+        normalized = artifact.model_copy(deep=True)
+        for entry in normalized.claims:
+            entry.source_id = resolve(entry.source_id)
+        for memory in normalized.memories:
+            memory.source_id = resolve(memory.source_id)
+        normalized.source_ids = sorted({resolve(value) for value in normalized.source_ids})
+        return ResearchArtifact.model_validate(normalized.model_dump(mode="json"))
+
     async def _run_dimension_extraction(
         self,
         job: PersonaCreationJob,
@@ -5496,6 +5771,17 @@ class PersonaCreationOrchestrator:
 严格包括 artifact_id, schema_version(固定为 1.1), dimension, source_ids, claims, memories,
 extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前八维是：
 {", ".join(REQUIRED_DIMENSIONS)}。
+保留高显著人格而非把它压成一般身份标签。仅在本维度证据支持时提取：
+dominant_traits: [{{trait, strength, stability, behavioral_implications}}]；
+needs_and_desires: [{{name, baseline, rebound_rate, satiation_response, evidence}}]。
+name 使用 attachment / intimacy / touch_closeness 等规范 Need 名；baseline 是长期基线，
+不是最近一次情境强度。等级 moderate=.55, high=.70, very_high=.85, extreme=.95；
+也可保留有证据的显式数值。rebound_rate 单位为每小时，satiation_response 为一次满足的降幅；
+无证据则省略动力学参数，不猜数值。dominant_traits 不随话题或短期满足消失。
+expression_style 可独立表达 flirtation_frequency, sexual_directness, suggestive_humor,
+playful_provocation, initiative, sexual_inhibition（low/moderate/high/very_high/extreme）。
+不可用欲望强度代替表达风格；不可凭身材推断欲望。embodied_identity 保存有依据的身材、
+body_self_image、body_confidence 及长期 behavioral_implications。不要强行填补资料空缺。
 """.strip()
         if job.persona_type == PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON:
             prompt_intro += (
@@ -5561,6 +5847,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             or 48
         )
         capabilities = self._effective_model_capabilities(job)
+        working_context = self._transport_capped_working_context(job, capabilities)
         batchable_items = self._split_oversized_evidence(
             evidence_items,
             render=render_dimension_evidence,
@@ -5570,6 +5857,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             system_prompt=dimension_system_prompt,
             base_text=prompt_intro,
             expected_output=ResearchArtifact.model_json_schema(),
+            max_evidence_tokens=working_context,
         )
         # A targeted repair has different instructions and acceptance criteria
         # from the original extraction. Reusing an evidence-only checkpoint
@@ -5583,7 +5871,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             batchable_items,
             item_text=render_dimension_evidence,
             max_items=batch_item_limit,
-            phase="dimension_extraction",
+            phase=phase,
             model=capabilities,
             system_prompt=dimension_system_prompt,
             expected_output=ResearchArtifact.model_json_schema(),
@@ -5593,17 +5881,23 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             # unknown window must never collapse back into dozens of 32K-shaped
             # batches (Unknown keeps the planning fallback, not 32K-capable
             # batching).
-            preferred_working_context=capabilities.preferred_working_context,
+            preferred_working_context=working_context,
         ):
             batch_index = len(batch_artifacts) + 1
             fingerprint = self._batch_evidence_fingerprint(batch)
             checkpoint = batch_checkpoints.get(fingerprint)
             if checkpoint is not None:
                 try:
-                    validated_batch = ResearchArtifact.model_validate(checkpoint["artifact"])
+                    validated_batch = self._normalize_batch_artifact_sources(
+                        ResearchArtifact.model_validate(checkpoint["artifact"]),
+                        batch,
+                        set(source_by_id),
+                        dimension=dimension,
+                    )
                 except Exception:
                     batch_checkpoints.pop(fingerprint, None)
                 else:
+                    checkpoint["artifact"] = validated_batch.model_dump(mode="json")
                     job.job_config["dimension_checkpoint_hit_count"] = (
                         safe_int(
                             job.job_config.get("dimension_checkpoint_hit_count"),
@@ -5642,31 +5936,12 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
                 phase=phase,
                 schema=ResearchArtifact,
             )
-            validated_batch = ResearchArtifact.model_validate(artifact)
-            if validated_batch.dimension != dimension:
-                raise PersonaCreationError(f"artifact_dimension_mismatch:{dimension}")
-            batch_source_ids = {
-                source_id
-                for item in batch
-                for source_id in item.get("source_ids") or []
-                if isinstance(source_id, str) and source_id in source_by_id
-            }
-            if batch_source_ids:
-                validated_batch.source_ids = sorted(
-                    set(validated_batch.source_ids) & batch_source_ids or batch_source_ids
-                )
-            primary_batch_source = (
-                validated_batch.source_ids[0]
-                if validated_batch.source_ids
-                else (next(iter(batch_source_ids), None) if batch_source_ids else None)
+            validated_batch = self._normalize_batch_artifact_sources(
+                ResearchArtifact.model_validate(artifact),
+                batch,
+                set(source_by_id),
+                dimension=dimension,
             )
-            if primary_batch_source:
-                for claim_entry in validated_batch.claims:
-                    if not claim_entry.source_id:
-                        claim_entry.source_id = primary_batch_source
-                for memory_entry in validated_batch.memories:
-                    if not memory_entry.source_id:
-                        memory_entry.source_id = primary_batch_source
             batch_artifacts.append(validated_batch)
             # Every successful batch is checkpointed before the next one runs,
             # so a later failure re-pays only for the unfinished batches.
@@ -5813,7 +6088,9 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         material_gap_payload: dict[str, Any] = {}
         if self.material_intelligence is not None and job.persona_id:
             with contextlib.suppress(Exception):
-                material_gap_payload = self.material_intelligence.gap_analysis(job.persona_id)
+                material_gap_payload = await asyncio.to_thread(
+                    self.material_intelligence.gap_analysis, job.persona_id
+                )
                 missing = [
                     str(item.get("dimension"))
                     for item in material_gap_payload.get("gaps", [])
@@ -5829,16 +6106,29 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             "evidence_gaps": material_gap_payload.get("gaps", []),
             "instruction": "动态生成一个最能补齐缺口的问题；允许用户回答不清楚，不得替用户填写。",
         }
+        question_context = hashlib.sha256(
+            json.dumps(
+                {**prompt_base, "source_ids": sorted(job.source_ids)},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        checkpoint = job.job_config.get("interview_question_checkpoint") or {}
+        if (
+            checkpoint.get("context") == question_context
+            and checkpoint.get("question") in job.interview_questions
+        ):
+            return
         existing_materials: list[dict[str, Any]] = []
         if self.material_intelligence is not None and job.persona_id:
             with contextlib.suppress(Exception):
-                existing_materials = [
-                    dict(item)
-                    for item in self.material_intelligence.get_index(job.persona_id).retrieve(
-                        top_k=None, diversity=True
-                    )
-                    if isinstance(item, dict)
-                ]
+                retrieved = await asyncio.to_thread(
+                    self.material_intelligence.get_index(job.persona_id).retrieve,
+                    missing[0] if missing else None,
+                    top_k=24,
+                    diversity=True,
+                )
+                existing_materials = [dict(item) for item in retrieved if isinstance(item, dict)]
         context_manager = getattr(
             self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
         )
@@ -5850,49 +6140,47 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
                 "why": {"type": "string"},
             },
         }
-        batches = list(
-            context_manager.iter_batches(
-                existing_materials,
-                item_text=lambda item: json.dumps(
-                    {
-                        "id": item.get("id"),
-                        "content": item.get("text") or item.get("content") or "",
-                    },
-                    ensure_ascii=False,
-                ),
-                max_items=24,
-                phase="guided_interview",
-                model=self._effective_model_capabilities(job),
-                base_text=json.dumps(prompt_base, ensure_ascii=False),
-                system_prompt=interview_system_prompt,
-                expected_output=question_schema,
-            )
-        ) or [[]]
-        candidates: list[dict[str, Any]] = []
-        for batch_index, batch in enumerate(batches):
-            result = await self._agent_json(
-                job,
-                user_message=json.dumps(
-                    {
-                        **prompt_base,
-                        "batch_index": batch_index,
-                        "batch_count": len(batches),
-                        "existing_materials": [
-                            {
-                                "id": item.get("id"),
-                                "content": item.get("text") or item.get("content") or "",
-                            }
-                            for item in batch
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                system_prompt=interview_system_prompt,
-                participant_id="guided_interview",
-            )
-            if isinstance(result, dict) and str(result.get("question") or "").strip():
-                candidates.append(dict(result))
-        result = candidates[0] if candidates else {}
+        # A follow-up question needs one bounded context, not a full corpus
+        # extraction. Save the first result before any later stage can fail.
+        batches = context_manager.iter_batches(
+            existing_materials,
+            item_text=lambda item: json.dumps(
+                {
+                    "id": item.get("id"),
+                    "content": item.get("text") or item.get("content") or "",
+                },
+                ensure_ascii=False,
+            ),
+            max_items=24,
+            phase="guided_interview",
+            model=self._effective_model_capabilities(job),
+            base_text=json.dumps(prompt_base, ensure_ascii=False),
+            system_prompt=interview_system_prompt,
+            expected_output=question_schema,
+        )
+        batch: list[dict[str, Any]] = next(iter(batches), [])
+        result = await self._agent_json(
+            job,
+            user_message=json.dumps(
+                {
+                    **prompt_base,
+                    "batch_index": 0,
+                    "batch_count": 1,
+                    "existing_materials": [
+                        {
+                            "id": item.get("id"),
+                            "content": item.get("text") or item.get("content") or "",
+                        }
+                        for item in batch
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            system_prompt=interview_system_prompt,
+            participant_id="guided_interview",
+            phase="guided_interview",
+            schema=question_schema,
+        )
         if not isinstance(result, dict) or not str(result.get("question") or "").strip():
             raise PersonaCreationError("interview_question_invalid")
         question = {
@@ -5901,11 +6189,29 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             "why": str(result.get("why") or "补齐当前证据缺口"),
         }
         job.interview_questions.append(question)
+        job.job_config["interview_question_checkpoint"] = {
+            "context": question_context,
+            "question": question,
+        }
         self._save(job)
         await self._emit(job, "persona_interview_question", **question)
 
     async def _ingest_configured_materials(self, job: PersonaCreationJob) -> None:
-        # Treat explicit user facts as the initial authoritative evidence.
+        from persona_continuum.application.persona_notes import parse_persona_notes
+
+        facts = parse_persona_notes(job.persona_notes)["user_supplied_fact"]
+        if facts and job.persona_id and not job.job_config.get("notes_facts_source_id"):
+            source = self.continuum.personas.add_source_text(
+                job.persona_id, title="用户备注中明确确认的事实", source_type="user_provided",
+                canonical_url=None, publisher="user", author="user", published_at=None,
+                accessed_at=datetime.now(UTC).isoformat(), content="\n".join(facts),
+                metadata={"provenance": "user_supplied", "authority": "user_assertion"},
+            )
+            job.source_ids.append(source.id)
+            job.source_count = len(job.source_ids)
+            job.job_config["notes_facts_source_id"] = source.id
+            self._save(job)
+        # If user explicitly provided user_defined_facts, ingest as initial Evidence
         if (
             job.user_defined_facts
             and job.persona_id
@@ -5913,7 +6219,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         ):
             provenance_kind = (
                 "fictional_author_defined"
-                if job.subject_kind in {"fictional_character", "original_character"}
+                if getattr(job, "subject_kind", "") in {"fictional_character", "original_character"}
                 else "user_provided"
             )
             try:
@@ -5949,7 +6255,66 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         for material in configured:
             if not isinstance(material, dict):
                 continue
-            if material.get("content_base64") is not None:
+            if material.get("upload_id"):
+                upload_id = str(material.get("upload_id") or "").strip()
+                if not upload_id:
+                    continue
+                uploads = self.continuum.material_uploads
+                try:
+                    existing_upload = uploads.get(upload_id)
+                except NotFoundError:
+                    continue
+                if str(existing_upload.get("status") or "") == "consumed":
+                    hashed = self.continuum.personas.get_source_by_hash(
+                        job.persona_id, str(existing_upload.get("sha256") or "")
+                    )
+                    if hashed is not None:
+                        pending.append(hashed)
+                    continue
+                bound = uploads.bind(upload_id, job_id=job.id, persona_id=job.persona_id)
+                staged = uploads.resolve_staged_path(upload_id)
+                existing = self.continuum.personas.get_source_by_hash(
+                    job.persona_id, str(bound.get("sha256") or "")
+                )
+                if existing is not None:
+                    pending.append(existing)
+                    uploads.mark_consumed(upload_id, stored_path=existing.path)
+                    uploads.delete_staging_tree(upload_id)
+                    continue
+                try:
+                    source = self.continuum.personas.add_external_file_source(
+                        job.persona_id,
+                        staged,
+                        filename=str(
+                            bound.get("filename") or material.get("filename") or staged.name
+                        ),
+                        sha256=str(bound.get("sha256") or ""),
+                        source_type=str(
+                            bound.get("source_type")
+                            or material.get("source_type")
+                            or "user_file"
+                        ),
+                        move=True,
+                        extra_metadata={
+                            "upload_id": upload_id,
+                            "privacy": "private_material",
+                            "provenance": "user_provided",
+                        },
+                    )
+                except ConflictError:
+                    duplicate = self.continuum.personas.get_source_by_hash(
+                        job.persona_id, str(bound.get("sha256") or "")
+                    )
+                    if duplicate is None:
+                        raise
+                    pending.append(duplicate)
+                    uploads.mark_consumed(upload_id, stored_path=duplicate.path)
+                    uploads.delete_staging_tree(upload_id)
+                    continue
+                pending.append(source)
+                uploads.mark_consumed(upload_id, stored_path=source.path)
+                uploads.delete_staging_tree(upload_id)
+            elif material.get("content_base64") is not None:
                 try:
                     raw_bytes = base64.b64decode(str(material.get("content_base64")), validate=True)
                 except Exception as exc:
@@ -6016,6 +6381,54 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         job.job_config["materials"] = []
         self._save(job)
 
+    def _bind_job_material_uploads(
+        self, job: PersonaCreationJob, materials: list[dict[str, Any]]
+    ) -> None:
+        if not job.persona_id:
+            return
+        uploads = getattr(self.continuum, "material_uploads", None)
+        if uploads is None:
+            return
+        summaries: list[dict[str, Any]] = []
+        for material in materials:
+            if not isinstance(material, dict) or not material.get("upload_id"):
+                continue
+            upload_id = str(material["upload_id"])
+            with contextlib.suppress(Exception):
+                bound = uploads.bind(upload_id, job_id=job.id, persona_id=job.persona_id)
+                summaries.append(
+                    {
+                        "upload_id": bound["id"],
+                        "filename": bound["filename"],
+                        "size": bound["size"],
+                        "sha256": bound["sha256"],
+                        "source_type": bound["source_type"],
+                    }
+                )
+        if summaries:
+            job.job_config["material_uploads"] = summaries
+            self._save(job)
+
+    def _cleanup_job_material_uploads(self, job: PersonaCreationJob) -> None:
+        uploads = getattr(self.continuum, "material_uploads", None)
+        if uploads is None:
+            return
+        upload_ids: list[str] = []
+        for material in list(job.job_config.get("materials") or []):
+            if isinstance(material, dict) and material.get("upload_id"):
+                upload_ids.append(str(material["upload_id"]))
+        for upload_id in upload_ids:
+            with contextlib.suppress(Exception):
+                row = uploads.get(upload_id)
+                if str(row.get("status") or "") == "consumed":
+                    continue
+                uploads.delete_staging_tree(upload_id)
+                self.continuum.database.conn.execute(
+                    "DELETE FROM persona_material_uploads WHERE id = ? AND status != 'consumed'",
+                    (upload_id,),
+                )
+        uploads.cleanup_job_staging(job.id)
+
     async def _analyze_private_materials(
         self,
         job: PersonaCreationJob,
@@ -6046,17 +6459,22 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             system_prompt = MATERIAL_AGENT_SYSTEM_PROMPTS.get(phase)
             if system_prompt is None:
                 raise PersonaCreationError(f"material_agent_phase_unsupported:{phase}")
-            result = await self._agent_json(
-                job,
-                user_message=json.dumps(payload, ensure_ascii=False),
-                system_prompt=system_prompt,
-                participant_id=participant_id,
-                phase={
-                    "classify": "material_classification",
-                    "relate": "semantic_relation",
-                    "fuse": "evidence_fusion",
-                }.get(phase, f"material_{phase}"),
-            )
+            try:
+                result = await self._agent_json(
+                    job,
+                    user_message=json.dumps(payload, ensure_ascii=False),
+                    system_prompt=system_prompt,
+                    participant_id=participant_id,
+                    schema=MATERIAL_AGENT_OUTPUT_SCHEMAS[phase],
+                    phase={
+                        "classify": "material_classification",
+                        "relate": "semantic_relation",
+                        "fuse": "evidence_fusion",
+                    }.get(phase, f"material_{phase}"),
+                )
+            finally:
+                if phase == "classify":
+                    await self._drop_job_session(job.id, participant_id)
             await self._emit(job, f"{event_prefix}_completed")
             return result
 
@@ -6091,6 +6509,14 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             if material_stage == "material_classification" and windows_total > 0:
                 ratio = min(windows_completed, windows_total) / windows_total
                 material_percent = max(40, min(49, 40 + round(9 * ratio)))
+            classification_total = int(material_job.progress.get("classification_total") or 0)
+            classification_completed = int(
+                material_job.progress.get("classification_completed") or 0
+            )
+            if material_stage == "material_classification" and classification_total:
+                material_percent = 40 + min(
+                    9, round(9 * classification_completed / classification_total)
+                )
             stage_updates: dict[str, Any] = {
                 "label": "本地资料分析失败" if material_stage == "failed" else material_stage,
                 "percent": material_percent,
@@ -6108,6 +6534,15 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
                 stage_updates["current_window"] = (
                     safe_int(material_job.progress.get("current_window"), default=None, minimum=1)
                     or windows_completed
+                )
+            if material_stage == "material_classification" and classification_total:
+                stage_updates.update(
+                    completed=classification_completed, total=classification_total,
+                    current_subtask="material_classification_records",
+                    message=(
+                        f"已审阅 {classification_completed:,} / {classification_total:,} "
+                        f"条目标语义记录（上下文消息不占用分类额度）"
+                    ),
                 )
             prompt_state = material_job.progress.get("prompt_state")
             if prompt_state:
@@ -6144,10 +6579,57 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         # adapter and read by the material planner; the business layer never
         # branches on an adapter id or tool name.
         adapter = self.continuum.agent_registry.get_adapter(job.agent_id)
+        runtime_identity: dict[str, Any] | None = None
         if adapter is not None:
             runtime_profile_snapshot["prompt_transport"] = (
                 resolve_prompt_transport_capability(adapter).as_dict()
             )
+            # Bind the persistent independent-session capability to the exact
+            # runtime: adapter + CLI binary identity/version + model + credential
+            # identity + origin.  Passed locally, never persisted with the job.
+            from persona_continuum.performance.runtime_identity import (
+                resolve_runtime_identity,
+            )
+
+            runtime_identity = resolve_runtime_identity(
+                adapter,
+                model_id=str(
+                    job.model_id or runtime_profile_snapshot.get("effective_model") or ""
+                ),
+                credential_manager=self.continuum.credentials,
+                credential_id=job.auth_profile_id,
+                binary_version=str(runtime_profile_snapshot.get("version") or ""),
+            ).as_dict(include_credential=True)
+        # P1-C: the Semantic Gate is a per-task strategy, not a global hidden
+        # config.  "auto" resolves locally (no network, no extra model calls):
+        # small/non-chat material stays full fidelity; a large private chat
+        # may use balanced only when the offline ShadowGate acceptance record
+        # passed.  The resolved mode and reason travel with the job so the
+        # task center can show why a mode was chosen.
+        from persona_continuum.application.semantic_gate import (
+            TASK_SEMANTIC_GATE_MODES,
+            resolve_task_semantic_gate_mode,
+        )
+        from persona_continuum.application.shadow_gate import load_shadow_gate_acceptance
+
+        task_gate_mode = str(job.job_config.get("material_semantic_gate_mode") or "auto").lower()
+        if task_gate_mode not in TASK_SEMANTIC_GATE_MODES:
+            task_gate_mode = "auto"
+        if task_gate_mode == "auto":
+            chat_target_messages = self.material_intelligence.count_chat_target_units(
+                job.persona_id
+            )
+            acceptance = load_shadow_gate_acceptance(self.continuum.config.data_dir)
+            effective_gate_mode, gate_reason = resolve_task_semantic_gate_mode(
+                task_gate_mode,
+                chat_target_messages=chat_target_messages,
+                shadow_gate_accepted=bool(acceptance and acceptance.get("accepted")),
+            )
+        else:
+            effective_gate_mode, gate_reason = resolve_task_semantic_gate_mode(task_gate_mode)
+        job.job_config["material_semantic_gate_effective"] = effective_gate_mode
+        job.job_config["material_semantic_gate_reason"] = gate_reason
+        self._save(job)
         return await self.material_intelligence.analyze_sources_async(
             job.persona_id,
             source_ids,
@@ -6157,6 +6639,8 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             agent_phases=agent_phases,
             shared_factual_cache=shared_factual_cache,
             progress_callback=report_progress,
+            semantic_gate_mode=effective_gate_mode,
+            runtime_identity=runtime_identity,
         )
 
     def _assert_material_agent_analysis(self, job: PersonaCreationJob) -> None:
@@ -6735,7 +7219,47 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             effort = None
         return probe, adapter, selected.id, effort
 
+    @staticmethod
+    def _adapter_binary_missing(adapter: AgentAdapter) -> bool:
+        finder = getattr(adapter, "_find_binary", None)
+        if not callable(finder):
+            return False
+        try:
+            return not bool(finder())
+        except Exception:
+            return False
+
     async def _assert_snapshot_available(self, job: PersonaCreationJob) -> None:
+        adapter = self.continuum.agent_registry.get_adapter(job.agent_id)
+        if adapter is None:
+            raise RuntimeBindingError(f"agent_adapter_missing:{job.agent_id}")
+        snapshot = job.job_config.get("runtime_binding_snapshot") or {}
+        bound = str(snapshot.get("binding_status") or "") == "verified" or bool(job.agent_version)
+        if bound:
+            # A job that already opened this runtime must not be paused because
+            # a concurrent `agy --version` / `agy models` probe timed out while
+            # the same CLI was serving the job's own turn.
+            if self._adapter_binary_missing(adapter):
+                raise RuntimeBindingError(f"runtime_not_ready:{job.agent_id}")
+            cached = next(
+                (
+                    item
+                    for item in self.continuum.agent_discovery.get_cached_probes()
+                    if item.id == job.agent_id
+                ),
+                None,
+            )
+            if (
+                job.agent_version
+                and cached is not None
+                and cached.status == AgentStatus.READY
+                and cached.version
+                and job.agent_version != cached.version
+            ):
+                raise RuntimeBindingError(
+                    f"agent_version_changed:{job.agent_version}:{cached.version}"
+                )
+            return
         probe, _, _, _ = await self._resolve_runtime(
             runtime_source=job.runtime_source,
             agent_id=job.agent_id,
@@ -6786,6 +7310,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         # Force-revalidate is an explicit user action ("重新验证联网研究" button);
         # it should still run the full probe, but with a bounded timeout.
         if force_revalidate or bool(runtime.get("force_revalidate")):
+            probe.research_model_id = runtime.get("model_id")
             try:
                 backend = await asyncio.wait_for(
                     resolver.resolve(
@@ -6819,6 +7344,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             from persona_continuum.agent.models import ResearchVerificationStatus
 
             probe.research = cached
+            probe.research_model_id = runtime.get("model_id")
             if cached.verification_status == ResearchVerificationStatus.VERIFIED:
                 return None  # Worker will reuse the cached verification.
             if cached.verification_status in {
@@ -7052,177 +7578,216 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
             "transport_max_prompt_bytes": transport.max_prompt_bytes,
             "transport_safe_prompt_bytes": transport.safe_prompt_bytes,
         }
-        session_binding: RuntimeSessionBinding | None = None
-        # Logical sessions live for the whole job per participant instead of
-        # being re-spawned per model call.  The physical runtime underneath is
-        # pooled; threads are never shared between participants/dimensions.
         session_key = (job.id, participant_id)
-        reused = False
-        try:
-            cached_binding = self._job_sessions.get(session_key)
-            if (
-                cached_binding is not None
-                and cached_binding.session.is_active
-                and cached_binding.session.config.model_id == (job.model_id or None)
-                and cached_binding.session.config.auth_profile_id == job.auth_profile_id
-            ):
-                session_binding = cached_binding
-                reused = True
-            if session_binding is None:
-                job.progress.set_prompt_state("STARTING_SESSION")
-                session_extra: dict[str, Any] = {"source_ids": list(job.source_ids)}
-                for key in (
-                    "idle_timeout_seconds",
-                    "hard_timeout_seconds",
-                    "turn_timeout_seconds",
-                    "acp_stream_limit_bytes",
-                ):
-                    if job.job_config.get(key) is not None:
-                        session_extra[key] = job.job_config[key]
-                stream_limit = job.job_config.get("acp_stream_limit_bytes")
-                if stream_limit is not None:
-                    session_extra["acp_stream_limit_bytes"] = safe_acp_stream_limit(stream_limit)
-                try:
-                    session_binding = await self.runtime_executor.open_session(
-                        adapter,
-                        AgentSessionConfig(
-                            session_id=f"persona_creation_{job.id}_{participant_id}",
-                            room_id=f"persona_creation:{job.id}",
-                            participant_id=participant_id,
-                            persona_id=job.persona_id or job.id,
-                            model_id=job.model_id,
-                            reasoning_effort=job.reasoning_effort,
-                            auth_profile_id=job.auth_profile_id,
-                            allow_mcp=False,
-                            tools=[],
-                            system_prompt=system_prompt,
-                            extra=session_extra,
-                        ),
-                    )
-                except AgentRuntimeError:
-                    raise
-                except Exception as exc:
-                    raise AgentSessionStartError(
-                        f"agent_session_start_failed:{sanitize_diagnostic(exc)}",
-                        phase=effective_phase,
-                        diagnostics={"agent_id": job.agent_id, "model_id": job.model_id},
-                    ) from exc
-                self._job_sessions[session_key] = session_binding
-                self._job_session_keys.setdefault(job.id, set()).add(session_key)
-            assert session_binding is not None
-            job.job_config["runtime_binding_snapshot"] = session_binding.snapshot.model_dump(
-                mode="json"
-            )
-            job.progress.set_runtime_binding(job.job_config["runtime_binding_snapshot"])
-            if not reused:
-                self._save(job)
-            self._active_bindings[job.id] = session_binding
-            call_id = new_id("agent_call")
-            job.progress.set_prompt_state("WAITING_RUNTIME")
-            job.progress.begin_agent_call()
-            job.agent_call_count = job.progress.agent_call_attempt_count
-            job.job_config["agent_call_in_flight"] = {
-                "call_id": call_id,
-                "phase": effective_phase,
-                "started_at": job.progress.updated_at,
-            }
-            self._touch_worker(job, WorkerState.WAITING_AGENT)
-
-            def on_runtime_state(state: str) -> None:
-                # Mirrors the executor's dispatch lifecycle onto the durable
-                # job progress: WAITING_SCHEDULER -> SENDING_PROMPT ->
-                # MODEL_RUNNING.  A job can only show MODEL_RUNNING after the
-                # Adapter dispatch actually completed.
-                job.progress.set_prompt_state(state)
-                if state == "MODEL_RUNNING":
-                    job.progress.dispatch_metrics = {
-                        **job.progress.dispatch_metrics,
-                        "model_started_at": progress_now(),
-                    }
-                    self._save(job)
-
+        last_error: BaseException | None = None
+        for attempt in range(self.TRANSIENT_AGENT_RETRY_ATTEMPTS):
+            session_binding: RuntimeSessionBinding | None = None
+            # Logical sessions live for the whole job per participant instead of
+            # being re-spawned per model call.  The physical runtime underneath is
+            # pooled; threads are never shared between participants/dimensions.
+            reused = False
             try:
-                call_metadata = {
-                    "persona_creation_job_id": job.id,
-                    "participant_id": participant_id,
-                    "stage": effective_phase,
-                    "phase": effective_phase,
-                    "call_id": call_id,
-                }
-                if schema is None:
-                    result = await self.runtime_executor.execute_text(
-                        session_binding,
-                        system_prompt=system_prompt,
-                        user_message=user_message,
-                        expected_output=None,
-                        phase=effective_phase,
-                        stream=False,
-                        metadata=call_metadata,
-                        state_callback=on_runtime_state,
-                    )
-                else:
-                    result = await self.runtime_executor.execute_structured(
-                        session_binding,
-                        system_prompt=system_prompt,
-                        user_message=user_message,
-                        schema=schema,
-                        phase=effective_phase,
-                        metadata=call_metadata,
-                        state_callback=on_runtime_state,
-                    )
-                self._sync_runtime_activity(job, session_binding)
-                response = result.response
-                if response is not None:
-                    self._record_agent_call(job, response, call_id=call_id, phase=effective_phase)
-                else:
-                    job.progress.record_agent_outcome(failed=False)
-                    job.job_config.pop("agent_call_in_flight", None)
+                cached_binding = self._job_sessions.get(session_key)
+                if (
+                    cached_binding is not None
+                    and cached_binding.session.is_active
+                    and cached_binding.session.config.model_id == (job.model_id or None)
+                    and cached_binding.session.config.auth_profile_id == job.auth_profile_id
+                ):
+                    session_binding = cached_binding
+                    reused = True
+                if session_binding is None:
+                    job.progress.set_prompt_state("STARTING_SESSION")
+                    session_extra: dict[str, Any] = {"source_ids": list(job.source_ids)}
+                    if effective_phase == "material_classification":
+                        session_extra["workload_context_scope"] = "per_window"
+                        session_extra["context_scope"] = "per_window"
+                    for key in (
+                        "idle_timeout_seconds",
+                        "hard_timeout_seconds",
+                        "turn_timeout_seconds",
+                        "acp_stream_limit_bytes",
+                        "requested_context_window",
+                        "context_window",
+                    ):
+                        if job.job_config.get(key) is not None:
+                            session_extra[key] = job.job_config[key]
+                    stream_limit = job.job_config.get("acp_stream_limit_bytes")
+                    if stream_limit is not None:
+                        session_extra["acp_stream_limit_bytes"] = (
+                            safe_acp_stream_limit(stream_limit)
+                        )
+                    try:
+                        session_binding = await self.runtime_executor.open_session(
+                            adapter,
+                            AgentSessionConfig(
+                                session_id=f"persona_creation_{job.id}_{participant_id}",
+                                room_id=f"persona_creation:{job.id}",
+                                participant_id=participant_id,
+                                persona_id=job.persona_id or job.id,
+                                model_id=job.model_id,
+                                reasoning_effort=job.reasoning_effort,
+                                auth_profile_id=job.auth_profile_id,
+                                allow_mcp=False,
+                                tools=[],
+                                system_prompt=system_prompt,
+                                extra=session_extra,
+                            ),
+                        )
+                    except AgentRuntimeError:
+                        raise
+                    except Exception as exc:
+                        raise AgentSessionStartError(
+                            f"agent_session_start_failed:{sanitize_diagnostic(exc)}",
+                            phase=effective_phase,
+                            diagnostics={"agent_id": job.agent_id, "model_id": job.model_id},
+                        ) from exc
+                    self._job_sessions[session_key] = session_binding
+                    self._job_session_keys.setdefault(job.id, set()).add(session_key)
+                assert session_binding is not None
+                job.job_config["runtime_binding_snapshot"] = session_binding.snapshot.model_dump(
+                    mode="json"
+                )
+                job.progress.set_runtime_binding(job.job_config["runtime_binding_snapshot"])
+                if not reused:
                     self._save(job)
-                # The dispatch finished; the state is stale until the next
-                # call starts building its prompt.
-                job.progress.set_prompt_state(None)
-                return result
-            except AgentRuntimeError as exc:
-                self._sync_runtime_activity(job, session_binding)
-                response = getattr(exc, "response", None)
-                if response is not None:
-                    self._record_agent_call(
-                        job,
-                        response,
-                        call_id=call_id,
+                self._active_bindings[job.id] = session_binding
+                call_id = new_id("agent_call")
+                job.progress.set_prompt_state("WAITING_RUNTIME")
+                job.progress.begin_agent_call()
+                job.agent_call_count = job.progress.agent_call_attempt_count
+                job.job_config["agent_call_in_flight"] = {
+                    "call_id": call_id,
+                    "phase": effective_phase,
+                    "started_at": job.progress.updated_at,
+                }
+                self._touch_worker(job, WorkerState.WAITING_AGENT)
+
+                def on_runtime_state(state: str) -> None:
+                    # Mirrors the executor's dispatch lifecycle onto the durable
+                    # job progress: WAITING_SCHEDULER -> SENDING_PROMPT ->
+                    # MODEL_RUNNING.  A job can only show MODEL_RUNNING after the
+                    # Adapter dispatch actually completed.
+                    job.progress.set_prompt_state(state)
+                    if state == "MODEL_RUNNING":
+                        job.progress.dispatch_metrics = {
+                            **job.progress.dispatch_metrics,
+                            "model_started_at": progress_now(),
+                        }
+                        self._save(job)
+
+                try:
+                    call_metadata = {
+                        "persona_creation_job_id": job.id,
+                        "participant_id": participant_id,
+                        "stage": effective_phase,
+                        "phase": effective_phase,
+                        "call_id": call_id,
+                        "require_complete_json": effective_phase == "material_classification",
+                    }
+                    if schema is None:
+                        result = await self.runtime_executor.execute_text(
+                            session_binding,
+                            system_prompt=system_prompt,
+                            user_message=user_message,
+                            expected_output=None,
+                            phase=effective_phase,
+                            stream=False,
+                            metadata=call_metadata,
+                            state_callback=on_runtime_state,
+                        )
+                    else:
+                        result = await self.runtime_executor.execute_structured(
+                            session_binding,
+                            system_prompt=system_prompt,
+                            user_message=user_message,
+                            schema=schema,
+                            max_repair_attempts=(
+                                0 if effective_phase == "material_classification" else None
+                            ),
+                            phase=effective_phase,
+                            metadata=call_metadata,
+                            state_callback=on_runtime_state,
+                        )
+                    self._sync_runtime_activity(job, session_binding)
+                    response = result.response
+                    if response is not None:
+                        self._record_agent_call(
+                            job, response, call_id=call_id, phase=effective_phase
+                        )
+                    else:
+                        job.progress.record_agent_outcome(failed=False)
+                        job.job_config.pop("agent_call_in_flight", None)
+                        self._save(job)
+                    # The dispatch finished; the state is stale until the next
+                    # call starts building its prompt.
+                    job.progress.set_prompt_state(None)
+                    return result
+                except AgentRuntimeError as exc:
+                    self._sync_runtime_activity(job, session_binding)
+                    response = getattr(exc, "response", None)
+                    if response is not None:
+                        self._record_agent_call(
+                            job,
+                            response,
+                            call_id=call_id,
+                            phase=effective_phase,
+                            failure=exc,
+                        )
+                    else:
+                        self._record_agent_failure_without_response(
+                            job, exc, call_id=call_id, phase=effective_phase
+                        )
+                    # A transport/runtime failure invalidates the cached logical
+                    # session; the next attempt gets a fresh thread on a healthy
+                    # runtime (crash recovery instead of poisoning the pool).
+                    await self._drop_job_session(job.id, participant_id)
+                    last_error = exc
+                    if (
+                        attempt + 1 >= self.TRANSIENT_AGENT_RETRY_ATTEMPTS
+                        or not _is_transient_agent_failure(exc)
+                    ):
+                        raise
+                except Exception as exc:
+                    self._sync_runtime_activity(job, session_binding)
+                    wrapped = AgentTransportError(
+                        "agent_transport_failed",
                         phase=effective_phase,
-                        failure=exc,
+                        diagnostics={
+                            "protocol": session_binding.snapshot.protocol
+                            if session_binding is not None
+                            else "unknown",
+                            "exception_type": type(exc).__name__,
+                            "diagnostic": sanitize_diagnostic(exc),
+                        },
                     )
-                else:
                     self._record_agent_failure_without_response(
-                        job, exc, call_id=call_id, phase=effective_phase
+                        job, wrapped, call_id=call_id, phase=effective_phase
                     )
-                # A transport/runtime failure invalidates the cached logical
-                # session; the next attempt gets a fresh thread on a healthy
-                # runtime (crash recovery instead of poisoning the pool).
+                    await self._drop_job_session(job.id, participant_id)
+                    last_error = wrapped
+                    if attempt + 1 >= self.TRANSIENT_AGENT_RETRY_ATTEMPTS:
+                        raise wrapped from exc
+            except AgentRuntimeError as exc:
+                last_error = exc
                 await self._drop_job_session(job.id, participant_id)
-                raise
-            except Exception as exc:
-                self._sync_runtime_activity(job, session_binding)
-                wrapped = AgentTransportError(
-                    "agent_transport_failed",
-                    phase=effective_phase,
-                    diagnostics={
-                        "protocol": session_binding.snapshot.protocol
-                        if session_binding is not None
-                        else "unknown",
-                        "exception_type": type(exc).__name__,
-                        "diagnostic": sanitize_diagnostic(exc),
-                    },
-                )
-                self._record_agent_failure_without_response(
-                    job, wrapped, call_id=call_id, phase=effective_phase
-                )
-                await self._drop_job_session(job.id, participant_id)
-                raise wrapped from exc
-        finally:
-            if session_binding is not None:
-                self._active_bindings.pop(job.id, None)
+                if (
+                    attempt + 1 >= self.TRANSIENT_AGENT_RETRY_ATTEMPTS
+                    or not _is_transient_agent_failure(exc)
+                ):
+                    raise
+            finally:
+                if session_binding is not None:
+                    self._active_bindings.pop(job.id, None)
+            self._raise_if_pause_requested(job)
+            delay = self.TRANSIENT_AGENT_RETRY_BACKOFF_SECONDS[
+                min(attempt, len(self.TRANSIENT_AGENT_RETRY_BACKOFF_SECONDS) - 1)
+            ]
+            if delay > 0:
+                await asyncio.sleep(delay)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Agent execution ended without returning a result")
 
     async def _drop_job_session(self, job_id: str, participant_id: str) -> None:
         """Close and forget one cached job session (used after failures)."""
@@ -7681,6 +8246,7 @@ extracted_components, conflicts, uncertainty, created_by, artifact_hash。当前
         job.job_config["control_version"] = control.control_version
 
     def _save(self, job: PersonaCreationJob) -> None:
+        job.job_config["persona_notes"] = job.persona_notes
         now = datetime.now(UTC).isoformat()
         job.updated_at = now
         if not job.created_at:

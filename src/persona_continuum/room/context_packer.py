@@ -44,6 +44,7 @@ from persona_continuum.agent.prompt_transport import (
     PromptTransportCapability,
     PromptTransportMode,
 )
+from persona_continuum.runtime.turn_normalizer import normalize_turn_for_prompt
 
 # The transport capability already carries a 10% safety margin.  Room prompts
 # additionally carry JSON-escaped payloads and chat scaffolding that are added
@@ -126,11 +127,7 @@ class PackedPrompt(BaseModel):
     def payload(self) -> dict[str, Any]:
         """The sections that survived, keyed by section name."""
 
-        return {
-            section.key: section.content
-            for section in self.sections
-            if not section.dropped
-        }
+        return {section.key: section.content for section in self.sections if not section.dropped}
 
     def report(self) -> dict[str, Any]:
         return {
@@ -206,11 +203,7 @@ class ContextPacker:
 
         sections: list[PackedSection] = []
         if system:
-            sections.append(
-                self._section(
-                    "system", PRIORITY_SYSTEM, system, droppable=False
-                )
-            )
+            sections.append(self._section("system", PRIORITY_SYSTEM, system, droppable=False))
         if persona_context not in (None, "", [], {}):
             sections.append(
                 self._section(
@@ -222,15 +215,11 @@ class ContextPacker:
             )
         if current_task:
             sections.append(
-                self._section(
-                    "current_task", PRIORITY_TASK, current_task, droppable=False
-                )
+                self._section("current_task", PRIORITY_TASK, current_task, droppable=False)
             )
         if case_state not in (None, "", [], {}):
             sections.append(
-                self._section(
-                    "case_state", PRIORITY_CASE_STATE, case_state, droppable=False
-                )
+                self._section("case_state", PRIORITY_CASE_STATE, case_state, droppable=False)
             )
         if stage_instruction:
             sections.append(
@@ -243,17 +232,13 @@ class ContextPacker:
             )
         if expert_task not in (None, "", [], {}):
             sections.append(
-                self._section(
-                    "expert_task", PRIORITY_EXPERT_TASK, expert_task, droppable=False
-                )
+                self._section("expert_task", PRIORITY_EXPERT_TASK, expert_task, droppable=False)
             )
         if shared_context not in (None, "", [], {}):
             sections.append(self._section("shared_context", PRIORITY_STAGE, shared_context))
         if structured_results not in (None, "", [], {}):
             sections.append(
-                self._section(
-                    "structured_results", PRIORITY_RESULTS, structured_results
-                )
+                self._section("structured_results", PRIORITY_RESULTS, structured_results)
             )
         if room_summary:
             sections.append(self._section("room_summary", PRIORITY_SUMMARY, room_summary))
@@ -374,12 +359,14 @@ def compact_transcript(
     for item in window:
         if not isinstance(item, dict):
             continue
-        content = str(item.get("content") or "").strip()
+        content = str(normalize_turn_for_prompt(item)["spoken_text"]).strip()
         if len(content) > per_message_chars:
             content = content[:per_message_chars] + "…"
         entry: dict[str, Any] = {
             "speaker": item.get("speaker_name") or item.get("participant_id") or "",
             "content": content,
+            "scene_events": normalize_turn_for_prompt(item)["scene_events"],
+            "actions": normalize_turn_for_prompt(item)["actions"],
         }
         kind = item.get("message_kind")
         if kind:
@@ -447,7 +434,7 @@ def extract_older_user_facts(transcript: list[dict[str, Any]], *, limit: int = 1
             continue
         if item.get("participant_id") != "user":
             continue
-        content = str(item.get("content") or "").strip()
+        content = str(normalize_turn_for_prompt(item)["spoken_text"]).strip()
         if not content:
             continue
         facts.append(content[:300])

@@ -22,6 +22,7 @@ resolved capability and never branches on an adapter id or tool name:
 
 from __future__ import annotations
 
+import inspect
 from enum import StrEnum
 from typing import Any
 
@@ -213,8 +214,14 @@ def _normalise_mode(value: Any) -> str:
         "rpc": PromptTransportMode.RPC.value,
         "http": PromptTransportMode.RPC.value,
         "api": PromptTransportMode.RPC.value,
+        "openai_compatible": PromptTransportMode.RPC.value,
+        "openai_compatible_http": PromptTransportMode.RPC.value,
+        "provider_http": PromptTransportMode.RPC.value,
         "stream": PromptTransportMode.STREAM.value,
         "streaming": PromptTransportMode.STREAM.value,
+        "acp": PromptTransportMode.STREAM.value,
+        "jsonrpc_stdio": PromptTransportMode.STREAM.value,
+        "vendor_app_server": PromptTransportMode.STREAM.value,
     }
     if text in aliases:
         return aliases[text]
@@ -254,6 +261,9 @@ def resolve_prompt_transport_capability(adapter: Any) -> PromptTransportCapabili
     declared = _declared_capability(adapter)
     if declared is not None:
         return declared
+    from_send = _infer_from_send_implementation(adapter)
+    if from_send is not None:
+        return from_send
     return _infer_from_adapter_shape(adapter)
 
 
@@ -276,6 +286,79 @@ def _declared_capability(adapter: Any) -> PromptTransportCapability | None:
     return None
 
 
+_RPC_PROTOCOL_MARKERS = frozenset(
+    {
+        "openai_compatible",
+        "openai_compatible_http",
+        "provider_http",
+        "http",
+        "rpc",
+        "api",
+    }
+)
+_STREAM_PROTOCOL_MARKERS = frozenset(
+    {
+        "acp",
+        "jsonrpc_stdio",
+        "vendor_app_server",
+    }
+)
+_STDIN_PROTOCOL_MARKERS = frozenset(
+    {
+        "plain_cli",
+        "streaming_json_cli",
+    }
+)
+
+
+def _adapter_protocol_names(adapter: Any) -> list[str]:
+    """Collect protocol names from ``protocol`` and ``protocols`` (never ids)."""
+
+    names: list[str] = []
+    protocol = str(getattr(adapter, "protocol", "") or "").strip().casefold()
+    if protocol:
+        names.append(protocol)
+    protocols = getattr(adapter, "protocols", None)
+    if isinstance(protocols, (list, tuple)):
+        for item in protocols:
+            text = str(item or "").strip().casefold()
+            if text and text not in names:
+                names.append(text)
+    return names
+
+
+def _infer_from_send_implementation(adapter: Any) -> PromptTransportCapability | None:
+    """Classify transport from the real send()/spawn path, never from the name."""
+
+    send = getattr(type(adapter), "send", None) or getattr(adapter, "send", None)
+    if send is None:
+        return None
+    try:
+        source = inspect.getsource(send)
+    except (OSError, TypeError):
+        return None
+    writes_prompt = (
+        "write(prompt" in source
+        or "write(prompt.encode" in source
+        or "transport.write(prompt" in source
+    )
+    argv_prompt = any(
+        marker in source
+        for marker in (
+            '"-p", prompt',
+            "'-p', prompt",
+            'cmd.append(prompt)',
+            "cmd.extend([*prompt_flags",
+            "cmd.extend(prompt_flags)",
+        )
+    )
+    if writes_prompt and not argv_prompt:
+        return capability_for_mode(PromptTransportMode.STDIN, source="adapter_send_stdin")
+    if argv_prompt:
+        return capability_for_mode(PromptTransportMode.ARGV, source="adapter_send_argv")
+    return None
+
+
 def _infer_from_adapter_shape(adapter: Any) -> PromptTransportCapability:
     """Infer a transport mode from structural adapter facts (never from ids)."""
 
@@ -293,17 +376,28 @@ def _infer_from_adapter_shape(adapter: Any) -> PromptTransportCapability:
             return capability_for_mode(
                 PromptTransportMode.ARGV, source="adapter_shape_print_flag"
             )
-    # A protocol without a subprocess boundary carries the prompt in-process.
-    protocol = str(getattr(adapter, "protocol", "") or "").strip().casefold()
-    if protocol in {"acp", "jsonrpc_stdio", "openai_compatible", "vendor_app_server"}:
+    # Adapters expose either ``protocol`` or ``protocols``; HTTP API adapters
+    # historically only set the list (``openai_compatible_http``), so looking
+    # at the singular attribute alone classified them as UNKNOWN/64KB.
+    protocols = _adapter_protocol_names(adapter)
+    if any(name in _STREAM_PROTOCOL_MARKERS for name in protocols):
         return capability_for_mode(
-            PromptTransportMode.STREAM
-            if protocol in {"acp", "jsonrpc_stdio", "vendor_app_server"}
-            else PromptTransportMode.RPC,
-            source="adapter_shape_protocol",
+            PromptTransportMode.STREAM, source="adapter_shape_protocol"
         )
-    if protocol in {"plain_cli", "streaming_json_cli"}:
-        return capability_for_mode(PromptTransportMode.STDIN, source="adapter_shape_protocol")
+    if any(
+        name in _RPC_PROTOCOL_MARKERS or name.endswith("_http") for name in protocols
+    ):
+        return capability_for_mode(
+            PromptTransportMode.RPC, source="adapter_shape_protocol"
+        )
+    if any(name in _STDIN_PROTOCOL_MARKERS for name in protocols):
+        return capability_for_mode(
+            PromptTransportMode.STDIN, source="adapter_shape_protocol"
+        )
+    if str(getattr(adapter, "base_url", "") or "").strip():
+        return capability_for_mode(
+            PromptTransportMode.RPC, source="adapter_shape_http_base_url"
+        )
     return default_prompt_transport_capability()
 
 

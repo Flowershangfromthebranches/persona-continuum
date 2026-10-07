@@ -1,0 +1,68 @@
+{
+  "status": "RAN",
+  "probe_status": "failed_payment",
+  "max_verified": 1,
+  "serial": {
+    "width": 1,
+    "wall_s": 7.6049,
+    "success_count": 0,
+    "requested_width": 1,
+    "unique_sessions": 1,
+    "correlation_ok": false,
+    "errors": [
+      "Error: Internal error: {\n  \"message\": \"API error (status 402 Payment Required): Grok Build usage balance exhausted\",\n  \"http_status\": 402\n}\n"
+    ],
+    "session_ids": [
+      "sess_7c1c5b25f371"
+    ],
+    "rows": [
+      {
+        "label": "TASK-01",
+        "session_id": "sess_7c1c5b25f371",
+        "elapsed_s": 7.6047,
+        "text_head": "",
+        "matched": false,
+        "error": "Error: Internal error: {\n  \"message\": \"API error (status 402 Payment Required): Grok Build usage balance exhausted\",\n  \"http_status\": 402\n}\n"
+      }
+    ]
+  },
+  "speedup_valid": false,
+  "two_speedup": null,
+  "four_speedup": null,
+  "identity": {
+    "adapter_id": "grok",
+    "binary_identity": "9a89c6813e0f3e110a229f6238aad35c",
+    "binary_version": "grok 1.0.25 (f7e67d6988e2)",
+    "model_id": "grok-4.6",
+    "runtime_origin": "xai",
+    "probe_version": "independent-session-concurrency-v1",
+    "credential_identity_hash": "set"
+  },
+  "capability": {
+    "state": "unverified",
+    "source": "fallback",
+    "verified": false,
+    "max_verified": 1,
+    "current_recommended": 1,
+    "effective_limit": 1,
+    "parallel_independent_sessions_verified": false,
+    "parallel_same_session_verified": false,
+    "probe_status": "failed_payment",
+    "probe_sample_count": 1,
+    "verified_at": null,
+    "expires_at": null,
+    "downgrade_reason": null,
+    "downgrade_expires_at": null,
+    "last_failure_kind": "failed_payment",
+    "identity": {
+      "adapter_id": "grok",
+      "binary_identity": "9a89c6813e0f3e110a229f6238aad35c",
+      "binary_version": "grok 1.0.25 (f7e67d6988e2)",
+      "model_id": "grok-4.6",
+      "runtime_origin": "xai",
+      "probe_version": "independent-session-concurrency-v1",
+      "credential_identity_hash": "set"
+    }
+  },
+  "GROK_CONCURRENCY_LIVE_PROBE": "RAN"
+}

@@ -265,6 +265,9 @@ def test_invalid_commit_reflection_rolls_back_all_writes(app: PersonaContinuum) 
     persona = _create_persona(app, "rc5-reflection-atomic")
     branch_a, _ = _branches(app, persona.id)
     turn = _commit_turn(app, persona.id, branch_a.id, session_title="A")
+    before_trust = app.relationships.get_relationship(
+        persona.id, "Alice", branch_id=branch_a.id
+    ).trust
     before_memories = app.database.conn.execute(
         "SELECT COUNT(*) AS count FROM memories WHERE source_kind = 'reflection_summary'"
     ).fetchone()["count"]
@@ -281,7 +284,10 @@ def test_invalid_commit_reflection_rolls_back_all_writes(app: PersonaContinuum) 
         "SELECT COUNT(*) AS count FROM memories WHERE source_kind = 'reflection_summary'"
     ).fetchone()["count"]
     assert after_memories == before_memories
-    assert app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust == 0
+    assert (
+        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust
+        == before_trust
+    )
 
 
 def test_multisession_reflection_records_all_support_edges(app: PersonaContinuum) -> None:
@@ -334,15 +340,21 @@ def test_deleting_one_support_session_keeps_multisession_reflection_until_last_s
     persona = _create_persona(app, "rc5-delete-support")
     branch_a, _ = _branches(app, persona.id)
     turn_one = _commit_turn(app, persona.id, branch_a.id, session_title="one")
+    one_turn_trust = app.relationships.get_relationship(
+        persona.id, "Alice", branch_id=branch_a.id
+    ).trust
     turn_two = _commit_turn(app, persona.id, branch_a.id, session_title="two")
+    before_trust = app.relationships.get_relationship(
+        persona.id, "Alice", branch_id=branch_a.id
+    ).trust
     result = app.sessions.commit_reflection(
         persona.id,
         _reflection_artifact([turn_one["turn_id"], turn_two["turn_id"]], tag="RC5_DELETE_SUPPORT"),
         branch_id=branch_a.id,
     )
-    assert (
-        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust == 0.8
-    )
+    assert app.relationships.get_relationship(
+        persona.id, "Alice", branch_id=branch_a.id
+    ).trust == pytest.approx(before_trust + 0.8)
 
     app.sessions.delete_session(persona.id, turn_one["session"].id, delete_derived_memories=True)
 
@@ -353,9 +365,9 @@ def test_deleting_one_support_session_keeps_multisession_reflection_until_last_s
         tuple(result["memory_ids"]),
     ).fetchall()
     assert len(remaining) == len(result["memory_ids"])
-    assert (
-        app.relationships.get_relationship(persona.id, "Alice", branch_id=branch_a.id).trust == 0.8
-    )
+    assert app.relationships.get_relationship(
+        persona.id, "Alice", branch_id=branch_a.id
+    ).trust == pytest.approx(one_turn_trust + 0.8)
     for row in remaining:
         metadata = json.loads(row["metadata_json"])
         assert metadata["supporting_session_ids"] == [turn_two["session"].id]

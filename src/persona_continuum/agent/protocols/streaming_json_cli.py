@@ -12,6 +12,7 @@ from persona_continuum.agent.adapter import (
     resolve_binary,
     safe_exec_cmd,
 )
+from persona_continuum.agent.context_fields import CLAUDE_USAGE_SEMANTICS, ContextScope
 from persona_continuum.agent.models import (
     AgentCapabilityFlags,
     AgentEvent,
@@ -37,6 +38,18 @@ from persona_continuum.auth.credentials import CredentialManager, build_runtime_
 
 
 class StreamingJsonCliAdapter(AgentAdapter):
+    # Prompt is written to the child stdin pipe (see send()).  Without this
+    # declaration the transport resolver used to classify the adapter as
+    # unknown/64KB because exec_args are streaming flags, not -p.
+    prompt_transport_mode = "stdin"
+    protocols = ["streaming_json_cli"]
+    usage_context_semantics = CLAUDE_USAGE_SEMANTICS
+    context_scope = ContextScope.PER_REQUEST
+    adapter_session_mode = "per_request"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = True
+    max_parallel_independent_sessions = 4
+
     def __init__(
         self,
         adapter_id: str,

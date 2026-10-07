@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from persona_continuum.agent.adapters.fake import FakeAgentAdapter
+from persona_continuum.agent.models import AgentEvent, AgentEventType
 from persona_continuum.agent.response_collector import AgentTimeoutError
 from persona_continuum.application.persona_creation_service import (
     PersonaCreationJob,
@@ -173,6 +174,67 @@ async def test_persona_agent_turn_persists_binding_activity_and_attempt_count(ap
     assert persisted.progress.agent_call_completed_count == 1
     assert persisted.progress.agent_call_failed_count == 0
     assert "agent_call_in_flight" not in persisted.job_config
+
+
+class _OauthBlipThenOk(FakeAgentAdapter):
+    def __init__(self) -> None:
+        super().__init__(adapter_id="oauth_blip_agent", chunk_delay_sec=0.0)
+        self.failures = 0
+
+    async def send(self, session, turn):  # type: ignore[no-untyped-def]
+        if self.failures < 1:
+            self.failures += 1
+            yield AgentEvent(
+                type=AgentEventType.ERROR,
+                error="AGENT_PROCESS_EXITED_WITHOUT_OUTPUT: Eligibility check failed: EOF",
+                metadata={
+                    "failure_code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                    "failure": {
+                        "code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                        "message": (
+                            'Eligibility check failed: Get '
+                            '"https://www.googleapis.com/oauth2/v2/userinfo": EOF'
+                        ),
+                        "retriable": True,
+                    },
+                    "returncode": 1,
+                },
+            )
+            return
+        async for event in super().send(session, turn):
+            yield event
+
+
+@pytest.mark.anyio
+async def test_transient_oauth_eof_is_retried_and_does_not_fail_job(app) -> None:
+    adapter = _OauthBlipThenOk()
+    app.agent_registry.register_adapter(adapter)
+    await app.agent_discovery.scan(force_refresh=True)
+    app.persona_creation.TRANSIENT_AGENT_RETRY_BACKOFF_SECONDS = (0.0, 0.0)
+    job = PersonaCreationJob(
+        id="pcjob_oauth_blip",
+        display_name="OAuth Blip Persona",
+        persona_type=PersonaType.FICTIONAL_OR_SYNTHETIC_PERSON,
+        creation_mode="fictional",
+        runtime_source="test",
+        agent_id=adapter.adapter_id,
+        model_id="fake-gpt-5",
+        job_config={"runtime_binding_snapshot": {"binding_status": "verified"}},
+    )
+
+    result = await app.persona_creation._run_agent(
+        job,
+        user_message="Return a short response.",
+        system_prompt="You are a test Agent.",
+        participant_id="oauth_blip",
+        phase="material_classification",
+    )
+
+    assert result.text
+    assert adapter.failures == 1
+    persisted = app.persona_creation.get_job(job.id)
+    assert persisted.progress.agent_call_attempt_count == 2
+    assert persisted.progress.agent_call_completed_count == 1
 
 
 @pytest.mark.anyio

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from persona_continuum.application._utils import loads
+from persona_continuum.domain.core_traits import CORE_COMPONENT_KEYS
 from persona_continuum.storage.database import Database
 
 
@@ -63,6 +64,7 @@ class CompiledPersonaContextService:
                 },
                 "components": [],
                 "by_key": {},
+                "core_components": {},
                 "active_goals": self._runtime_active_goals(
                     persona_id, branch_id=effective_branch_id
                 ),
@@ -91,10 +93,9 @@ class CompiledPersonaContextService:
         selected = [component for _, component in scored[:max_items]]
         selected_ids = {str(component["component_id"]) for component in selected}
         priority_keys = {
-            "values",
-            "needs_and_desires",
-            "decision_heuristics",
-            "expression_style",
+            *CORE_COMPONENT_KEYS,
+            "mental_models",
+            "defenses",
             "branch_provenance",
             "persona_state_delta",
             "relationship_delta",
@@ -110,6 +111,12 @@ class CompiledPersonaContextService:
         if max_context_size is not None:
             selected = self._fit_budget(selected, max_context_size)
         by_key = {str(component["component_key"]): component["content"] for component in selected}
+        core_components = {
+            component["component_key"]: component["content"]
+            for _, component in scored
+            if component["component_type"] == "persona_component"
+            and component["component_key"] in CORE_COMPONENT_KEYS
+        }
         runtime_state = self._runtime_state(persona_id, effective_branch_id)
         active_goals = self._active_goals(by_key)
         active_goals.extend(
@@ -129,9 +136,32 @@ class CompiledPersonaContextService:
             },
             "components": selected,
             "by_key": by_key,
+            "core_components": core_components,
             "active_goals": active_goals,
             "runtime": runtime_state,
         }
+
+    def runtime_seed_components(self, persona_id: str) -> list[dict[str, Any]]:
+        """Read seed inputs independently of retrieval ranking or prompt budget."""
+        version = self._latest_base_version(persona_id)
+        rows = self.database.conn.execute(
+            """SELECT id, component_key, content_json FROM compiled_components
+               WHERE persona_id=? AND version=? AND component_type='persona_component'
+               AND component_key IN ('temperament', 'attachment_patterns',
+                                     'needs_and_desires', 'relationships',
+                                     'dominant_traits',
+                                     'identity_profile', 'embodied_identity',
+                                     'expression_style')""",
+            (persona_id, version),
+        ).fetchall()
+        return [
+            {
+                "component_id": str(row["id"]),
+                "component_key": str(row["component_key"]),
+                "content": loads(row["content_json"]),
+            }
+            for row in rows
+        ]
 
     def _latest_base_version(self, persona_id: str) -> int | None:
         row = self.database.conn.execute(

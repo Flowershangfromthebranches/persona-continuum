@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -235,6 +236,23 @@ class CredentialManager:
         except KeyError:
             return False
         return True
+
+    def credential_identity_hash(self, credential: CredentialProvider | str | None) -> str:
+        """Irreversible identity for "is this the same credential set?".
+
+        Used to bind a verified runtime capability to one account without ever
+        persisting (or logging) the underlying secret.  Returns ``""`` when the
+        credential cannot be resolved.
+        """
+
+        if not credential:
+            return ""
+        try:
+            runtime = self.get(credential)
+        except (KeyError, ValueError):
+            return ""
+        material = f"{runtime.provider.value}\x1f{runtime.base_url}\x1f{runtime.api_key}"
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
     def request_headers(self, credential_id: str) -> tuple[str, dict[str, str]]:
         credential = self.get(credential_id)

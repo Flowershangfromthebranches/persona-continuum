@@ -104,13 +104,23 @@ async def test_orchestrator_multi_turn_flow(app: PersonaContinuum) -> None:
     room_after_t2 = app.orchestrator.get_room(room.id)
     assert room_after_t2 is not None
     assert room_after_t2.turn_index == 2
-    assert len(room_after_t2.transcript) == 2
+    # The user message is a committed transcript entry of its own: it is the
+    # raw-history fact source (L0) that later turns, summaries and memory
+    # consolidation all read from.  So turn 2 adds TWO entries: the injected
+    # user message and the persona reply.
+    assert len(room_after_t2.transcript) == 3
+    assert [entry.get("participant_id") for entry in room_after_t2.transcript] == [
+        "slot_elon",
+        "user",
+        "slot_elon",
+    ]
 
     # 6. Check transcripts in sqlite
     transcripts = app.orchestrator.list_room_transcripts(room.id)
-    assert len(transcripts) == 2
-    assert transcripts[1].participant_id == "slot_elon"
-    assert transcripts[1].agent_runtime_id == "fake_agent"
+    assert len(transcripts) == 3
+    assert transcripts[1].participant_id == "user"
+    assert transcripts[2].participant_id == "slot_elon"
+    assert transcripts[2].agent_runtime_id == "fake_agent"
 
     # 7. Stop room
     stopped_room = await app.orchestrator.stop_room(room.id)

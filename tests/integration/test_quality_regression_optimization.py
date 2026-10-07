@@ -8,6 +8,7 @@ only change *how* the same work is scheduled, cached, and reused.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -57,7 +58,12 @@ class JsonRuntime(FakeAgentAdapter):
                 (d for d in REQUIRED_DIMENSIONS if f"提取维度 {d}" in prompt),
                 REQUIRED_DIMENSIONS[0],
             )
-            source_id = (session.config.extra.get("source_ids") or ["src_missing"])[0]
+            source_match = re.search(r'SOURCE_IDS:\s*\["([^"]+)"', prompt)
+            source_id = (
+                source_match.group(1)
+                if source_match
+                else (session.config.extra.get("source_ids") or ["src_missing"])[0]
+            )
             payload = {
                 "artifact_id": f"art_{dimension}",
                 "schema_version": "1.1",

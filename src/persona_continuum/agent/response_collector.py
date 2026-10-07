@@ -593,6 +593,7 @@ class AgentResponseCollector:
         for key in (
             "stderr_tail",
             "failure_code",
+            "failure_subtype",
             "returncode",
             "command_shape",
             "fallback",

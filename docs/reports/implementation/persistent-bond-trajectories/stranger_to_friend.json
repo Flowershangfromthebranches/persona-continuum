@@ -1,0 +1,312 @@
+[
+  {
+    "relationship_kind": "acquaintance",
+    "bond_stage": "new",
+    "familiarity": 0.41384504253317966,
+    "trust": 0.04729494044960385,
+    "affection": 0.04729494044960385,
+    "dependence": 0.0,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "warming",
+    "turn": 10,
+    "active_emotions": {
+      "affection": 0.0384,
+      "hope": 0.0276,
+      "joy": 0.0492
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.476,
+      "autonomy": 0.5,
+      "being_understood": 0.4829,
+      "belonging": 0.4768,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.4794,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "acquaintance",
+    "bond_stage": "new",
+    "familiarity": 0.6668902338916533,
+    "trust": 0.1787670954086546,
+    "affection": 0.1787670954086546,
+    "dependence": 0.0,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "warming",
+    "turn": 20,
+    "active_emotions": {
+      "affection": 0.0987,
+      "hope": 0.0714,
+      "joy": 0.1251
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.4215,
+      "autonomy": 0.5,
+      "being_understood": 0.4439,
+      "belonging": 0.4245,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.4327,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "acquaintance",
+    "bond_stage": "forming",
+    "familiarity": 0.8047460592149795,
+    "trust": 0.2908938524211814,
+    "affection": 0.2908938524211814,
+    "dependence": 0.0,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "warming",
+    "turn": 30,
+    "active_emotions": {
+      "affection": 0.1698,
+      "hope": 0.1244,
+      "joy": 0.213
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.371,
+      "autonomy": 0.5,
+      "being_understood": 0.4078,
+      "belonging": 0.3753,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.3894,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "friend",
+    "bond_stage": "forming",
+    "familiarity": 0.8890378837232426,
+    "trust": 0.3963243046932549,
+    "affection": 0.3963243046932549,
+    "dependence": 0.0,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "warming",
+    "turn": 40,
+    "active_emotions": {
+      "affection": 0.2684,
+      "hope": 0.1998,
+      "joy": 0.3313
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.2642,
+      "autonomy": 0.5,
+      "being_understood": 0.3316,
+      "belonging": 0.2752,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.2979,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "friend",
+    "bond_stage": "forming",
+    "familiarity": 0.9349590054533689,
+    "trust": 0.4788574703663447,
+    "affection": 0.4788574703663447,
+    "dependence": 0.03130459411607948,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 50,
+    "active_emotions": {
+      "affection": 0.3574,
+      "hope": 0.2705,
+      "joy": 0.4342
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.1849,
+      "autonomy": 0.5,
+      "being_understood": 0.275,
+      "belonging": 0.1969,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.2299,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "friend",
+    "bond_stage": "forming",
+    "familiarity": 0.9630374354001623,
+    "trust": 0.5563527509915394,
+    "affection": 0.5563527509915394,
+    "dependence": 0.06778317548796856,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 60,
+    "active_emotions": {
+      "affection": 0.4491,
+      "hope": 0.3462,
+      "joy": 0.536
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.0571,
+      "autonomy": 0.5,
+      "being_understood": 0.1837,
+      "belonging": 0.0704,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.1204,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "friend",
+    "bond_stage": "established",
+    "familiarity": 0.9783342095191175,
+    "trust": 0.6170081283349839,
+    "affection": 0.6170081283349839,
+    "dependence": 0.09991005949126978,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 70,
+    "active_emotions": {
+      "affection": 0.5241,
+      "hope": 0.411,
+      "joy": 0.6158
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.0,
+      "autonomy": 0.5,
+      "being_understood": 0.12,
+      "belonging": 0.0,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.044,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "close_friend",
+    "bond_stage": "established",
+    "familiarity": 0.9876874087513834,
+    "trust": 0.6739601352105187,
+    "affection": 0.6739601352105187,
+    "dependence": 0.13380519602244156,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 80,
+    "active_emotions": {
+      "affection": 0.601,
+      "hope": 0.4806,
+      "joy": 0.6939
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.0,
+      "autonomy": 0.5,
+      "being_understood": 0.0163,
+      "belonging": 0.0,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.0,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "close_friend",
+    "bond_stage": "established",
+    "familiarity": 0.9927829136003608,
+    "trust": 0.7185362586764955,
+    "affection": 0.7185362586764955,
+    "dependence": 0.1636567761178503,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 90,
+    "active_emotions": {
+      "affection": 0.666,
+      "hope": 0.5423,
+      "joy": 0.7566
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.0,
+      "autonomy": 0.5,
+      "being_understood": 0.0,
+      "belonging": 0.0,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.0,
+      "touch_closeness": 0.2
+    }
+  },
+  {
+    "relationship_kind": "close_friend",
+    "bond_stage": "established",
+    "familiarity": 0.9958985556089857,
+    "trust": 0.7603907376631052,
+    "affection": 0.7603907376631052,
+    "dependence": 0.19515137134763383,
+    "resentment": 0.0,
+    "perceived_threat": 0.0,
+    "trajectory": "deepening",
+    "turn": 100,
+    "active_emotions": {
+      "affection": 0.7276,
+      "hope": 0.6042,
+      "joy": 0.8129
+    },
+    "active_needs": {
+      "achievement": 0.5,
+      "attachment": 0.0,
+      "autonomy": 0.5,
+      "being_understood": 0.0,
+      "belonging": 0.0,
+      "continuity": 0.5,
+      "control": 0.5,
+      "curiosity": 0.5,
+      "intimacy": 0.2,
+      "recognition": 0.5,
+      "safety": 0.0,
+      "touch_closeness": 0.2
+    }
+  }
+]

@@ -10,20 +10,11 @@
 
 ### 快速使用
 
-1. 安装项目并执行 `uv run persona-continuum init`。
-2. 导入 `personas/` 下的六个包：
+1. 安装项目后运行 `uv run persona-continuum web`。首次启动会自动导入这六位人格（每个数据目录只导入一次，不覆盖同名人格）。
+2. 打开网页，在房间页点击「进入太卜阁」。模板会按名称绑定六位人格，并为每个席位预选本机可用的 Agent Host 与模型。
+3. 核对 Agent、模型与 Reasoning Effort 后启动房间。
 
-   ```bash
-   uv run persona-continuum import examples/taibuge/personas/xuanheng-xiansheng.persona.zip
-   uv run persona-continuum import examples/taibuge/personas/ziping-xiansheng.persona.zip
-   uv run persona-continuum import examples/taibuge/personas/ziwei-xiansheng.persona.zip
-   uv run persona-continuum import examples/taibuge/personas/yigua-xiansheng.persona.zip
-   uv run persona-continuum import examples/taibuge/personas/sanshi-xiansheng.persona.zip
-   uv run persona-continuum import examples/taibuge/personas/western-divination-consultant.persona.zip
-   ```
-
-3. 启动 Web UI，新建房间，选择内置模板“太卜阁 · 术数综合会诊”。模板会按名称匹配六位已导入人物。
-4. 为每个席位选择本机可用的 Agent Host、模型与 Reasoning Effort，核对后启动房间。
+如需手动导入（例如删除后想重新安装），仍可使用 `uv run persona-continuum import examples/taibuge/personas/<包名>.persona.zip`。
 
 新建房间默认是空白的：不预填标题、协议、讨论方式、发言方式或参与者。只有选择模板或手动添加席位后，才会写入配置。
 
@@ -37,10 +28,11 @@ This directory provides six importable sample Persona compiled packages (Xuanhen
 
 ### Quick start
 
-1. Install the project and run `uv run persona-continuum init`.
-2. Import all six archives from `personas/` with `uv run persona-continuum import <archive>`.
-3. Start the Web UI, create a Room, and select the built-in `太卜阁 · 术数综合会诊` template. The template matches the imported Personas by name.
-4. Select a locally available Agent Host, model, and Reasoning Effort for each seat, review the bindings, and start the Room.
+1. Install the project and run `uv run persona-continuum web`. The first start imports all six personas automatically (once per data directory; existing personas with the same id are never overwritten).
+2. Open the Web UI and click "Enter Taibuge" on the Rooms page. The template binds each seat to its persona by name and pre-selects a locally available Agent Host and model.
+3. Review the Agent, model, and Reasoning Effort bindings, then start the Room.
+
+To import manually (for example after deleting one), run `uv run persona-continuum import examples/taibuge/personas/<package>.persona.zip`.
 
 A new Room now opens blank: no title, protocol, discussion/speaker mode, or participants are prefilled. Configuration appears only after choosing a template or adding seats manually.
 

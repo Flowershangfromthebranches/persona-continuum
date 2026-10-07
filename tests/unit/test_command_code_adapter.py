@@ -98,6 +98,8 @@ def test_command_code_adapter_parse_models() -> None:
     assert gemini_model.provider == "google"
 
     # Verify xai model
+    kimi = by_id["moonshotai/kimi-k3"]
+    assert kimi.context_window == 1_000_000
     grok_model = by_id["xai/grok-4.6"]
     assert grok_model.provider == "xai"
 

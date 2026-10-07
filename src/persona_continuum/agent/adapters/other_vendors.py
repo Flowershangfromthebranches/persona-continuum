@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from pathlib import Path
 
 from persona_continuum.agent.adapter import resolve_binary, safe_exec_cmd
+from persona_continuum.agent.context_capability import (
+    ContextWindowMode,
+    default_model_capability_registry,
+)
+from persona_continuum.agent.context_fields import extract_context_window
 from persona_continuum.agent.models import (
     AgentProbeResult,
+    AgentSessionConfig,
     AgentStatus,
     ModelCapability,
     ResearchCapability,
@@ -12,6 +20,7 @@ from persona_continuum.agent.models import (
     SelectionStrategy,
 )
 from persona_continuum.agent.protocols.plain_cli import PlainCliAdapter
+from persona_continuum.numeric import safe_int
 
 
 class QwenAdapter(PlainCliAdapter):
@@ -89,6 +98,7 @@ class QwenAdapter(PlainCliAdapter):
 
 class KimiAdapter(PlainCliAdapter):
     def __init__(self) -> None:
+        registry = default_model_capability_registry()
         super().__init__(
             adapter_id="kimi",
             name="Kimi CLI",
@@ -108,7 +118,8 @@ class KimiAdapter(PlainCliAdapter):
                     provider="moonshot",
                     supported_reasoning_efforts=["none", "low", "medium", "high"],
                     default_reasoning_effort="high",
-                    source="config",
+                    context_window=registry.native_context_window("kimi-k3"),
+                    source="official_capability_table",
                     reasoning_selection=SelectionStrategy.STARTUP,
                 ),
                 ModelCapability(
@@ -143,6 +154,8 @@ class KimiAdapter(PlainCliAdapter):
 
 
 class CopilotAdapter(PlainCliAdapter):
+    upstream_context_is_native_only = True
+
     def __init__(self) -> None:
         super().__init__(
             adapter_id="copilot",
@@ -189,7 +202,11 @@ class CopilotAdapter(PlainCliAdapter):
 
 
 class QoderAdapter(PlainCliAdapter):
+    context_window_mode = ContextWindowMode.CONFIGURABLE_AND_DISCOVERABLE
+
     def __init__(self) -> None:
+        self._listing_auth_required = False
+        self._listing_unavailable = False
         super().__init__(
             adapter_id="qoder",
             name="Qoder",
@@ -226,8 +243,35 @@ class QoderAdapter(PlainCliAdapter):
             default_models=self._fallback_models(),
         )
 
+    def build_extra_cli_args(self, config: AgentSessionConfig) -> list[str]:
+        """Bind `--context-window` when the user requested a configurable size.
+
+        The flag is a request.  Effective context is whatever the runtime
+        later reports; requested 1M is never treated as already-granted 1M.
+        """
+
+        requested = safe_int(
+            (config.extra or {}).get("requested_context_window")
+            or (config.extra or {}).get("context_window"),
+            default=None,
+            minimum=1,
+        )
+        if requested is None:
+            return []
+        return ["--context-window", str(requested)]
+
     async def probe(self) -> AgentProbeResult:
         result = await super().probe()
+        if result.status == AgentStatus.READY and self._listing_auth_required:
+            return result.model_copy(update={
+                "status": AgentStatus.AUTH_REQUIRED, "auth_status": "auth_required",
+                "models": [], "status_detail": "Qoder login required (run qodercli login)",
+            })
+        if result.status == AgentStatus.READY and self._listing_unavailable:
+            return result.model_copy(update={
+                "status": AgentStatus.DETECTED, "auth_status": "unverified",
+                "models": [], "status_detail": "Qoder model discovery unavailable; rescan to retry",
+            })
         # ``list_models`` may pin a different edition than the one the base
         # probe read its version from (for example the international build is
         # not logged in while the CN build is).  Re-read the version from the
@@ -262,6 +306,7 @@ class QoderAdapter(PlainCliAdapter):
             ("Kimi-K2.7-Code", "moonshot"),
             ("MiniMax-M2.7", "minimax"),
         ]
+        registry = default_model_capability_registry()
         return [
             ModelCapability(
                 id=m_id,
@@ -269,7 +314,8 @@ class QoderAdapter(PlainCliAdapter):
                 provider=provider,
                 supported_reasoning_efforts=["none", "low", "medium", "high"],
                 default_reasoning_effort="medium",
-                source="config",
+                context_window=registry.native_context_window(m_id),
+                source="official_cli",
                 reasoning_selection=SelectionStrategy.STARTUP,
             )
             for m_id, provider in known
@@ -290,15 +336,27 @@ class QoderAdapter(PlainCliAdapter):
             resolved = resolve_binary([candidate])
             if resolved and resolved not in paths:
                 paths.append(resolved)
+        # The official dispatcher forwards to the installed CLI, not another edition.
+        if any(Path(path).name == "qodercli" for path in paths):
+            paths = [p for p in paths if not p.endswith("/.qoder/entry/qoder")]
         return paths
 
     async def list_models(self) -> list[ModelCapability]:
         merged: dict[str, ModelCapability] = {}
         listing_binaries: list[str] = []
-        for binary in self._candidate_binaries():
-            code, out, err = await safe_exec_cmd([binary, "--list-models"], timeout=6.0)
+        self._listing_auth_required = False
+        self._listing_unavailable = False
+        binaries = self._candidate_binaries()
+        results = await asyncio.gather(*(
+            safe_exec_cmd([binary, "--list-models"], timeout=8.0) for binary in binaries
+        ))
+        for binary, (code, out, err) in zip(binaries, results, strict=True):
             output = out or err or ""
-            if code != 0 or "not logged in" in output.lower():
+            if "not logged in" in output.lower():
+                self._listing_auth_required = True
+                continue
+            if code != 0:
+                self._listing_unavailable = True
                 continue
             parsed = self._parse_models(output)
             if not parsed:
@@ -307,10 +365,13 @@ class QoderAdapter(PlainCliAdapter):
             for model in parsed:
                 merged.setdefault(model.id.lower(), model)
         if merged:
+            self._listing_auth_required = False
+            self._listing_unavailable = False
             # Sessions must run on an edition that served the model list.
             self._resolved_binary = listing_binaries[0]
             return list(merged.values())
-        return self._fallback_models()
+        self._listing_unavailable = self._listing_unavailable or not self._listing_auth_required
+        return []
 
     @staticmethod
     def _provider_for(model_id: str) -> str:
@@ -345,6 +406,17 @@ class QoderAdapter(PlainCliAdapter):
             if key in seen:
                 continue
             seen.add(key)
+            window = extract_context_window({"text": line_s})
+            if window is None:
+                match = re.search(r"(\d+(?:\.\d+)?)\s*[Mm](?:\s*context)?", line_s)
+                if match:
+                    window = int(float(match.group(1)) * 1_000_000)
+                else:
+                    k_match = re.search(r"(\d+)\s*[Kk](?:\s*context)?", line_s)
+                    if k_match:
+                        window = int(k_match.group(1)) * 1_000
+            if window is None:
+                window = default_model_capability_registry().native_context_window(m_id)
             models.append(
                 ModelCapability(
                     id=m_id,
@@ -352,6 +424,7 @@ class QoderAdapter(PlainCliAdapter):
                     provider=self._provider_for(m_id),
                     supported_reasoning_efforts=["none", "low", "medium", "high"],
                     default_reasoning_effort="medium",
+                    context_window=window,
                     # The listing came from the official CLI and the adapter
                     # binds --reasoning-effort at session startup; classifying
                     # it as "dynamic" would hide the effort ladder from the UI.

@@ -445,7 +445,9 @@ class CompilationService:
             "source_coverage": min(1.0, source_count / 3),
             "claim_coverage": min(1.0, claim_count / 8),
             "memory_coverage": min(1.0, memory_count / 8),
-            "compiled_component_coverage": min(1.0, component_count / 18),
+            "compiled_component_coverage": min(
+                1.0, component_count / max(len(COMPILE_CONTRACT), 1)
+            ),
             "gap_report_absent": 0.0 if gap_rows else 1.0,
         }
         score = (
@@ -759,11 +761,14 @@ class CompilationService:
             "affect/emotional_triggers.json": merged["emotional_triggers"],
             "affect/attachment.json": merged["attachment_patterns"],
             "affect/needs.json": merged["needs_and_desires"],
+            "identity/dominant_traits.json": merged["dominant_traits"],
+            "identity/embodied_identity.json": merged["embodied_identity"],
             "affect/defenses.json": merged["defenses"],
             "expression/style.json": merged["expression_style"],
             "expression/vocabulary.json": merged["vocabulary"],
             "expression/dialogue_examples.jsonl": merged["dialogue_examples"],
             "expression/anti_patterns.json": merged["anti_patterns"],
+            "identity/erotic_profile.json": merged["erotic_profile"],
             "relationships/relationships.json": merged["relationships"],
         }
         for relative, value in file_map.items():

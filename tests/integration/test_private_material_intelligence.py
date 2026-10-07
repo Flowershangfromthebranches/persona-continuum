@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -44,14 +45,16 @@ def _source(app, persona_id: str, text: str, *, source_type: str = "txt", metada
 
 
 @pytest.mark.anyio
-async def test_material_classification_cancels_sibling_windows_after_failure(
+async def test_material_classification_keeps_healthy_windows_after_failure(
     app, monkeypatch
 ) -> None:
+    persona = _persona(app)
+    source = _source(app, persona.id, "fixture")
     units = [
         EvidenceUnit(
             id=f"evidence-{index}",
-            persona_id="persona-test",
-            source_id=f"source-{index}",
+            persona_id=persona.id,
+            source_id=source.id,
             text=f"material {index}",
             normalized_text=f"material {index}",
         )
@@ -72,7 +75,7 @@ async def test_material_classification_cancels_sibling_windows_after_failure(
         lambda *_args, **_kwargs: windows,
     )
     both_started = asyncio.Event()
-    sibling_cancelled = asyncio.Event()
+    sibling_completed = asyncio.Event()
     calls = 0
 
     async def analyzer(_phase, request):
@@ -81,13 +84,11 @@ async def test_material_classification_cancels_sibling_windows_after_failure(
         if calls == 2:
             both_started.set()
         await both_started.wait()
-        if request["_participant_id"].endswith(":0"):
+        if request["target_units"] == ["evidence-0"]:
             raise RuntimeError("classification_timeout")
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            sibling_cancelled.set()
-            raise
+        await asyncio.sleep(0)
+        sibling_completed.set()
+        return {"units": []}
 
     with pytest.raises(RuntimeError, match="classification_timeout"):
         await app.material_intelligence._classify_with_agent(
@@ -96,7 +97,7 @@ async def test_material_classification_cancels_sibling_windows_after_failure(
             execution_profile=ResolvedExecutionProfile(parallel_safe=True),
         )
 
-    await asyncio.wait_for(sibling_cancelled.wait(), timeout=0.2)
+    await asyncio.wait_for(sibling_completed.wait(), timeout=0.2)
     assert calls == 2
 
 
@@ -385,8 +386,11 @@ def test_guided_interview_targets_remaining_gaps(app) -> None:
 @pytest.mark.anyio
 async def test_compiler_uses_fused_evidence(app, monkeypatch) -> None:
     persona = _persona(app)
+    # P0.1: a singleton evidence no longer fuses with itself; fused rows now
+    # exist only when two or more EvidenceUnits merge.
     source = _source(app, persona.id, "我会记录风险并做决定。")
-    app.material_intelligence.analyze_sources(persona.id, [source.id])
+    second = _source(app, persona.id, "我会记录风险再做决定。")
+    app.material_intelligence.analyze_sources(persona.id, [source.id, second.id])
     task = app.compilation.create_task(persona.id)
     job = PersonaCreationJob(
         id="pcjob_compiler_fused",
@@ -398,7 +402,8 @@ async def test_compiler_uses_fused_evidence(app, monkeypatch) -> None:
         model_id="fake-gpt-5",
         persona_id=persona.id,
         compilation_task_id=task.id,
-        source_ids=[source.id],
+            source_ids=[source.id],
+            persona_notes="",
     )
     prompts: list[tuple[str, str]] = []
 
@@ -541,3 +546,41 @@ def test_old_persona_version_preserved(app) -> None:
     )
     versions = app.profile_library.list_versions(profile.id)
     assert versions and versions[0].version == profile.version
+
+
+def test_fused_evidence_retrieval_bounds_intelligence(app: Any) -> None:
+    from persona_continuum.application.material_intelligence import FusedEvidence
+
+    persona = _persona(app)
+    source = _source(app, persona.id, "源文本内容。")
+    index = app.material_intelligence.get_index(persona.id)
+    units = [
+        EvidenceUnit(
+            id=f"evu_test_{i}",
+            persona_id=persona.id,
+            source_id=source.id,
+            text=f"Text {i}",
+            normalized_text=f"Text {i}",
+            metadata={"evidence_intelligence": {"claims": [f"claim {i}"]}},
+        )
+        for i in range(10)
+    ]
+    app.material_intelligence._persist_units(units)
+    fused = [
+        FusedEvidence(
+            id="evf_test_1",
+            persona_id=persona.id,
+            canonical_claim="Canonical claim",
+            evidence_type="fused",
+            dimension_scores={"interviews_and_dialogue": 0.8},
+            supporting_evidence_ids=[u.id for u in units],
+            unique_evidence_ids=[u.id for u in units],
+            source_ids=[source.id],
+        )
+    ]
+    app.material_intelligence._persist_fused(fused)
+    retrieved = index.retrieve("interviews_and_dialogue")
+    fused_candidates = [c for c in retrieved if c.get("kind") == "fused"]
+    assert fused_candidates
+    assert len(fused_candidates[0]["intelligence"]) <= 4
+

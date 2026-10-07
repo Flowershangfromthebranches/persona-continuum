@@ -30,7 +30,8 @@ def test_gemini_cli_models_are_parsed_from_runtime_output() -> None:
         "claude-sonnet-4-6",
         "gemini-3.7-flash-low",
     ]
-    assert models[0].supported_reasoning_efforts == ["high"]
+    # agy bakes effort into the id; siblings of one family share the ladder.
+    assert models[0].supported_reasoning_efforts == ["high", "low"]
     assert models[0].source == "official_cli"
     assert models[1].supported_reasoning_efforts == []
 

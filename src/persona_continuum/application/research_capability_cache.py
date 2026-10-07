@@ -82,6 +82,7 @@ class ResearchCapabilityCache:
         """Hash only safe runtime policy metadata; never prompt or source text."""
 
         payload = {
+            "probe_contract_version": 2,
             "agent_version": str(agent_version or "unknown"),
             "model_id": str(model_id or "default"),
             "runtime_source": str(runtime_source or "local_cli").lower(),
@@ -308,6 +309,15 @@ class ResearchCapabilityCache:
         if rows is None:
             return None
         row_keys = set(rows.keys())
+        fingerprint = self.configuration_fingerprint(
+            agent_version=agent_version, model_id=str(rows["model_id"]),
+            runtime_source=runtime_source,
+        )
+        if (
+            "configuration_fingerprint" not in row_keys
+            or rows["configuration_fingerprint"] != fingerprint
+        ):
+            return None
         return self.get(
             agent_id=str(rows["agent_id"]),
             agent_version=str(rows["agent_version"]),

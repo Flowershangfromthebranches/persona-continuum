@@ -38,7 +38,13 @@ def _unit(index: int, text: str, *, source: str | None = None) -> EvidenceUnit:
     )
 
 
-def test_case_a_1000_short_chats_pack_into_tens_of_windows() -> None:
+def test_case_a_1000_short_chats_pack_by_token_budget_not_fixed_ceiling() -> None:
+    """V2: the old fixed 160-unit ceiling must not fragment short chats.
+
+    Window count is governed by the token budget (and transport), so a
+    1000-message short chat packs into a handful of large windows instead
+    of being flushed every 160 rows.
+    """
     manager = AgentContextBudgetManager(default_context_window_tokens=32_768)
     units = [_unit(index, f"第{index}条对话：我会记录事实、决定与结果。") for index in range(1000)]
     windows = build_analysis_windows(
@@ -47,7 +53,11 @@ def test_case_a_1000_short_chats_pack_into_tens_of_windows() -> None:
         target_tokens=8_000,
     )
     assert sum(len(window.evidence_unit_ids) for window in windows) == 1000
-    assert 7 <= len(windows) <= 60
+    # Pre-V2 (max_units=160) produced ceil(1000/160)=7+ windows; the token
+    # budget alone yields fewer, larger reasoning windows.
+    assert len(windows) < 7
+    # No window silently exceeds the (loose) safety ceiling.
+    assert all(len(window.evidence_unit_ids) <= 1200 for window in windows)
 
 
 def test_case_b_5000_chats_candidate_index_is_bounded() -> None:

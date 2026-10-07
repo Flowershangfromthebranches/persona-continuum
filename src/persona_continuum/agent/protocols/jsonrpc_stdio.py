@@ -56,6 +56,7 @@ class JsonRpcStdioAdapter(AgentAdapter):
         self.structured_output_mode = StructuredOutputMode.PROMPT_ONLY
         self.output_streaming_mode = OutputStreamingMode.PROTOCOL_STREAM
         self.protocols = ["jsonrpc_stdio"]
+        self.prompt_transport_mode = "stream"
 
     async def probe(self) -> AgentProbeResult:
         binary = self._find_binary()

@@ -20,6 +20,7 @@ from persona_continuum.agent.models import (
     ResearchCapability,
     ResearchVerificationStatus,
 )
+from persona_continuum.agent.protocols.plain_cli import is_invalid_cli_argument_error
 from persona_continuum.agent.runtime_executor import AgentRuntimeExecutor
 from persona_continuum.agent.structured_output import StructuredResult
 from persona_continuum.application.research_capability_cache import ResearchCapabilityCache
@@ -35,6 +36,7 @@ _worker_seq = itertools.count(1)
 _GEO_BLOCK_MARKERS = (
     "user location is not supported",
     "location is not supported",
+    "not currently available in your location",
 )
 _AUTH_MARKERS = (
     "auth",
@@ -42,17 +44,15 @@ _AUTH_MARKERS = (
     "credential",
     "unauthorized",
     "not authenticated",
+    "must specify the gemini_api_key",
+    "missing api key",
+    "please set an auth method",
 )
 _POLICY_MARKERS = (
-    "permission",
-    "policy",
     "not allowed",
     "disallowed",
     "denied",
     "forbidden",
-    "sandbox",
-    "headless",
-    "allowlist",
 )
 # Typed codes the runtime executor raises when the turn's own timeout
 # budget expires; only these are genuine "the session timed out" signals.
@@ -250,9 +250,10 @@ class NativeCliResearchBackend:
                 model_id=self.runtime.get("model_id"),
                 reasoning_effort=self.runtime.get("reasoning_effort"),
                 auth_profile_id=self.runtime.get("auth_profile_id"),
+                working_dir=self.runtime.get("working_dir"),
                 permission_profile=PermissionProfile.RESEARCH_READ_ONLY,
                 allow_mcp=False,
-                tools=[{"name": "google_web_search"}, {"name": "web_fetch"}],
+                tools=[],
                 system_prompt=self._backend_system_prompt(),
                 extra={
                     key: self.runtime[key]
@@ -509,7 +510,7 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
     async def verify_cli_research_capability(self) -> ResearchCapability:
         cli_name = str(self.runtime.get("agent_name") or self.runtime.get("agent_id") or "CLI")
         search_prompt = (
-            "PROBE_SEARCH. Use the google_web_search tool in this native Web Research "
+            "PROBE_SEARCH. Use your native web search tool in this Web Research "
             "session. Do not answer from training memory and do not invent a URL. "
             "Search for the public OpenAI Developers page at "
             "https://developers.openai.com/ and return JSON only as "
@@ -538,7 +539,11 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
                 ).strip()
                 if source_url:
                     break
-        if not source_url:
+        if (
+            not source_url
+            or not isinstance(search_payload, dict)
+            or search_payload.get("searched") is not True
+        ):
             raise ResearchCapabilityProbeError(
                 "WEB_SEARCH_UNAVAILABLE",
                 f"{cli_name} 已连接，但本次 Headless Session 没有执行任何可验证的 Web Search。",
@@ -548,7 +553,7 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
             )
 
         fetch_prompt = (
-            "PROBE_FETCH. Use the web_fetch tool in a native Web Research "
+            "PROBE_FETCH. Use your native web fetch/read tool in a Web Research "
             "session to read the source URL below. Do not answer from training memory. "
             "Return JSON only as {\"fetched\":true,\"url\":\"...\","
             "\"title\":\"...\",\"content\":\"...\"}; content must be a non-empty "
@@ -593,29 +598,13 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
         elif isinstance(fetch_payload, str) and fetch_payload.strip():
             fetched_content = fetch_payload.strip()
 
-        has_fetch_indication = (
-            isinstance(fetch_payload, dict)
-            and (
-                bool(fetch_payload.get("fetched"))
-                or bool(fetch_payload.get("title"))
-                or bool(fetch_payload.get("url"))
-            )
-        )
-        # A few older adapters echo the searched source envelope instead of a
-        # dedicated fetch envelope.  The independent URL validator below still
-        # has to prove that the source is readable; the native fetch call above
-        # is retained as a separate policy probe.
-        legacy_source_echo = (
+        # An independently readable URL cannot substitute for Agent fetch evidence.
+        if (
             not fetched_content
-            and isinstance(fetch_payload, dict)
-            and any(
-                isinstance(item, dict)
-                and str(item.get("url") or item.get("canonical_url") or "").strip()
-                == source_url
-                for item in (fetch_payload.get("sources") or [])
-            )
-        )
-        if not fetched_content and not legacy_source_echo and not has_fetch_indication:
+            or not isinstance(fetch_payload, dict)
+            or fetch_payload.get("fetched") is not True
+            or str(fetch_payload.get("url") or "").strip() != source_url
+        ):
             raise ResearchCapabilityProbeError(
                 "WEB_SEARCH_UNAVAILABLE",
                 f"{cli_name} 的 web_fetch 未返回可读取的来源正文。",
@@ -666,7 +655,7 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
             source=f"{cli_name}:behavioral_probe",
             verification_status=ResearchVerificationStatus.VERIFIED,
             verified_at=now,
-            verification_method="behavioral_probe:search+fetch+http_validation",
+            verification_method="behavioral_probe:response_declaration+http_validation",
         )
 
     @staticmethod
@@ -733,13 +722,21 @@ class AgenticCliResearchBackend(NativeCliResearchBackend):
         is_auth = any(marker in surface for marker in _AUTH_MARKERS)
         is_policy = any(marker in surface for marker in _POLICY_MARKERS)
 
-        if is_geo_blocked:
+        if typed_code == "AGENT_CLI_INVALID_ARGUMENT" or is_invalid_cli_argument_error(surface):
+            code = "WEB_RESEARCH_CLI_INCOMPATIBLE"
+            message = f"{cli_name} 的 CLI 参数不兼容，联网工具尚未执行。{detail_suffix}"
+            verification_status = ResearchVerificationStatus.UNAVAILABLE
+        elif is_geo_blocked:
             code = "WEB_RESEARCH_REGION_BLOCKED"
+            reason = (
+                "User location is not supported"
+                if "user location is not supported" in surface
+                else "Antigravity is not currently available in your location"
+            )
             message = (
-                f"{cli_name} 的模型调用被服务方以地理位置拒绝"
-                "（User location is not supported / FAILED_PRECONDITION）。"
-                "这通常意味着当前网络出口（直连或代理节点）不被 Gemini API 接受；"
-                "请更换可用的代理/VPN 出口节点后重新验证，或改用其他 Runtime。"
+                f"{cli_name} 的模型调用被服务方以地理位置拒绝（{reason}）。"
+                "当前账户或网络出口所在地区未通过服务方资格检查；"
+                "请检查账户资格和代理出口后重新验证，或改用其他 Runtime。"
                 f"{detail_suffix}"
             )
             verification_status = ResearchVerificationStatus.UNAVAILABLE
@@ -1036,6 +1033,7 @@ class ResearchBackendResolver:
                         "当前 CLI 的 Web Research 被权限或运行时策略阻止。"
                     )
             elif capability.verification_status in {
+                ResearchVerificationStatus.VERIFIED,
                 ResearchVerificationStatus.BLOCKED,
                 ResearchVerificationStatus.UNAVAILABLE,
             }:
@@ -1049,6 +1047,8 @@ class ResearchBackendResolver:
                             "mode": "agentic_cli",
                             "verification_status": ResearchVerificationStatus.UNKNOWN,
                             "verification_error": None,
+                            "verification_error_code": None,
+                            "verified_at": None,
                         }
                     )
                     self.last_capability = capability
@@ -1057,13 +1057,13 @@ class ResearchBackendResolver:
                 ResearchVerificationStatus.UNKNOWN,
                 ResearchVerificationStatus.DECLARED,
             }:
+                agentic = AgenticCliResearchBackend(
+                    self.adapter,
+                    {**runtime, "agent_name": runtime.get("agent_name")},
+                    job_id=job_id,
+                    url_validator=self.url_validator,
+                )
                 try:
-                    agentic = AgenticCliResearchBackend(
-                        self.adapter,
-                        {**runtime, "agent_name": runtime.get("agent_name")},
-                        job_id=job_id,
-                        url_validator=self.url_validator,
-                    )
                     verified = await agentic.verify_cli_research_capability()
                 except ResearchCapabilityProbeError as exc:
                     unavailable = capability.model_copy(
@@ -1087,6 +1087,8 @@ class ResearchBackendResolver:
                     self.research = verified.model_dump(mode="json")
                     self._cache_capability(runtime, verified)
                     return NativeCliResearchBackend(self.adapter, runtime, job_id=job_id)
+                finally:
+                    await agentic.aclose()
             elif capability.verification_status == ResearchVerificationStatus.VERIFIED:
                 return NativeCliResearchBackend(self.adapter, runtime, job_id=job_id)
 

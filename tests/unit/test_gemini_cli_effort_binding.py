@@ -23,16 +23,14 @@ def test_parse_agy_concatenated_model_listing() -> None:
     by_id = {model.id: model for model in models}
     assert "gemini-3.7-flash-high" in by_id
     assert by_id["gemini-3.7-flash-high"].display_name == "Gemini 3.7 Flash (High)"
-    assert by_id["gemini-3.7-flash-high"].supported_reasoning_efforts == ["high"]
+    assert by_id["gemini-3.7-flash-high"].supported_reasoning_efforts == ["high", "medium", "low"]
     assert by_id["gemini-3.7-flash-high"].context_window == 1_048_576
-    assert by_id["gemini-3.7-flash-medium"].supported_reasoning_efforts == ["medium"]
+    assert by_id["gemini-3.7-flash-medium"].supported_reasoning_efforts == ["high", "medium", "low"]
     assert by_id["claude-sonnet-4-6"].display_name.startswith("Claude Sonnet")
 
 
 def test_parse_tab_separated_models_still_works() -> None:
-    models = GeminiCliAdapter._parse_models(
-        "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n"
-    )
+    models = GeminiCliAdapter._parse_models("gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n")
     assert models[0].id == "gemini-3.7-flash-high"
     assert models[0].supported_reasoning_efforts == ["high"]
 
@@ -68,9 +66,7 @@ def test_suffixed_model_rewrites_effort_into_model_id() -> None:
 
 def test_unsuffixed_model_still_passes_effort_flag() -> None:
     adapter = GeminiCliAdapter()
-    model, reasoning = adapter.resolve_cli_model_and_reasoning(
-        _config("gemini-2.5-pro", "high")
-    )
+    model, reasoning = adapter.resolve_cli_model_and_reasoning(_config("gemini-2.5-pro", "high"))
     assert model == "gemini-2.5-pro"
     assert reasoning == "high"
 
@@ -83,12 +79,18 @@ def test_classify_agy_location_failure_hides_email_and_explains() -> None:
         "Print mode: run ended with error and no response: "
         "Agent execution terminated due to error.\n"
     )
-    message = classify_agy_cli_failure(
-        "Agent execution terminated due to error.", log
-    )
+    message = classify_agy_cli_failure("Agent execution terminated due to error.", log)
     assert message == LOCATION_UNSUPPORTED_MESSAGE
     assert "example.com" not in message
     assert "user location is not supported" in message.casefold()
+
+
+def test_classify_agy_oauth_eligibility_eof_is_transient() -> None:
+    message = classify_agy_cli_failure(
+        'Error: Eligibility check failed: Get "https://www.googleapis.com/oauth2/v2/userinfo": EOF'
+    )
+    assert "eligibility check failed" in message.casefold()
+    assert "transient" in message.casefold()
 
 
 def test_agy_print_mode_attaches_private_log_file() -> None:
@@ -122,3 +124,24 @@ def test_official_gemini_binary_does_not_add_agy_log_file() -> None:
     adapter._resolved_binary = "/usr/local/bin/gemini"
     args = adapter.build_extra_cli_args(_config("gemini-3.7-flash-high", "high"))
     assert args == []
+
+
+def test_agy_explicit_timeout_and_prompt_only_schema() -> None:
+    from persona_continuum.agent.models import AgentTurn
+
+    adapter = GeminiCliAdapter()
+    adapter._resolved_binary = "/opt/local/bin/agy"
+    config = _config("gemini-3.7-flash-high", "high")
+    config.extra["hard_timeout_seconds"] = 900
+    args = adapter.build_extra_cli_args(config)
+    try:
+        assert args[args.index("--print-timeout") + 1] == "900s"
+        schema = {"type": "object", "required": ["units"]}
+        flags = adapter.build_turn_cli_args(
+            AgentSession(config=config),
+            AgentTurn(user_message="synthetic", expected_output=schema),
+        )
+        assert "--json-schema" not in flags
+        assert "--output-format" not in flags
+    finally:
+        Path(args[1]).unlink(missing_ok=True)

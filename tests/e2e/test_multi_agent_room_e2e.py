@@ -138,12 +138,12 @@ async def test_e2e_multi_persona_room_debate(app: PersonaContinuum) -> None:
     final_room = app.orchestrator.get_room(room.id)
     assert final_room is not None
     assert final_room.turn_index == 2
-    assert len(final_room.transcript) == 2
+    assert len(final_room.transcript) == 3
 
     # Transcripts in database
     transcripts = app.orchestrator.list_room_transcripts(room.id)
-    assert len(transcripts) == 2
-    assert len(transcripts[1].recall_ids) >= 1
+    assert len(transcripts) == 3
+    assert len(transcripts[2].recall_ids) >= 1
 
     # Stop room
     await app.orchestrator.stop_room(room.id)

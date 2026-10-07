@@ -77,6 +77,7 @@ OPERATIONAL_KINDS: frozenset[str] = frozenset(
     {
         "user_correction",  # operator explicitly corrected the record
         "digital_experience",  # memory of an actual runtime interaction
+        "reflection_summary",  # derived runtime interpretation, never historical evidence
     }
 )
 
@@ -100,9 +101,7 @@ CHARACTER_VISIBLE = "character_visible"
 AUTHOR_ONLY = "author_only"
 EVALUATION_ONLY = "evaluation_only"
 
-MATERIAL_SCOPES: frozenset[str] = frozenset(
-    {CHARACTER_VISIBLE, AUTHOR_ONLY, EVALUATION_ONLY}
-)
+MATERIAL_SCOPES: frozenset[str] = frozenset({CHARACTER_VISIBLE, AUTHOR_ONLY, EVALUATION_ONLY})
 
 #: Scopes that may never reach an actor's runtime context.
 NON_CHARACTER_SCOPES: frozenset[str] = frozenset({AUTHOR_ONLY, EVALUATION_ONLY})

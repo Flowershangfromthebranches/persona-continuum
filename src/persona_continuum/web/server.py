@@ -264,7 +264,9 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
                     json.dumps(
                         {
                             "event": "profile_enrichment_progress",
-                            "job": job.model_dump(mode="json"),
+                            # Same public projection as the REST API: never
+                            # echo uploaded material text to the browser.
+                            "job": handler._public_profile_job(job),
                         },
                         ensure_ascii=False,
                         default=str,
@@ -475,6 +477,11 @@ def create_web_app(continuum: PersonaContinuum) -> Starlette:
         Route(
             "/api/personas/{persona_id}/material-analysis",
             endpoint=handler.analyze_persona_materials,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/persona-material/uploads",
+            endpoint=handler.upload_persona_material,
             methods=["POST"],
         ),
         Route(

@@ -59,13 +59,19 @@ class RuntimePoolStats:
     reuses: int = 0
     crashes: int = 0
     reaped_idle: int = 0
+    wait_count: int = 0
+    wait_ms_total: float = 0.0
+    peak_wait_ms: float = 0.0
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | float]:
         return {
             "spawns": self.spawns,
             "reuses": self.reuses,
             "crashes": self.crashes,
             "reaped_idle": self.reaped_idle,
+            "wait_count": self.wait_count,
+            "wait_ms_total": round(self.wait_ms_total, 3),
+            "peak_wait_ms": round(self.peak_wait_ms, 3),
         }
 
 
@@ -187,17 +193,38 @@ class AgentRuntimePool:
         self._reaper_task: asyncio.Task[None] | None = None
 
     @staticmethod
-    def make_key(adapter_id: str, command: list[str], env: dict[str, str] | None) -> str:
-        # The env fingerprint covers auth/credential differences without
-        # storing any secret material beyond its digest.
-        interesting = {
-            k: v
-            for k, v in (env or {}).items()
-            if k.upper() in {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"}
-            or k.startswith(("CODEX_", "ACP_", "CLAUDE_"))
+    def make_key(
+        adapter_id: str,
+        command: list[str],
+        env: dict[str, str] | None,
+        *,
+        credential_identity: str = "",
+        binary_identity: str = "",
+        runtime_origin: str = "",
+    ) -> str:
+        """Identity of one physical runtime.
+
+        Credential identity is the primary discriminator.  When an adapter has
+        migrated to ``CredentialManager`` it passes ``credential_identity``
+        directly; otherwise the credential-bearing environment subset is
+        fingerprinted as a *fallback* (never the raw value, never a growing
+        guess table as the primary mechanism).
+        """
+
+        from persona_continuum.performance.runtime_identity import (
+            legacy_env_credential_fingerprint,
+        )
+
+        credential = credential_identity or legacy_env_credential_fingerprint(env)
+        material = {
+            "adapter": adapter_id,
+            "command": " ".join(command),
+            "credential": credential,
+            "binary": binary_identity,
+            "origin": runtime_origin,
         }
         digest = hashlib.sha256(
-            repr(sorted(interesting.items())).encode("utf-8")
+            repr(sorted(material.items())).encode("utf-8")
         ).hexdigest()[:16]
         return f"{adapter_id}:{' '.join(command)}:{digest}"
 
@@ -225,6 +252,7 @@ class AgentRuntimePool:
             if max_idle_seconds is None
             else max(30.0, float(max_idle_seconds))
         )
+        waited_from = time.monotonic()
         while True:
             async with self._condition:
                 bucket = self._entries.setdefault(key, [])
@@ -251,6 +279,7 @@ class AgentRuntimePool:
                     self._active_leases += 1
                     lease = PoolAcquiredRuntime(candidate, pool=self, slot=_NoopSlot())
                     lease.touch()
+                    self._note_wait(waited_from)
                     return lease
                 creating = self._creating.get(key, 0)
                 if len(bucket) + creating < self.max_processes_per_key:
@@ -277,7 +306,14 @@ class AgentRuntimePool:
             default_tracer().incr_global("physical_process_spawn_count", 1)
             self._active_leases += 1
             self._condition.notify_all()
+        self._note_wait(waited_from)
         return PoolAcquiredRuntime(managed, pool=self, slot=_NoopSlot())
+
+    def _note_wait(self, started: float) -> None:
+        waited_ms = max(0.0, (time.monotonic() - started) * 1000.0)
+        self.stats.wait_count += 1
+        self.stats.wait_ms_total += waited_ms
+        self.stats.peak_wait_ms = max(self.stats.peak_wait_ms, waited_ms)
 
     async def acquire_managed(self, managed: ManagedRuntime) -> PoolAcquiredRuntime:
         """Acquire the execution lease for a logical session's affinity."""

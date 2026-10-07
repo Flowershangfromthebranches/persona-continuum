@@ -23,6 +23,26 @@ CREATE TABLE IF NOT EXISTS sources (
   UNIQUE(persona_id, hash)
 );
 
+CREATE TABLE IF NOT EXISTS persona_material_uploads (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  stored_filename TEXT NOT NULL,
+  path TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  job_id TEXT,
+  persona_id TEXT,
+  created_at TEXT NOT NULL,
+  bound_at TEXT,
+  consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_persona_material_uploads_status
+  ON persona_material_uploads(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_persona_material_uploads_job
+  ON persona_material_uploads(job_id, status);
+
 -- Derived private-material Evidence Layer.  Raw `sources` are immutable and
 -- remain the provenance root; these tables can be rebuilt without losing the
 -- uploaded originals, source locators, or compilation lineage.
@@ -72,6 +92,9 @@ CREATE INDEX IF NOT EXISTS idx_persona_evidence_units_persona
   ON persona_evidence_units(persona_id, evidence_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_persona_evidence_units_source
   ON persona_evidence_units(source_id, normalized_text_hash);
+CREATE INDEX IF NOT EXISTS idx_persona_evidence_units_order
+  ON persona_evidence_units(persona_id, source_id,
+    COALESCE(CAST(json_extract(source_locator_json, '$.segment_index') AS INTEGER), 0), id);
 
 CREATE TABLE IF NOT EXISTS persona_evidence_clusters (
   id TEXT PRIMARY KEY,
@@ -157,6 +180,21 @@ CREATE TABLE IF NOT EXISTS persona_identity_aliases (
 
 CREATE INDEX IF NOT EXISTS idx_persona_identity_aliases_lookup
   ON persona_identity_aliases(persona_id, normalized_alias);
+
+-- Deterministic chat Expression DNA statistics (Large Conversation Pipeline
+-- V2, P0-E).  One derived record per persona; raw evidence rows and their
+-- provenance are untouched and the profile can be rebuilt from them at any
+-- time without calling any model.
+CREATE TABLE IF NOT EXISTS persona_chat_style_profiles (
+  persona_id TEXT PRIMARY KEY REFERENCES personas(id) ON DELETE CASCADE,
+  contract TEXT NOT NULL,
+  corpus_size INTEGER NOT NULL DEFAULT 0,
+  time_range_json TEXT NOT NULL DEFAULT '[]',
+  statistics_json TEXT NOT NULL DEFAULT '{}',
+  representative_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  profile_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS claims (
   id TEXT PRIMARY KEY,
@@ -397,6 +435,40 @@ CREATE TABLE IF NOT EXISTS research_capability_cache (
 
 CREATE INDEX IF NOT EXISTS idx_research_capability_cache_runtime
   ON research_capability_cache(agent_id, agent_version, model_id, runtime_source);
+
+-- Verified independent-session concurrency.  Identity covers adapter, CLI
+-- binary identity/version, model, credential identity hash, runtime origin and
+-- the probe contract version, so a stale verification can never be reused for
+-- a different CLI, account, model, or probe contract.  Only an irreversible
+-- credential hash is stored; raw secrets never reach this table.
+CREATE TABLE IF NOT EXISTS runtime_concurrency_capabilities (
+  capability_key TEXT PRIMARY KEY,
+  adapter_id TEXT NOT NULL,
+  binary_identity TEXT NOT NULL DEFAULT '',
+  binary_version TEXT NOT NULL DEFAULT '',
+  model_id TEXT NOT NULL DEFAULT '',
+  credential_identity_hash TEXT NOT NULL DEFAULT '',
+  runtime_origin TEXT NOT NULL DEFAULT '',
+  probe_version TEXT NOT NULL DEFAULT '',
+  max_verified_independent_sessions INTEGER NOT NULL DEFAULT 1,
+  parallel_independent_sessions_verified INTEGER NOT NULL DEFAULT 0,
+  parallel_same_session_verified INTEGER NOT NULL DEFAULT 0,
+  current_recommended INTEGER NOT NULL DEFAULT 1,
+  probe_status TEXT NOT NULL DEFAULT 'unverified',
+  probe_sample_count INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT,
+  expires_at TEXT,
+  last_runtime_downgrade_at TEXT,
+  downgrade_reason TEXT,
+  downgrade_expires_at TEXT,
+  last_failure_kind TEXT,
+  last_failure_at TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_concurrency_adapter
+  ON runtime_concurrency_capabilities(adapter_id, model_id);
 
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -1328,4 +1400,487 @@ CREATE INDEX IF NOT EXISTS idx_narrative_video_production_guides_prompt_pkg
 CREATE INDEX IF NOT EXISTS idx_narrative_video_production_guides_production
   ON narrative_video_production_guides(production_package_id, status);
 
+-- ---------------------------------------------------------------------------
+-- Memory Architecture v2, Phase 3: Episodes.
+--
+-- An Episode groups committed turns into "a stretch of shared experience".
+-- It is a derived ORGANISATION layer: it never replaces the raw transcript and
+-- never replaces the per-turn digital_experience memory.  Provenance lives in
+-- memory_episode_turns, so an Episode can always be walked back to the exact
+-- turns (and therefore to the raw text) that support it.
+--
+-- Scope is (persona_id, counterpart_id, branch_id, session_id).  A room is a
+-- runtime/UI container and is NOT an isolation key -- the same persona talking
+-- to the same counterpart in another room continues the same relationship --
+-- but it is recorded because room_transcripts is keyed by it and provenance
+-- must be resolvable.  Those two fields are deliberately not equivalent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_episodes (
+  id TEXT PRIMARY KEY,
+  persona_id TEXT NOT NULL,
+  counterpart_id TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  session_id TEXT NOT NULL,
+  room_id TEXT,
+  sequence INTEGER NOT NULL DEFAULT 1,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'open',
+  boundary_reason TEXT NOT NULL DEFAULT 'none',
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  turn_count INTEGER NOT NULL DEFAULT 0,
+  source_token_estimate INTEGER NOT NULL DEFAULT 0,
+  source_first_turn_id TEXT,
+  source_last_turn_id TEXT,
+  source_range_hash TEXT NOT NULL DEFAULT '',
+  importance REAL NOT NULL DEFAULT 0.5,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  consolidation_version INTEGER NOT NULL DEFAULT 1,
+  summary_status TEXT NOT NULL DEFAULT 'pending',
+  consolidation_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  consolidated_at TEXT,
+  -- Phase 4: the Episode is also the unit of fact extraction, so its status
+  -- lives here as a real column (queryable, indexable) instead of in JSON.
+  fact_extraction_status TEXT NOT NULL DEFAULT 'pending',
+  fact_extraction_attempts INTEGER NOT NULL DEFAULT 0,
+  fact_extraction_error TEXT,
+  facts_extracted_at TEXT,
+  -- Phase 5: the Episode is likewise the unit of Active-Thread resolution, and
+  -- the status column is the durable work list a restart resumes from.
+  thread_resolution_status TEXT NOT NULL DEFAULT 'pending',
+  thread_resolution_attempts INTEGER NOT NULL DEFAULT 0,
+  thread_resolution_error TEXT,
+  threads_resolved_at TEXT,
+  visibility TEXT NOT NULL DEFAULT 'private_session',
+  provenance TEXT NOT NULL DEFAULT 'digital_experience',
+  material_scope TEXT NOT NULL DEFAULT 'character_visible',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+-- One Episode per scope position: this is what makes a replayed commit and a
+-- re-run consolidation land on the SAME row instead of creating A, A2, A3.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_episodes_scope_sequence
+  ON memory_episodes(persona_id, counterpart_id, branch_id, session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_scope_status
+  ON memory_episodes(persona_id, counterpart_id, branch_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_session_status
+  ON memory_episodes(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_persona_time
+  ON memory_episodes(persona_id, started_at, ended_at);
+-- Drives the durable consolidation sweep after a restart.
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_pending
+  ON memory_episodes(status, summary_status, updated_at);
+-- Drives the durable FACT-extraction sweep after a restart.
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_fact_pending
+  ON memory_episodes(fact_extraction_status, updated_at);
+-- Drives the durable THREAD-resolution sweep after a restart.
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_thread_pending
+  ON memory_episodes(thread_resolution_status, updated_at);
+
+CREATE TABLE IF NOT EXISTS memory_episode_turns (
+  episode_id TEXT NOT NULL REFERENCES memory_episodes(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL DEFAULT 'session_turn',
+  position INTEGER NOT NULL DEFAULT 0,
+  session_id TEXT,
+  room_id TEXT,
+  speaker TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT,
+  token_estimate INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (episode_id, turn_id)
+);
+-- Given a turn -> which Episode owns it.
+CREATE INDEX IF NOT EXISTS idx_memory_episode_turns_turn
+  ON memory_episode_turns(turn_id);
+CREATE INDEX IF NOT EXISTS idx_memory_episode_turns_session
+  ON memory_episode_turns(session_id, turn_id);
+CREATE INDEX IF NOT EXISTS idx_memory_episode_turns_episode_position
+  ON memory_episode_turns(episode_id, position);
+
+-- ---------------------------------------------------------------------------
+-- Memory Architecture v2, Phase 4: Semantic Facts.
+--
+-- An Episode records what happened; a Fact records what is true about a
+-- counterpart, distilled from Episodes.  A fact is never overwritten: a value
+-- that stops being true gets ``valid_until`` and ``superseded_by_fact_id``
+-- while the new value becomes a new row, so the history stays readable.
+-- Scope is (persona_id, counterpart_id, branch_id) -- deliberately the same
+-- isolation as Episode/memory, with no implicit cross-persona sharing.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_semantic_facts (
+  id TEXT PRIMARY KEY,
+  persona_id TEXT NOT NULL,
+  counterpart_id TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  category TEXT NOT NULL DEFAULT 'other',
+  fact_key TEXT NOT NULL DEFAULT '',
+  value_key TEXT NOT NULL DEFAULT '',
+  subject TEXT NOT NULL DEFAULT '',
+  predicate TEXT NOT NULL DEFAULT '',
+  value_json TEXT NOT NULL DEFAULT '{}',
+  display_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  origin TEXT NOT NULL DEFAULT 'inferred',
+  durability TEXT NOT NULL DEFAULT 'unknown',
+  plan_status TEXT NOT NULL DEFAULT 'not_applicable',
+  confidence REAL NOT NULL DEFAULT 0.5,
+  evidence_count INTEGER NOT NULL DEFAULT 0,
+  last_confirmed_at TEXT,
+  valid_from TEXT,
+  valid_until TEXT,
+  observed_at TEXT,
+  temporal_expression TEXT,
+  temporal_normalized TEXT,
+  temporal_confidence REAL NOT NULL DEFAULT 0.0,
+  superseded_by_fact_id TEXT,
+  supersedes_fact_id TEXT,
+  extraction_version INTEGER NOT NULL DEFAULT 1,
+  visibility TEXT NOT NULL DEFAULT 'private_session',
+  material_scope TEXT NOT NULL DEFAULT 'character_visible',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+-- One ACTIVE fact per (scope, slot, value): re-extraction reinforces the
+-- existing row instead of piling up duplicates.  Superseded rows leave the
+-- partial index, which is what keeps the history intact.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_semantic_facts_active_key
+  ON memory_semantic_facts(persona_id, counterpart_id, branch_id, fact_key, value_key)
+  WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_memory_semantic_facts_slot
+  ON memory_semantic_facts(persona_id, counterpart_id, branch_id, fact_key);
+CREATE INDEX IF NOT EXISTS idx_memory_semantic_facts_status
+  ON memory_semantic_facts(persona_id, counterpart_id, branch_id, status, category);
+CREATE INDEX IF NOT EXISTS idx_memory_semantic_facts_validity
+  ON memory_semantic_facts(valid_from, valid_until);
+
+CREATE TABLE IF NOT EXISTS memory_fact_sources (
+  fact_id TEXT NOT NULL REFERENCES memory_semantic_facts(id) ON DELETE CASCADE,
+  source_type TEXT NOT NULL DEFAULT 'episode',
+  episode_id TEXT NOT NULL DEFAULT '',
+  turn_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT,
+  room_id TEXT,
+  evidence_role TEXT NOT NULL DEFAULT 'supporting',
+  excerpt_available INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (fact_id, source_type, episode_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_sources_episode
+  ON memory_fact_sources(episode_id);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_sources_turn
+  ON memory_fact_sources(turn_id);
+
+-- ---------------------------------------------------------------------------
+-- Memory Architecture v2, Phase 5: Active Threads.
+--
+-- A Fact says "what is true"; a Thread says "what is still going on".  It is
+-- the thing a later conversation can continue -- a trip being planned, an
+-- argument not yet settled, a project still in progress -- and it must NOT
+-- disappear when the recent-dialogue window moves past it.  Its lifetime is
+-- therefore owned by the memory layer, never by a prompt budget or a message
+-- count.
+--
+-- Scope is (persona_id, counterpart_id, branch_id): the same isolation as
+-- Episode/Fact.  ``thread_key`` is the canonical identity inside that scope, so
+-- "重庆旅行" / "去重庆" / "重庆计划" converge on ONE live thread instead of four.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_active_threads (
+  id TEXT PRIMARY KEY,
+  persona_id TEXT NOT NULL,
+  counterpart_id TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  thread_key TEXT NOT NULL,
+  thread_type TEXT NOT NULL DEFAULT 'general',
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  importance REAL NOT NULL DEFAULT 0.5,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  opened_at TEXT NOT NULL,
+  last_activity_at TEXT NOT NULL,
+  resolved_at TEXT,
+  cancelled_at TEXT,
+  stale_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  current_state_json TEXT NOT NULL DEFAULT '{}',
+  consolidation_version INTEGER NOT NULL DEFAULT 1,
+  visibility TEXT NOT NULL DEFAULT 'private_session',
+  material_scope TEXT NOT NULL DEFAULT 'character_visible',
+  -- A thread that revives after a long gap may be recorded as a NEW thread
+  -- instead of a reopen; the link keeps that from erasing the earlier history.
+  related_previous_thread_id TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+-- One LIVE thread per (scope, canonical key): a replay, a re-resolution, or a
+-- model that paraphrases the same subject cannot fork a second live thread.
+-- RESOLVED/CANCELLED rows leave the index, so history is kept while a genuinely
+-- new episode of the same subject is still representable.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_threads_live_key
+  ON memory_active_threads(persona_id, counterpart_id, branch_id, thread_key)
+  WHERE status IN ('open', 'active', 'waiting', 'stale');
+CREATE INDEX IF NOT EXISTS idx_memory_active_threads_scope_status
+  ON memory_active_threads(persona_id, counterpart_id, branch_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_active_threads_activity
+  ON memory_active_threads(persona_id, counterpart_id, branch_id, last_activity_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_active_threads_type
+  ON memory_active_threads(persona_id, counterpart_id, branch_id, thread_type, status);
+
+-- Thread history as an append-only ledger.  A status change never overwrites
+-- the previous step: 决定去 → 选时间 → 买票 → 出发 → 完成 stays readable instead of
+-- collapsing into a single ``status=resolved`` row.
+CREATE TABLE IF NOT EXISTS memory_thread_events (
+  event_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES memory_active_threads(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  -- Stable identity for a replay: the same episode producing the same event
+  -- twice inserts once.  Without it, a retried resolution would duplicate a
+  -- milestone and the history would lie.
+  event_key TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  state_json TEXT NOT NULL DEFAULT '{}',
+  occurred_at TEXT NOT NULL,
+  source_episode_id TEXT,
+  source_turn_id TEXT,
+  -- Phase 3.1 semantics: an explicitly deleted source must be visible as such,
+  -- never a silent dangling reference.
+  source_availability TEXT NOT NULL DEFAULT 'complete',
+  confidence REAL NOT NULL DEFAULT 0.5,
+  created_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_thread_events_replay
+  ON memory_thread_events(thread_id, event_key);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_events_thread_time
+  ON memory_thread_events(thread_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_events_episode
+  ON memory_thread_events(source_episode_id);
+
+-- Thread -> Episode -> Turn -> raw text.  A Thread that cannot be explained by
+-- a source turn is not allowed to exist.
+CREATE TABLE IF NOT EXISTS memory_thread_sources (
+  thread_id TEXT NOT NULL REFERENCES memory_active_threads(id) ON DELETE CASCADE,
+  source_type TEXT NOT NULL DEFAULT 'episode',
+  episode_id TEXT NOT NULL DEFAULT '',
+  turn_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT,
+  room_id TEXT,
+  evidence_role TEXT NOT NULL DEFAULT 'supporting',
+  excerpt_available INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (thread_id, source_type, episode_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_sources_episode
+  ON memory_thread_sources(episode_id);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_sources_turn
+  ON memory_thread_sources(turn_id);
+
+-- Thread <-> Fact lineage.  The Fact stays the single source of its own text;
+-- the Thread only points at it, and a deleted fact takes its link with it.
+CREATE TABLE IF NOT EXISTS memory_thread_facts (
+  thread_id TEXT NOT NULL REFERENCES memory_active_threads(id) ON DELETE CASCADE,
+  fact_id TEXT NOT NULL REFERENCES memory_semantic_facts(id) ON DELETE CASCADE,
+  relation TEXT NOT NULL DEFAULT 'supporting',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (thread_id, fact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_facts_fact
+  ON memory_thread_facts(fact_id);
+
+-- Ambiguity safety: a low-confidence continuation is recorded as a CANDIDATE
+-- instead of being applied.  "她联系我了" with three plausible relationship
+-- threads must not silently bind to the wrong one.
+CREATE TABLE IF NOT EXISTS memory_thread_link_candidates (
+  id TEXT PRIMARY KEY,
+  persona_id TEXT NOT NULL,
+  counterpart_id TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  episode_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.0,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_thread_link_candidates_pair
+  ON memory_thread_link_candidates(episode_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_memory_thread_link_candidates_pending
+  ON memory_thread_link_candidates(status, updated_at);
+
+-- ---------------------------------------------------------------------------
+-- Memory Architecture v2, Phase 6: Hierarchical Summaries.
+--
+-- Episodes answer "what happened in this stretch"; a Chapter answers "what
+-- phase were we in", and a Long-term segment answers "what have we been
+-- through".  They are DERIVED ORGANISATION layers over Episodes (level 1) and
+-- over Chapters (level 2+), never a replacement for the raw turns, Episodes,
+-- Facts or Threads underneath them.
+--
+-- A summary always names its real sources in ``memory_summary_sources``: a
+-- Chapter points at Episodes, a Long-term segment points at Chapters, so the
+-- chain Long-term -> Chapter -> Episode -> Turn -> raw text stays walkable.
+-- ``level`` is a plain integer on purpose: nothing in the schema assumes that
+-- history only has two layers.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_hierarchical_summaries (
+  id TEXT PRIMARY KEY,
+  persona_id TEXT NOT NULL,
+  counterpart_id TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT 'main',
+  level INTEGER NOT NULL DEFAULT 1,
+  summary_type TEXT NOT NULL DEFAULT 'chapter',
+  sequence INTEGER NOT NULL DEFAULT 1,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  source_count INTEGER NOT NULL DEFAULT 0,
+  source_token_estimate INTEGER NOT NULL DEFAULT 0,
+  importance REAL NOT NULL DEFAULT 0.5,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  consolidation_version INTEGER NOT NULL DEFAULT 1,
+  -- pending / provisional / ready / stale / failed.  An OPEN chapter may carry
+  -- a PROVISIONAL summary; closing it regenerates from the full source set, so
+  -- a provisional text can never be mistaken for final history.  STALE means
+  -- the text was right for the sources it was built from but a source has
+  -- changed since (Phase 6.1) -- readable, but not current, and owed a refresh.
+  summary_status TEXT NOT NULL DEFAULT 'pending',
+  consolidation_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  consolidated_at TEXT,
+  -- Stable identity of the source set, so replaying the same range updates one
+  -- row instead of creating "September Chapter 2 / 3 / 4".
+  source_range_hash TEXT NOT NULL DEFAULT '',
+  -- Phase 6.1: identity of the sources IN THEIR CURRENT STATE, and the same
+  -- identity as it was when the stored text was generated.  A mismatch is what
+  -- turns "a child changed underneath me" into an arithmetic question instead
+  -- of a guess, without re-running a model.
+  source_fingerprint TEXT NOT NULL DEFAULT '',
+  consolidated_fingerprint TEXT NOT NULL DEFAULT '',
+  parent_summary_id TEXT,
+  visibility TEXT NOT NULL DEFAULT 'private_session',
+  material_scope TEXT NOT NULL DEFAULT 'character_visible',
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_hierarchical_summaries_range
+  ON memory_hierarchical_summaries(persona_id, counterpart_id, branch_id, level, source_range_hash)
+  WHERE source_range_hash != '' AND status != 'retracted';
+CREATE INDEX IF NOT EXISTS idx_memory_hierarchical_summaries_scope_level
+  ON memory_hierarchical_summaries(persona_id, counterpart_id, branch_id, level, status);
+CREATE INDEX IF NOT EXISTS idx_memory_hierarchical_summaries_time
+  ON memory_hierarchical_summaries(persona_id, counterpart_id, branch_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_memory_hierarchical_summaries_pending
+  ON memory_hierarchical_summaries(summary_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_hierarchical_summaries_parent
+  ON memory_hierarchical_summaries(parent_summary_id);
+
+CREATE TABLE IF NOT EXISTS memory_summary_sources (
+  summary_id TEXT NOT NULL REFERENCES memory_hierarchical_summaries(id) ON DELETE CASCADE,
+  source_type TEXT NOT NULL DEFAULT 'episode',
+  source_id TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  ended_at TEXT,
+  importance REAL NOT NULL DEFAULT 0.5,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (summary_id, source_type, source_id)
+);
+-- One Chapter per Episode, and one Long-term seat per Chapter: this is what
+-- makes re-running the grouping idempotent instead of producing parallel
+-- summaries over the same history.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_summary_sources_episode
+  ON memory_summary_sources(source_type, source_id) WHERE source_type = 'episode';
+CREATE INDEX IF NOT EXISTS idx_memory_summary_sources_lookup
+  ON memory_summary_sources(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_memory_summary_sources_summary_position
+  ON memory_summary_sources(summary_id, position);
+
+-- Applied schema migrations, so an upgrade can be identified without guessing
+-- from the table list.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_id TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}'
+);
+
 """
+
+#: Phase 3 migration id recorded in ``schema_migrations``.
+MEMORY_EPISODES_MIGRATION_ID = "phase3_memory_episodes"
+
+#: Phase 3.1: shared room user turns become provenance of every persona Episode
+#: that answered them (no schema change, but a semantic contract worth stamping).
+SHARED_USER_PROVENANCE_MIGRATION_ID = "phase31_shared_user_provenance"
+
+#: Phase 4 migration id recorded in ``schema_migrations``.
+SEMANTIC_FACTS_MIGRATION_ID = "phase4_semantic_facts"
+
+#: Phase 5 migration id recorded in ``schema_migrations``.
+ACTIVE_THREADS_MIGRATION_ID = "phase5_active_threads"
+
+#: Phase 6 migration id recorded in ``schema_migrations``.
+HIERARCHICAL_SUMMARIES_MIGRATION_ID = "phase6_hierarchical_summaries"
+
+#: Phase 6.1: parent summaries record the state of their sources, so a changed
+#: child invalidates its direct parent instead of the parent quietly quoting a
+#: stale version.  Additive columns only; recorded separately so an operator can
+#: tell a Phase 6 directory from a hardened one.
+HIERARCHY_DEPENDENCY_MIGRATION_ID = "phase61_hierarchy_dependency"
+
+#: Phase 7: provenance-backed raw recall.  No new table -- a raw excerpt is a
+#: *view* over the authoritative ``session_turns`` / ``room_transcripts`` built
+#: by walking the provenance the earlier phases already recorded.
+RAW_RECALL_MIGRATION_ID = "phase7_raw_recall"
+
+#: Reverse of the Phase 3 migration.  Safe by construction: both tables are new
+#: and hold only derived organisation data -- no other table references them,
+#: and dropping them cannot touch raw transcripts, memories, or lineage.  It is
+#: never run automatically; an operator applies it deliberately to roll back.
+MEMORY_EPISODES_DOWN_SQL = """
+DROP TABLE IF EXISTS memory_episode_turns;
+DROP TABLE IF EXISTS memory_episodes;
+DELETE FROM schema_migrations WHERE migration_id = 'phase3_memory_episodes';
+DELETE FROM schema_migrations WHERE migration_id = 'phase31_shared_user_provenance';
+"""
+
+#: Reverse of the Phase 4 migration.  Same reasoning: the Fact tables are new
+#: and derived, and nothing outside them references them.
+SEMANTIC_FACTS_DOWN_SQL = """
+DROP TABLE IF EXISTS memory_fact_sources;
+DROP TABLE IF EXISTS memory_semantic_facts;
+DELETE FROM schema_migrations WHERE migration_id = 'phase4_semantic_facts';
+"""
+
+#: Reverse of the Phase 5 migration.  Same reasoning as Phase 3/4: the Thread
+#: tables are new, derived, and referenced by nothing outside themselves.
+ACTIVE_THREADS_DOWN_SQL = """
+DROP TABLE IF EXISTS memory_thread_link_candidates;
+DROP TABLE IF EXISTS memory_thread_facts;
+DROP TABLE IF EXISTS memory_thread_sources;
+DROP TABLE IF EXISTS memory_thread_events;
+DROP TABLE IF EXISTS memory_active_threads;
+DELETE FROM schema_migrations WHERE migration_id = 'phase5_active_threads';
+"""
+
+#: Reverse of the Phase 6 migration.  Same reasoning again: the summary tables
+#: are new, derived, and referenced by nothing outside themselves.
+HIERARCHICAL_SUMMARIES_DOWN_SQL = """
+DROP TABLE IF EXISTS memory_summary_sources;
+DROP TABLE IF EXISTS memory_hierarchical_summaries;
+DELETE FROM schema_migrations WHERE migration_id = 'phase6_hierarchical_summaries';
+DELETE FROM schema_migrations WHERE migration_id = 'phase61_hierarchy_dependency';
+DELETE FROM schema_migrations WHERE migration_id = 'phase7_raw_recall';
+"""
+

@@ -205,15 +205,14 @@ async def test_gemini_search_and_fetch_probed_separately(app) -> None:
     assert len(adapter.prompts) == 2
     assert "PROBE_SEARCH" in adapter.prompts[0]
     assert "PROBE_FETCH" in adapter.prompts[1]
-    assert "google_web_search" in adapter.prompts[0]
-    assert "web_fetch" in adapter.prompts[1]
+    assert "native web search tool" in adapter.prompts[0]
+    assert "native web fetch/read tool" in adapter.prompts[1]
     assert all(
         config.permission_profile == PermissionProfile.RESEARCH_READ_ONLY
         for config in adapter.configs
     )
     assert all(
-        {str(tool.get("name")) for tool in config.tools}
-        == {"google_web_search", "web_fetch"}
+        config.tools == []
         for config in adapter.configs
     )
     assert resolver.last_capability is not None

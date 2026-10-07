@@ -77,7 +77,7 @@
       personaLead: "统一管理人物、组织、机构与群体 Agent 档案；Persona 仍由正式证据、记忆与编译链路提供权威内容。",
       searchPersona: "搜索档案",
       footerNote: "本地优先 · 真实协议与因果推演系统",
-      emptyRooms: "还没有房间", emptyRoomsHint: "创建一个房间，开始多人讨论。",
+      emptyRooms: "还没有房间", emptyRoomsHint: "创建一个房间，开始多人讨论。", enterTaibu: "进入太卜阁",
       emptyWorlds: "还没有平行世界", emptyWorldsHint: "设定初始历史分歧条件，开启推演。",
       emptyApi: "尚未配置提供方", emptyApiHint: "可添加本地 Ollama 或其它兼容端点。",
       emptyPersona: "没有匹配的人物",
@@ -113,7 +113,7 @@
       resetRuntimeSoft: "保留记忆和聊天记录的重置",
       resetRuntimeSoftHint: "只恢复情绪、需求与关系到初始值；聊天记录与记忆保留。",
       resetRuntimeFull: "全量重置",
-      resetRuntimeFullHint: "同时清除会话、聊天记录与对话衍生记忆；人物档案与编译内容保留。",
+      resetRuntimeFullHint: "同时清除会话、聊天房间与对话记忆；人物档案、编译内容与调研记忆保留。",
       resetRuntimeSoftDone: "已恢复初始状态，聊天记录与记忆已保留。",
       resetRuntimeFullDone: "已全量重置，会话与对话记忆已清除。",
       resetRuntimeFailed: "恢复初始状态失败", resetting: "正在恢复…",
@@ -376,7 +376,7 @@
       personaLead: "Manage Persona, Organization, Institution and Collective decision profiles while preserving the formal evidence and compilation pipeline.",
       searchPersona: "Search profiles",
       footerNote: "Local-first · Real protocols and counterfactual causal simulation",
-      emptyRooms: "No rooms yet", emptyRoomsHint: "Create a room to start a multi-persona discussion.",
+      emptyRooms: "No rooms yet", emptyRoomsHint: "Create a room to start a multi-persona discussion.", enterTaibu: "Enter Taibuge",
       emptyWorlds: "No parallel worlds yet", emptyWorldsHint: "Define counterfactual divergence conditions to begin.",
       emptyApi: "No providers configured", emptyApiHint: "Add local Ollama or another compatible endpoint.",
       emptyPersona: "No matching personas",
@@ -412,7 +412,7 @@
       resetRuntimeSoft: "Reset keeping memories and chat history",
       resetRuntimeSoftHint: "Only emotions, needs and relationships return to initial values; history and memories stay.",
       resetRuntimeFull: "Full reset",
-      resetRuntimeFullHint: "Also clears sessions, chat history and conversation-derived memories; profile and compiled content stay.",
+      resetRuntimeFullHint: "Also clears sessions, chat rooms and conversation memories; profile, compiled content and research memories stay.",
       resetRuntimeSoftDone: "Initial state restored; history and memories kept.",
       resetRuntimeFullDone: "Full reset done; sessions and conversation memories cleared.",
       resetRuntimeFailed: "Reset failed", resetting: "Resetting…",
@@ -805,6 +805,11 @@
   }
 
   function runtimeReasoningNotice(agent, model, source) {
+    if (agent && agent.model_discovery_error) {
+      const detail = String(agent.model_discovery_error);
+      if (!model) return `模型探测失败，请重新扫描：${detail}`;
+      return `模型探测暂时失败，保留上次发现的目录；${reasoningCapabilityLabel(model)} · ${detail}`;
+    }
     const selectedLabel = reasoningCapabilityLabel(model);
     if (source !== "api" || getReasoningCapability(model).mode !== "unknown") {
       return selectedLabel;
@@ -872,7 +877,9 @@
     const hasExplicitDefault = agent && agent.capabilities && (agent.capabilities.model_selection === "unsupported" || agent.capabilities.agent_default_model);
     const model = models.find(item => item.id === savedModelId) || models[0] || null;
     if (!models.length || hasExplicitDefault && !models.length) {
-      modelSelect.innerHTML = `<option value="default" selected>Agent 默认模型</option>`;
+      modelSelect.innerHTML = agent.model_discovery_error
+        ? `<option value="" disabled selected>模型探测失败，请重新扫描</option>`
+        : `<option value="default" selected>Agent 默认模型</option>`;
     } else {
       modelSelect.innerHTML = models.map(item =>
         `<option value="${esc(item.id)}" ${model && item.id === model.id ? "selected" : ""}>${esc(runtimeModelOptionLabel(agent, item))}</option>`
@@ -1077,9 +1084,25 @@
   // labelled as a planning policy.
   function formatTokens(value) {
     const n = Number(value);
-    if (!Number.isFinite(n) || n <= 0) return "—";
-    if (n >= 1_048_576 && n % 1_048_576 === 0) return `${n / 1_048_576}M`;
-    if (n >= 1024) return `${Math.round(n / 1024)}K`;
+    if (!Number.isFinite(n) || n < 0) return "—";
+    if (n === 0) return "0";
+    const compact = formatDecimalTokens(n);
+    const exact = n.toLocaleString("en-US");
+    if (compact === exact) return exact;
+    return `${compact} (${exact})`;
+  }
+
+  function formatDecimalTokens(n) {
+    if (n >= 1_000_000) {
+      const millions = n / 1_000_000;
+      const rounded = Math.round(millions * 100) / 100;
+      return Number.isInteger(rounded) ? `${rounded}M` : `${rounded}M`;
+    }
+    if (n >= 1_000) {
+      const thousands = n / 1_000;
+      const rounded = Math.round(thousands * 10) / 10;
+      return Number.isInteger(rounded) ? `${rounded}K` : `${rounded}K`;
+    }
     return String(n);
   }
 
@@ -1091,19 +1114,66 @@
 
   function formatContextDetail(capabilities) {
     const caps = capabilities || {};
+    const nativeUnknown = caps.native_context_window == null;
+    const effectiveUnknown = caps.effective_context_window == null;
+    const transport = caps.prompt_transport || {};
+    const utilization = caps.utilization != null
+      ? `${Math.round(Number(caps.utilization) * 100)}%`
+      : (caps.actual_prompt_tokens != null && caps.phase_working_target
+          ? `${Math.round((Number(caps.actual_prompt_tokens) / Number(caps.phase_working_target)) * 100)}%`
+          : "—");
+    const remainingSource = String(caps.remaining_context_source || "");
+    const remainingUnknown = caps.remaining_context_tokens == null;
+    const remainingEstimate = ["estimated_remaining", "inferred_fresh_session", "planning_fallback"].includes(remainingSource)
+      || (caps.remaining_context_verified === false && !remainingUnknown);
+    const remainingTrust = remainingUnknown
+      ? "unknown"
+      : (caps.remaining_context_verified && remainingSource === "runtime_reported" ? "verified" : "estimate");
+    const remainingSourceLabel = remainingUnknown
+      ? "Unknown"
+      : remainingSource === "runtime_reported"
+        ? "Runtime"
+        : remainingSource === "estimated_remaining"
+          ? "Estimated"
+          : remainingSource === "inferred_fresh_session"
+            ? "Fresh Session Assumption"
+            : "Unknown";
+    const scopeRaw = String(caps.context_scope || "").toLowerCase();
+    const scopeLabel = scopeRaw === "persistent"
+      ? "Persistent"
+      : scopeRaw === "per_request"
+        ? "Per Request"
+        : scopeRaw === "per_window"
+          ? "Per Window"
+          : "Unknown";
+    const packing = caps.packing || {};
     const lines = [
-      `Native: ${formatTokens(caps.native_context_window)}`,
-      `Requested: ${caps.requested_context_window == null ? "Auto" : formatTokens(caps.requested_context_window)}`,
-      `Adapter limit: ${formatTokens(caps.adapter_context_limit)}`,
-      `Effective: ${caps.effective_context_window == null ? "Unknown ⚠" : formatTokens(caps.effective_context_window)}`,
-      `Usable: ${caps.usable_context_budget == null ? "—" : formatTokens(caps.usable_context_budget)}`,
-      `Preferred working: ${caps.preferred_working_context == null ? "—" : formatTokens(caps.preferred_working_context)}`,
-      `Mode: ${caps.context_window_mode || "unknown"}`,
-      `Source: ${caps.context_capability_source || caps.context_window_source || "unknown"}`,
-      `Verified: ${caps.context_verified ? "yes" : "no"}`,
+      `Model Native:       ${nativeUnknown ? "Unknown" : formatTokens(caps.native_context_window)}`,
+      `Runtime Effective:  ${effectiveUnknown ? "Unknown ⚠" : formatTokens(caps.effective_context_window)}`,
+      `Current Remaining:  ${remainingUnknown ? "Unknown" : `${formatTokens(caps.remaining_context_tokens)}${remainingEstimate ? " (Estimate)" : ""}`}`,
+      `Usable After Reserve: ${caps.usable_context_budget == null ? "—" : formatTokens(caps.usable_context_budget)}`,
+      `Phase Working Target: ${caps.phase_working_target == null && caps.preferred_working_context == null ? "—" : formatTokens(caps.phase_working_target || caps.preferred_working_context)}`,
+      `Prompt Transport:   ${transport.transport_mode || caps.transport_mode || "unknown"}`,
+      `Transport Safe Capacity: ${transport.safe_prompt_bytes != null ? formatTokens(Math.floor(Number(transport.safe_prompt_bytes) / 4)) : (caps.transport_token_budget != null ? formatTokens(caps.transport_token_budget) : "—")}`,
+      `Actual Current Prompt: ${caps.actual_prompt_tokens == null ? "—" : formatTokens(caps.actual_prompt_tokens)}`,
+      `Utilization:        ${utilization}`,
+      `Context Scope:      ${scopeLabel}`,
+      `Requested Context:  ${caps.requested_context_window == null ? "Auto" : formatTokens(caps.requested_context_window)}`,
+      `Context Source:     ${caps.context_capability_source || caps.context_window_source || "unknown"}`,
+      `Remaining Source:   ${remainingSourceLabel}`,
+      `Trust:              ${remainingTrust}`,
+      `Verified:           ${remainingTrust === "verified" ? "yes" : "no"}`,
     ];
-    if (caps.effective_context_window == null && caps.planning_context_window != null) {
-      lines.push(`Planning fallback: ${formatTokens(caps.planning_context_window)} (fallback_policy)`);
+    if (packing.initial_windows != null || packing.actual_calls != null) {
+      lines.push(
+        `Packing:            initial ${packing.initial_windows ?? "—"} / actual ${packing.actual_calls ?? "—"} / re-batched ${packing.rebatched ?? 0} / accuracy ${packing.accuracy ?? "—"}`
+      );
+      if (Number(packing.rebatched_ratio || 0) > 0.25) {
+        lines.push("Window packing underestimated request overhead");
+      }
+    }
+    if (nativeUnknown && caps.planning_context_window != null) {
+      lines.push(`Planning fallback: ${formatTokens(caps.planning_context_window)} (not native context)`);
     }
     return lines.join("\n");
   }
@@ -1134,10 +1204,15 @@
         <div class="empty" style="grid-column:1/-1">
           <h3>${t("emptyRooms")}</h3>
           <p>${t("emptyRoomsHint")}</p>
-          <button class="btn btn-primary" id="empty-new-room">${t("newRoom")}</button>
+          <div class="row" style="gap:8px;justify-content:center;">
+            <button class="btn btn-primary" id="empty-taibu-room">${t("enterTaibu")}</button>
+            <button class="btn" id="empty-new-room">${t("newRoom")}</button>
+          </div>
         </div>`;
       const b = $("#empty-new-room");
       if (b) b.onclick = openRoomLobby;
+      const taibu = $("#empty-taibu-room");
+      if (taibu) taibu.onclick = openTaibuRoomLobby;
       return;
     }
 
@@ -1202,8 +1277,22 @@
     showRoomSub("lobby");
     applyLobbyMode(state.lobbyAdvanced ? "advanced" : "simple");
     state.lobbySlots = [];
-    buildLobbyDefaults();
+    const ready = buildLobbyDefaults();
     renderProtocolSettings();
+    return ready;
+  }
+
+  // Quick start for the bundled 太卜阁 personas: the template maps every
+  // seat by name and buildLobbyDefaults has already picked a READY runtime,
+  // so the user only reviews the Agent bindings and starts the room.
+  const TAIBU_TEMPLATE_ID = "room_template_divination_consultation";
+
+  async function openTaibuRoomLobby() {
+    await openRoomLobby();
+    const select = $("#lobby-template");
+    if (!select || !state.roomTemplates.some((item) => item.id === TAIBU_TEMPLATE_ID)) return;
+    select.value = TAIBU_TEMPLATE_ID;
+    applyRoomTemplate(TAIBU_TEMPLATE_ID);
   }
 
   // ─── Lobby: simple vs advanced mode ─────────────────────────────────────
@@ -1302,6 +1391,8 @@
     if (speakerSelection && speakerSelection.closest(".field")) {
       speakerSelection.closest(".field").hidden = direct;
     }
+    const relationshipField = $("#lobby-relationship-field");
+    if (relationshipField) relationshipField.hidden = !direct;
   }
 
   const protocolMeta = {
@@ -1868,6 +1959,9 @@
         // re-derived from the protocol's default role sequence.
         const roleKept = validRoles.includes(s.role);
         const finalRole = roleKept ? s.role : defaultRole(protocol, i);
+        const relationshipKind = conversationMode === "direct_chat"
+          ? (($("#lobby-relationship-kind") && $("#lobby-relationship-kind").value) || "partner")
+          : "";
         return {
           participant_id: `slot_${i}`,
           persona_id: s.persona_id,
@@ -1878,7 +1972,11 @@
           role: finalRole,
           specialties: (s.specialties && s.specialties.length) ? s.specialties : personaSpecialties(state.personas.find(p => p.id === s.persona_id)),
           authority: Number(roleKept && s.authority != null ? s.authority : authorityForRole(finalRole)),
-          tool_permissions: s.tool_permissions || []
+          tool_permissions: s.tool_permissions || [],
+          counterpart_id: conversationMode === "direct_chat" ? "user" : undefined,
+          allow_mcp: conversationMode !== "direct_chat",
+          allow_agent_tools: conversationMode !== "direct_chat",
+          initial_relationship: relationshipKind ? { relationship_kind: relationshipKind } : {}
         };
       })
     };
@@ -2942,6 +3040,26 @@
         </div>
       </div>`;
       }
+      if (m.input_mode === "time" || (m.metadata && m.metadata.channels && m.metadata.channels.input_mode === "time")) {
+        return `
+        <div class="scene-time-divider" style="margin: 1rem auto; text-align: center; font-size: 0.8rem; color: var(--text-muted); border-bottom: 1px dashed var(--border-color); line-height: 0.1em;">
+          <span style="background: var(--bg-card); padding: 0 0.75rem;">⏱ ${esc(m.content)}</span>
+        </div>`;
+      }
+      const spoken = m.spoken_text ?? m.metadata?.channels?.spoken_text ?? (m.input_mode === "action" ? "" : m.content);
+      const acts = m.actions || m.metadata?.channels?.actions || [];
+      if (!spoken && acts.length > 0) {
+        return acts.map((a) => {
+          const payload = a.payload || a;
+          const atype = payload.action_type || payload.action || "action";
+          const target = payload.target_id || payload.target || "";
+          const desc = payload.description || (`${isUser ? '你' : (m.speaker_name || m.participant_id)} ${atype}${target ? ' -> ' + target : ''}`);
+          return `
+          <div class="scene-action-event-pill" style="margin: 0.5rem auto; text-align: center; color: var(--text-muted); font-size: 0.85rem;">
+            ↳ ${esc(desc)}
+          </div>`;
+        }).join("");
+      }
       return `
       <div class="msg ${isUser ? "user" : ""}">
         <div class="avatar sm">${esc((m.speaker_name || "?").charAt(0).toUpperCase())}</div>
@@ -2950,7 +3068,13 @@
             <span class="msg-name">${esc(m.speaker_name || m.participant_id)}</span>
             <span class="msg-time num">${esc(m.created_at ? m.created_at.slice(11, 16) : nowTime())}</span>
           </div>
-          <div class="msg-body md">${renderMessageBody(m.content)}</div>
+          ${spoken ? `<div class="msg-body md">${renderMessageBody(spoken)}</div>` : ""}
+          ${acts.map((a) => {
+            const payload = a.payload || a;
+            const verb = ({hug: "拥抱", wave: "挥手", nod: "点头", smile: "微笑", approach: "靠近", stand_up: "站起", sit_down: "坐下", lie_down: "躺下"})[payload.action_type || payload.action] || payload.action_type || payload.action || "";
+            const tgt = payload.target_id || payload.target;
+            return verb ? `<div class="msg-action">${esc(verb)}</div>` : "";
+          }).join("")}
           ${renderMsgAttachments(m)}
         </div>
       </div>`;
@@ -3156,6 +3280,8 @@
       name: n.name,
       value: Number(n.level) || 0,
       baseline: Number(n.baseline) || 0,
+      rebound: Number(n.rebound_rate),
+      satiation: Number(n.satiation_response),
       confidence: Number(n.confidence) || 0,
       updated: fmtStateTime(n.updated_at),
       trigger: latestReason(n.reasons)
@@ -3168,7 +3294,7 @@
       updated: fmtStateTime(r.updated_at),
       trigger: latestReason(r.reasons)
     })).filter((r) => r.fields.length);
-    return { emotions, needs, relationships };
+    return { emotions, needs, relationships, fidelity: runtime && runtime.fidelity };
   }
 
   // Top N by significance; the rest fold behind a disclosure instead of
@@ -3184,6 +3310,7 @@
         <div class="track"><div class="fill" style="width:${Math.round(row.value * 100)}%"></div></div>
         <div class="meta num" style="margin-top:4px;display:flex;gap:10px;flex-wrap:wrap;">
           <span>${t("stateBaseline")} ${pctText(row.baseline)}</span>
+          ${Number.isFinite(row.rebound) ? `<span>回弹率 ${esc(row.rebound)}/h · 满足响应 ${pctText(row.satiation)}</span>` : ""}
           <span>${t("stateConfidence")} ${pctText(row.confidence)}</span>
           <span>${t("stateUpdated")} ${esc(row.updated)}</span>
         </div>
@@ -3327,7 +3454,19 @@
           <div class="meta">${t("affect")}</div>
           ${stateRows(view.emotions)}
           <div class="meta" style="margin-top:16px;">${t("needs")}</div>
-          ${stateRows(view.needs)}`;
+          ${stateRows(view.needs)}
+          ${view.fidelity ? `<details style="margin-top:16px;">
+            <summary>核心人格保真 / Core Trait Fidelity</summary>
+            <p class="meta">当前编译与 Prompt 预览；模型是否遵循需结合实际回复判断。</p>
+            <pre style="white-space:pre-wrap;">${esc(view.fidelity.static_kernel_preview)}</pre>
+            <pre style="white-space:pre-wrap;">${esc(view.fidelity.current_dominant_needs)}</pre>
+            ${(view.fidelity.relationship_modifiers || []).map((r) => `<div class="card">
+              <div>${esc(r.counterpart)} · ${esc(r.kind)} · trust ${pctText(r.trust)} · threat ${pctText(r.threat)}</div>
+              <pre style="white-space:pre-wrap;">${esc(r.stance)}</pre>
+              <div>Behavioral Implications</div>
+              <ul>${(r.behavioral_implications || []).map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+            </div>`).join("")}
+          </details>` : ""}`;
       }
     }
 
@@ -3937,6 +4076,7 @@
           <strong>${esc(researchLabel)}</strong>
           <div style="font-size:11px;margin-top:4px;">Method: ${esc(research.verification_method || "not_verified")} · Search: ${canDiscover ? "yes" : "no"} · Read: ${canRead ? "yes" : "no"}</div>
           ${research.verified_at ? `<div style="font-size:11px;">Last verified: ${esc(research.verified_at)}</div>` : ""}
+          ${a.research_model_id ? `<div style="font-size:11px;">验证模型：${esc(a.research_model_id)}</div>` : ""}
           ${research.verification_error ? `<div class="error" style="font-size:11px;margin-top:4px;">${esc(research.verification_error)}</div>` : ""}
         </div>
         <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:12px;">
@@ -3959,6 +4099,7 @@
               + `<button type="button" class="btn btn-sm btn-ghost btn-toggle-models" data-agent-toggle="${esc(a.id)}" data-expand-label="${esc(expandText)}" data-collapse-label="${esc(collapseText)}" style="padding:2px 8px;font-size:11px;color:var(--accent);height:22px;line-height:1.2;cursor:pointer;border:1px dashed var(--border-soft);">${esc(expandText)}</button>`;
           })()}
         </div>
+        ${a.model_discovery_error ? `<div class="error" style="font-size:11px;margin-bottom:8px;">模型目录探测：${esc(a.model_discovery_error)}</div>` : ""}
         <div class="row-between" style="margin-top:auto;padding-top:8px;">
           <div class="row" style="gap:6px;flex-wrap:wrap;">
             <button class="btn btn-sm btn-ghost" data-test-agent="${a.id}">${t("test")}</button>
@@ -4908,6 +5049,13 @@
       }
       if (dlg && dlg.open) dlg.close();
       invalidatePersonaRuntime(personaId, "main");
+      if (full) {
+        const cur = state.currentRoom;
+        if (cur && (cur.participants || []).some((p) => (p.persona_id || p.id) === personaId)) {
+          state.currentRoom = null;
+        }
+        await loadRooms();
+      }
       toast(full ? t("resetRuntimeFullDone") : t("resetRuntimeSoftDone"));
       // Refresh the detail view if it is still showing this persona.
       const box = $("#persona-detail");
@@ -5566,17 +5714,65 @@
     $("#pc-fused-evidence").textContent = `Fused: ${material.fused_evidence_count ?? 0}`;
     $("#pc-material-contradictions").textContent = `Contradictions: ${material.contradiction_count ?? 0}`;
     const materialProgress = (job.job_config && job.job_config.material_progress) || {};
+    const recordsParsed = materialProgress.records_parsed ?? materialProgress.segmented_messages ?? material.evidence_unit_count ?? 0;
+    const recordsTotal = materialProgress.records_total;
+    const batchesDone = materialProgress.analysis_batches_completed ?? 0;
+    const batchesTotal = materialProgress.analysis_batches_total;
+    const recordsEl = $("#pc-material-records");
+    if (recordsEl) {
+      recordsEl.textContent = recordsTotal
+        ? `Records: ${recordsParsed} / ${recordsTotal}`
+        : `Records processed: ${recordsParsed}`;
+    }
+    const batchesEl = $("#pc-material-batches");
+    if (batchesEl) {
+      batchesEl.textContent = batchesTotal
+        ? `Analysis batches: ${batchesDone} / ${batchesTotal}`
+        : `Analysis batches: ${batchesDone}`;
+    }
     const materialStats = $("#pc-material-stats");
     if (materialStats) {
+      const uploadBytes = materialProgress.upload_bytes;
+      const uploadTotal = materialProgress.upload_total_bytes;
       materialStats.textContent = [
-        `stage: ${materialProgress.status || "—"}`,
+        `stage: ${materialProgress.status || materialProgress.stage || "—"}`,
+        materialProgress.classification_total != null
+          ? `Material Classification 原始目标消息：${materialProgress.classification_completed ?? 0} / ${materialProgress.classification_total} (${(100 * (materialProgress.classification_completed ?? 0) / Math.max(1, materialProgress.classification_total)).toFixed(2)}%) · 已复用 ${materialProgress.classification_cached ?? 0}` : null,
+        materialProgress.classification_selected_total != null
+          ? `本次 Semantic 分类 Turn：${materialProgress.classification_reviewed_turns ?? 0} / ${materialProgress.classification_selected_total}（随扫描更新）` : null,
+        materialProgress.classification_turns_per_hour != null
+          ? `最近吞吐：${Math.round(materialProgress.classification_turns_per_hour)} target turns/hour · ETA：${materialProgress.classification_eta_seconds == null ? "统计中" : `${Math.ceil(materialProgress.classification_eta_seconds / 60)} 分钟`}` : null,
+        ...(() => {
+          const chat = materialProgress.chat_pipeline || {};
+          if (!chat.raw_message_count) return [];
+          const parts = [
+            `原始聊天：${(chat.raw_message_count ?? 0).toLocaleString()}`,
+            `目标人物消息：${(chat.target_message_count ?? 0).toLocaleString()} · 上下文消息：${(chat.context_message_count ?? 0).toLocaleString()}`,
+            `目标人物 Turn：${(chat.target_turn_count ?? 0).toLocaleString()}`,
+            `Semantic Gate (${chat.semantic_gate_mode || "full"})：selected ${chat.semantic_selected ?? 0} · skipped ${chat.semantic_skipped ?? 0} · reserve ${chat.semantic_reserve_selected ?? 0}`,
+            `分类 workers：${chat.active_classification_workers ?? 0} / ${chat.classification_worker_count ?? 0} · 平均 ${Number(chat.average_active_classification_workers ?? 0).toFixed(2)} · 队列 ${chat.window_queue_depth ?? 0}`,
+
+            `分类窗口：${chat.classification_windows_completed ?? 0} / ${chat.classification_windows_total ?? 0}`,
+            `Packing：initial ${chat.initial_analysis_windows ?? chat.classification_windows_total ?? 0} / actual ${chat.agent_calls ?? 0} / re-batched ${chat.rebatched_windows ?? 0} / accuracy ${chat.packing_accuracy ?? "—"}`,
+            `提取高价值证据：${(chat.evidence_turns_extracted ?? 0).toLocaleString()} · 无独立证据 Turn：${(chat.reviewed_no_independent_evidence ?? 0).toLocaleString()}`,
+            `Agent 调用：${chat.agent_calls ?? 0} · in ${chat.input_tokens ?? 0} / out ${chat.output_tokens ?? 0} tokens · 风格画像：${chat.style_profile_status || "—"}`,
+          ];
+          return [parts.join("\n")];
+        })(),
+        uploadTotal ? `upload: ${uploadBytes ?? 0} / ${uploadTotal} bytes` : (uploadBytes ? `upload: ${uploadBytes} bytes` : null),
+        `parsing: ${materialProgress.stage === "raw_sources" || materialProgress.status === "PARSING" ? "in progress" : (materialProgress.status || "—")}`,
+        recordsTotal ? `records: ${recordsParsed} / ${recordsTotal}` : `records processed: ${recordsParsed}`,
+        `segmented messages: ${materialProgress.segmented_messages ?? material.evidence_unit_count ?? 0}`,
+        batchesTotal ? `analysis batches: ${batchesDone} / ${batchesTotal}` : `analysis batches: ${batchesDone}`,
+        `indexing: ${materialProgress.stage === "persona_evidence_index" ? "in progress" : (material.evidence_unit_count ?? 0)}`,
+        `compilation: ${job.current_stage || job.status || "—"}`,
         `sources: ${material.source_count ?? 0}`,
         `units: ${material.evidence_unit_count ?? 0}`,
         `episodes: ${material.episode_count ?? 0}`,
         `fused evidence: ${material.fused_evidence_count ?? 0}`,
         `contradictions: ${material.contradiction_count ?? 0}`,
         `gaps: ${(material.high_priority_gaps || []).join(", ") || "—"}`,
-      ].join("\n");
+      ].filter(Boolean).join("\n");
     }
     $("#pc-stop-reason").textContent = job.research_stop_reason
       ? `Stop reason: ${job.research_stop_reason}`
@@ -5588,7 +5784,19 @@
     // ── Execution target + extraction detail + checkpoints + history ──
     const jobConfig = job.job_config || {};
     const binding = jobConfig.runtime_binding_snapshot || {};
-    const capabilities = jobConfig.effective_model_capabilities || {};
+    const chatPacking = (materialProgress && materialProgress.chat_pipeline) || {};
+    const capabilities = {
+      ...(jobConfig.effective_model_capabilities || {}),
+      context_scope: (jobConfig.effective_model_capabilities || {}).context_scope
+        || binding.context_scope,
+      packing: {
+        initial_windows: chatPacking.initial_analysis_windows,
+        actual_calls: chatPacking.agent_calls,
+        rebatched: chatPacking.rebatched_windows,
+        accuracy: chatPacking.packing_accuracy,
+        rebatched_ratio: chatPacking.rebatched_window_ratio,
+      },
+    };
     const setTag = (id, value) => { const el = $(id); if (el) el.textContent = value; };
     setTag("#pc-runtime-agent", `Agent: ${job.agent_id || binding.agent_id || "—"}`);
     setTag("#pc-runtime-model", `Model: ${job.model_id || binding.model_id || "—"}`);
@@ -5661,9 +5869,9 @@
     if (interview) interview.hidden = !latestQuestion || !["waiting_for_materials", "completed_with_gaps"].includes(job.status);
     if (latestQuestion) $("#pc-interview-question").textContent = latestQuestion.question || "请补充资料";
     $("#pc-pause").hidden = !["planning", "researching", "ingesting_sources", "extracting", "compiling"].includes(job.status);
-    $("#pc-resume").hidden = !["paused", "paused_runtime_unavailable", "waiting_for_materials"].includes(job.status);
+    $("#pc-resume").hidden = !["paused", "paused_runtime_unavailable", "waiting_for_materials", "pause_requested"].includes(job.status);
     const resumeModel = $("#pc-resume-model");
-    if (resumeModel) resumeModel.hidden = !["paused", "paused_runtime_unavailable"].includes(job.status);
+    if (resumeModel) resumeModel.hidden = !["paused", "paused_runtime_unavailable", "pause_requested"].includes(job.status);
     $("#pc-continue").hidden = !["completed", "completed_with_gaps"].includes(job.status);
     const retry = $("#pc-retry");
     if (retry) {
@@ -5695,31 +5903,105 @@
   }
 
   // ─── Persona Creation: model switch on pause/failure ────────────────────
-  // Arms the create-form runtime selectors so the next submit retargets the
-  // paused/failed job instead of creating a new one.  Persisted evidence,
-  // batch checkpoints, and completed dimensions are reused automatically.
+  function closePersonaCreationModelSwitch() {
+    $("#pc-runtime-home").appendChild($("#pc-runtime-controls"));
+    state.personaCreationModelSwitch = null;
+    if (state.personaCreationJob) openPersonaCreationProgressDialog(state.personaCreationJob);
+  }
+
   function armPersonaCreationModelSwitch(action) {
     const job = state.personaCreationJob;
     if (!job) return;
     state.personaCreationModelSwitch = { action, jobId: job.id };
-    const progressDialog = $("#dlg-persona-creation-progress");
-    if (progressDialog && progressDialog.open) progressDialog.close();
-    const start = $("#pc-start");
-    if (start) start.textContent = action === "retry" ? "更换模型后重试" : "更换模型并继续";
-    const form = $("#form-persona-create");
-    if (form) {
-      const progressCard = $("#pc-progress");
-      if (progressCard && progressCard.parentElement !== form) form.appendChild(progressCard);
-      setupPersonaCreationRuntimeSelectors();
-      const dlg = $("#dlg-persona-create");
-      if (dlg && !dlg.open) dlg.showModal();
+    for (const id of ["#dlg-persona-creation-progress", "#dlg-persona-create"]) {
+      if ($(id).open) $(id).close();
     }
+    $("#pc-switch-runtime-host").appendChild($("#pc-runtime-controls"));
+    const label = action === "retry" ? "更换模型后重试" : "更换模型并继续";
+    $("#pc-switch-title").textContent = label;
+    $("#pc-switch-submit").textContent = label;
+    $("#pc-switch-submit").disabled = false;
+    $("#pc-switch-cancel").disabled = false;
+    $("#pc-switch-error").hidden = true;
+    $("#pc-runtime-source").value = job.runtime_source || "local_cli";
+    $("#pc-persona-notes").value = job.persona_notes ?? [
+      job.identity_context || job.identity_disambiguation,
+      job.user_defined_facts || job.supplemental_profile,
+      job.research_instructions || job.research_scope
+    ].filter(Boolean).join("\n");
+    setupPersonaCreationRuntimeSelectors();
+    for (const [id, value] of [["#pc-agent", job.agent_id], ["#pc-model", job.model_id], ["#pc-reasoning", job.reasoning_effort]]) {
+      const select = $(id);
+      if (value && !Array.from(select.options).some(option => option.value === value)) {
+        select.add(new Option(`${value}（当前不可用，请重新选择）`, value));
+        select.options[select.options.length - 1].disabled = true;
+      }
+      if (value) select.value = value;
+      if (select.onchange) select.onchange();
+    }
+    $("#dlg-pc-model-switch").showModal();
+  }
+
+  function formatUploadBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function renderPrivateUploadProgress(items) {
+    const box = $("#pc-upload-progress");
+    if (!box) return;
+    box.hidden = !items.length;
+    box.innerHTML = items.map((item) => {
+      const total = Number(item.total || 0);
+      const loaded = Number(item.loaded || 0);
+      const pct = total ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      const pctLabel = total ? `${pct}%` : `${formatUploadBytes(loaded)} uploaded`;
+      return `<div class="pc-upload-item">
+        <div class="row-between"><span>${esc(item.filename || "file")}</span><span class="meta">${formatUploadBytes(loaded)} / ${total ? formatUploadBytes(total) : "—"} · ${pctLabel}</span></div>
+        <div class="progress"><div class="progress-bar" style="width:${total ? pct : 0}%"></div></div>
+      </div>`;
+    }).join("");
+  }
+
+  function uploadPrivateMaterialFile(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const url = `/api/persona-material/uploads?filename=${encodeURIComponent(file.name)}`;
+      xhr.open("POST", url);
+      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+      xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+      xhr.upload.onprogress = (event) => {
+        if (typeof onProgress === "function") {
+          onProgress({
+            filename: file.name,
+            loaded: event.loaded,
+            total: event.lengthComputable ? event.total : (file.size || 0)
+          });
+        }
+      };
+      xhr.onload = () => {
+        let payload = null;
+        try { payload = JSON.parse(xhr.responseText || "{}"); } catch (_) { payload = null; }
+        if (xhr.status >= 200 && xhr.status < 300 && payload && payload.ok) {
+          resolve(payload.data);
+          return;
+        }
+        reject(new Error((payload && payload.error) || `upload_failed:${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error("upload_failed"));
+      xhr.onabort = () => reject(new Error("upload_aborted"));
+      xhr.send(file);
+    });
   }
 
   async function submitPersonaCreation(e) {
     e.preventDefault();
-    const error = $("#pc-error-form");
-    const start = $("#pc-start");
+    const switching = Boolean(state.personaCreationModelSwitch);
+    const error = $(switching ? "#pc-switch-error" : "#pc-error-form");
+    const start = $(switching ? "#pc-switch-submit" : "#pc-start");
     if (error) error.hidden = true;
     // A model-switch submit retargets the existing paused/failed job from the
     // runtime selectors instead of starting a new creation.
@@ -5731,6 +6013,14 @@
         model_id: $("#pc-model").value || null,
         reasoning_effort: $("#pc-reasoning").value || null,
       };
+      if (["#pc-agent", "#pc-model"].some(id => !$(id).value || $(id).selectedOptions[0]?.disabled)) {
+        error.textContent = "请选择可用的智能体和模型。";
+        error.hidden = false;
+        return;
+      }
+      if (start.disabled) return;
+      start.disabled = true;
+      $("#pc-switch-cancel").disabled = true;
       try {
         const endpoint = modelSwitch.action === "retry" ? "/retry" : "/resume";
         const res = await api(`/api/persona-creation/jobs/${encodeURIComponent(modelSwitch.jobId)}${endpoint}`, {
@@ -5740,14 +6030,15 @@
         });
         if (!res || !res.ok) throw new Error((res && res.error) || "更换执行目标失败");
         state.personaCreationModelSwitch = null;
-        if (start) start.textContent = "开始创建";
-        $("#dlg-persona-create").close();
         state.personaCreationJob = res.data;
+        $("#dlg-pc-model-switch").close();
         openPersonaCreationProgressDialog(res.data);
         if (state.personaCreationPoll) clearInterval(state.personaCreationPoll);
         state.personaCreationPoll = setInterval(() => pollPersonaCreationJob(res.data.id), 1000);
       } catch (err) {
         if (error) {
+          start.disabled = false;
+          $("#pc-switch-cancel").disabled = false;
           error.textContent = `更换执行目标失败：${err.message || err}`;
           error.hidden = false;
         }
@@ -5764,10 +6055,8 @@
     const workUniverse = $("#pc-work-universe")?.value.trim() || null;
     const lifeStatus = $("#pc-life-status")?.value || "unknown";
     const privacyScope = $("#pc-privacy-scope")?.value || "public";
-    const identityContext = $("#pc-identity-context")?.value.trim() || null;
-    const userDefinedFacts = $("#pc-user-facts")?.value.trim() || null;
+    const personaNotes = $("#pc-persona-notes")?.value.trim() || "";
     const researchMode = $("#pc-research-mode")?.value || "auto";
-    const researchInstructions = $("#pc-research-instructions")?.value.trim() || null;
 
     // Derive backward-compatible type & mode
     let type = "public_living_person";
@@ -5793,6 +6082,10 @@
       }
     }
 
+    if (!$("#pc-display-name").value.trim() || !agent || !model) {
+      if (error) { error.hidden = false; error.textContent = "名称、READY Runtime 和模型能力均为必填。"; }
+      return;
+    }
     const materialText = $("#pc-materials").value.trim();
     const materials = materialText ? materialText.split(/\n\s*\n/).filter(Boolean).map((content, index) => ({
       title: `User material ${index + 1}`,
@@ -5800,18 +6093,29 @@
       content
     })) : [];
     const files = Array.from($("#pc-material-files")?.files || []);
-    for (const file of files) {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      let binary = "";
-      for (let index = 0; index < bytes.length; index += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    if (files.length && start) start.textContent = "正在上传资料…";
+    const uploadState = files.map((file) => ({ filename: file.name, loaded: 0, total: file.size || 0 }));
+    renderPrivateUploadProgress(uploadState);
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const uploaded = await uploadPrivateMaterialFile(file, (info) => {
+          uploadState[index] = info;
+          renderPrivateUploadProgress(uploadState);
+        });
+        materials.push({
+          upload_id: uploaded.upload_id,
+          filename: uploaded.filename || file.name,
+          source_type: "user_file"
+        });
+      } catch (uploadErr) {
+        if (error) {
+          error.hidden = false;
+          error.textContent = `资料上传失败：${file.name} — ${uploadErr.message || uploadErr}`;
+        }
+        if (start) start.textContent = "开始创建";
+        return;
       }
-      materials.push({
-        title: file.name,
-        filename: file.name,
-        source_type: "user_file",
-        content_base64: btoa(binary)
-      });
     }
     const profile = $("#pc-policy").value;
     const researchPolicy = { profile };
@@ -5832,10 +6136,8 @@
       work_or_universe: workUniverse,
       life_status: lifeStatus,
       privacy_scope: privacyScope,
-      identity_context: identityContext,
-      user_defined_facts: userDefinedFacts,
+      persona_notes: personaNotes,
       research_mode: researchMode,
-      research_instructions: researchInstructions,
       web_scope: subjectKind === "original_character" ? "background_only" : (subjectKind === "fictional_character" ? "identity_and_canon" : "identity_and_biography"),
       birth_date: $("#pc-birth-date").value || null,
       death_date: $("#pc-death-date").value || null,
@@ -5846,6 +6148,7 @@
       reasoning_effort: reasoning,
       research_policy: researchPolicy,
       materials,
+      material_semantic_gate_mode: $("#pc-gate-mode")?.value || "auto",
       remote_material_consent: $("#pc-remote-consent").checked,
       ...(state.personaCreationExistingId
         ? { existing_persona_id: state.personaCreationExistingId, duplicate_action: "enrich" }
@@ -5862,7 +6165,8 @@
     if (needsResearch) {
       const selectedAgent = (state.agents || []).find(a => a.id === agent);
       const researchStatus = ((selectedAgent && selectedAgent.research) || {}).verification_status || "";
-      if (researchStatus === "unavailable" || researchStatus === "blocked") {
+      const researchApplies = !selectedAgent?.research_model_id || selectedAgent.research_model_id === model;
+      if (researchApplies && (researchStatus === "unavailable" || researchStatus === "blocked")) {
         const detail = (selectedAgent.research || {}).verification_error || "";
         if (error) {
           error.hidden = false;
@@ -9864,6 +10168,10 @@
       e.preventDefault();
       openRoomLobby();
     });
+    onClick("#empty-taibu-room", (e) => {
+      e.preventDefault();
+      openTaibuRoomLobby();
+    });
     onClick("#empty-new-world", (e) => {
       e.preventDefault();
       const btn = $("#btn-new-world");
@@ -9874,6 +10182,25 @@
       const dlg = $("#dlg-api");
       if (dlg) dlg.showModal();
     });
+
+    const composerModeSel = $("#composer-mode");
+    if (composerModeSel) {
+      composerModeSel.addEventListener("change", () => {
+        const mode = composerModeSel.value;
+        const input = $("#inject");
+        const btn = $("#btn-inject");
+        if (mode === "time") {
+          input.placeholder = "推进时间，例如「30分钟」「8小时」「第二天早上」「明天 09:00」";
+          btn.textContent = "推进";
+        } else if (mode === "action") {
+          input.placeholder = "描述你的动作，例如「向她走过去」「坐在她旁边」「站起来」";
+          btn.textContent = "行动";
+        } else {
+          input.placeholder = t("injectPh") || "向讨论注入一句对话或主持提问…";
+          btn.textContent = "发送";
+        }
+      });
+    }
 
     const injectInput = $("#inject");
     if (injectInput) {
@@ -10929,6 +11256,12 @@
     onClick("#persona-create-close", () => $("#dlg-persona-create").close());
     onClick("#pc-cancel-create", () => $("#dlg-persona-create").close());
     onClick("#persona-creation-progress-close", () => $("#dlg-persona-creation-progress").close());
+    $("#form-pc-model-switch").addEventListener("submit", submitPersonaCreation);
+    $("#dlg-pc-model-switch").addEventListener("close", closePersonaCreationModelSwitch);
+    $("#dlg-pc-model-switch").addEventListener("cancel", event => {
+      if ($("#pc-switch-submit").disabled) event.preventDefault();
+    });
+    onClick("#pc-switch-cancel", () => $("#dlg-pc-model-switch").close());
     const personaForm = $("#form-persona-create");
     if (personaForm) personaForm.addEventListener("submit", submitPersonaCreation);
     const subjectKindSel = $("#pc-subject-kind");
@@ -10950,7 +11283,12 @@
       const job = state.personaCreationJob;
       if (!job) return;
       const res = await api(`/api/persona-creation/jobs/${encodeURIComponent(job.id)}/resume`, { method: "POST" });
-      if (res && res.ok) { state.personaCreationJob = res.data; renderPersonaCreationJob(res.data); }
+      if (res && res.ok) {
+        state.personaCreationJob = res.data;
+        renderPersonaCreationJob(res.data);
+        if (state.personaCreationPoll) clearInterval(state.personaCreationPoll);
+        state.personaCreationPoll = setInterval(() => pollPersonaCreationJob(res.data.id), 1000);
+      }
       else toast((res && res.error) || "Runtime 不可用，无法继续");
     });
     onClick("#pc-cancel", async () => {

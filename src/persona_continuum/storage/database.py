@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -16,6 +18,9 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._conn: sqlite3.Connection | None = None
+        self._readers = threading.local()
+        self._reader_connections: list[sqlite3.Connection] = []
+        self._readers_lock = threading.Lock()
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -43,8 +48,334 @@ class Database:
         self._ensure_research_capability_cache_columns()
         self._ensure_room_protocol_state()
         self._ensure_room_transcript_identity()
+        self._ensure_memory_episode_schema()
+        from persona_continuum.storage.temporal_migration import migrate_temporal_history
+
+        migrate_temporal_history(self.conn)
         self.conn.commit()
 
+    def _ensure_memory_episode_schema(self) -> None:
+        """Record the Episode migration and keep its tables forward-compatible.
+
+        Additive and non-destructive: the tables are created by ``SCHEMA_SQL``
+        with ``IF NOT EXISTS``, only missing columns are ever added, and no
+        existing table (raw transcripts, memories, lineage) is touched.  The
+        migration id is stamped so an operator can tell which schema a data
+        directory is on without guessing from the table list.
+        """
+
+        from persona_continuum.storage.migrations import (
+            MEMORY_EPISODES_MIGRATION_ID,
+            SHARED_USER_PROVENANCE_MIGRATION_ID,
+        )
+
+        tables = self._all_tables()
+        if "memory_episodes" not in tables or "memory_episode_turns" not in tables:
+            # SCHEMA_SQL failed to create them, which means the database is not
+            # writable or is not the file we think it is.  Fail closed rather
+            # than let the Episode layer run against missing tables.
+            raise RuntimeError("memory_episode_schema_missing")
+        expected_columns = {
+            "memory_episodes": (
+                "summary_status",
+                "consolidation_attempts",
+                "last_error",
+                "consolidated_at",
+                "visibility",
+                "provenance",
+                "material_scope",
+                "source_range_hash",
+                "fact_extraction_status",
+                "fact_extraction_attempts",
+                "fact_extraction_error",
+                "facts_extracted_at",
+                "thread_resolution_status",
+                "thread_resolution_attempts",
+                "thread_resolution_error",
+                "threads_resolved_at",
+            ),
+            "memory_episode_turns": ("source_kind", "token_estimate", "occurred_at"),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                # Only ever additive, always nullable/defaulted: an older row
+                # keeps a valid value and nothing is dropped.
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                MEMORY_EPISODES_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                SHARED_USER_PROVENANCE_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps(
+                    {"source_kinds": ["session_turn", "shared_user"]}, ensure_ascii=False
+                ),
+            ),
+        )
+        self._ensure_semantic_fact_schema()
+        self._ensure_active_thread_schema()
+        self._ensure_hierarchical_summary_schema()
+
+    def _ensure_hierarchical_summary_schema(self) -> None:
+        """Phase 6 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import (
+            HIERARCHICAL_SUMMARIES_MIGRATION_ID,
+            HIERARCHY_DEPENDENCY_MIGRATION_ID,
+        )
+
+        tables = self._all_tables()
+        required = ("memory_hierarchical_summaries", "memory_summary_sources")
+        if any(table not in tables for table in required):
+            raise RuntimeError("hierarchical_summary_schema_missing")
+        expected_columns = {
+            "memory_hierarchical_summaries": (
+                "level",
+                "summary_type",
+                "sequence",
+                "started_at",
+                "ended_at",
+                "status",
+                "source_count",
+                "source_token_estimate",
+                "consolidation_version",
+                "summary_status",
+                "consolidation_attempts",
+                "last_error",
+                "consolidated_at",
+                "source_range_hash",
+                "source_fingerprint",
+                "consolidated_fingerprint",
+                "parent_summary_id",
+                "visibility",
+                "material_scope",
+            ),
+            "memory_summary_sources": (
+                "source_type",
+                "position",
+                "started_at",
+                "ended_at",
+                "importance",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                HIERARCHICAL_SUMMARIES_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+        # Phase 6.1 stamps the dependency-hardening columns separately: the two
+        # fingerprints are what let a parent notice that a child changed.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                HIERARCHY_DEPENDENCY_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps(
+                    {"columns": ["source_fingerprint", "consolidated_fingerprint"]},
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+    def rollback_hierarchical_summaries(self) -> None:
+        """Apply the documented Phase 6 rollback (summary tables only)."""
+
+        from persona_continuum.storage.migrations import HIERARCHICAL_SUMMARIES_DOWN_SQL
+
+        self.conn.executescript(HIERARCHICAL_SUMMARIES_DOWN_SQL)
+        self.conn.commit()
+
+    def _ensure_active_thread_schema(self) -> None:
+        """Phase 5 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import ACTIVE_THREADS_MIGRATION_ID
+
+        tables = self._all_tables()
+        required = (
+            "memory_active_threads",
+            "memory_thread_events",
+            "memory_thread_sources",
+            "memory_thread_facts",
+            "memory_thread_link_candidates",
+        )
+        if any(table not in tables for table in required):
+            raise RuntimeError("active_thread_schema_missing")
+        expected_columns = {
+            "memory_active_threads": (
+                "thread_key",
+                "thread_type",
+                "status",
+                "opened_at",
+                "last_activity_at",
+                "resolved_at",
+                "cancelled_at",
+                "stale_at",
+                "current_state_json",
+                "consolidation_version",
+                "visibility",
+                "material_scope",
+                "related_previous_thread_id",
+            ),
+            "memory_thread_events": (
+                "event_key",
+                "state_json",
+                "source_episode_id",
+                "source_turn_id",
+                "source_availability",
+                "metadata_json",
+            ),
+            "memory_thread_sources": (
+                "source_type",
+                "episode_id",
+                "turn_id",
+                "session_id",
+                "room_id",
+                "evidence_role",
+                "excerpt_available",
+            ),
+            "memory_thread_facts": ("relation",),
+            "memory_thread_link_candidates": (
+                "episode_id",
+                "thread_id",
+                "confidence",
+                "reason",
+                "status",
+                "resolved_at",
+                "metadata_json",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                ACTIVE_THREADS_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+
+    def rollback_active_threads(self) -> None:
+        """Apply the documented Phase 5 rollback (Thread tables only)."""
+
+        from persona_continuum.storage.migrations import ACTIVE_THREADS_DOWN_SQL
+
+        self.conn.executescript(ACTIVE_THREADS_DOWN_SQL)
+        self.conn.commit()
+
+    def _ensure_semantic_fact_schema(self) -> None:
+        """Phase 4 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import SEMANTIC_FACTS_MIGRATION_ID
+
+        tables = self._all_tables()
+        if "memory_semantic_facts" not in tables or "memory_fact_sources" not in tables:
+            raise RuntimeError("semantic_fact_schema_missing")
+        expected_columns = {
+            "memory_semantic_facts": (
+                "fact_key",
+                "value_key",
+                "origin",
+                "durability",
+                "plan_status",
+                "evidence_count",
+                "last_confirmed_at",
+                "valid_from",
+                "valid_until",
+                "temporal_expression",
+                "temporal_normalized",
+                "temporal_confidence",
+                "superseded_by_fact_id",
+                "supersedes_fact_id",
+                "extraction_version",
+                "visibility",
+                "material_scope",
+            ),
+            "memory_fact_sources": (
+                "source_type",
+                "episode_id",
+                "turn_id",
+                "session_id",
+                "room_id",
+                "evidence_role",
+                "excerpt_available",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                SEMANTIC_FACTS_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+
+    def rollback_semantic_facts(self) -> None:
+        """Apply the documented Phase 4 rollback (Fact tables only)."""
+
+        from persona_continuum.storage.migrations import SEMANTIC_FACTS_DOWN_SQL
+
+        self.conn.executescript(SEMANTIC_FACTS_DOWN_SQL)
+        self.conn.commit()
+
+    def rollback_memory_episodes(self) -> None:
+        """Apply the documented Phase 3 rollback (drops only the Episode tables).
+
+        Exposed for operators and for the migration test; never called during
+        startup.  Raw transcripts, memories and lineage are untouched.
+        """
+
+        from persona_continuum.storage.migrations import MEMORY_EPISODES_DOWN_SQL
+
+        self.conn.executescript(MEMORY_EPISODES_DOWN_SQL)
+        self.conn.commit()
     def _ensure_room_transcript_identity(self) -> None:
         """Make (room_id, turn_id) an identity key for replay-safe injection.
 
@@ -595,7 +926,40 @@ class Database:
         else:
             conn.commit()
 
+    def reader(self) -> sqlite3.Connection:
+        """A read-only connection private to the calling thread.
+
+        ``conn`` is shared with the event loop.  Python's sqlite3 caches
+        prepared statements per connection, so the same SQL run from two
+        threads at once fails with ``InterfaceError: API misuse``.  Worker
+        threads that read off the event loop use this instead; WAL lets them
+        run alongside the writer and they see every committed write.
+        """
+
+        connection: sqlite3.Connection | None = getattr(self._readers, "conn", None)
+        if connection is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30.0,
+                # Owned by one thread; the flag only lets close() release it.
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
+            self._readers.conn = connection
+            with self._readers_lock:
+                self._reader_connections.append(connection)
+        return connection
+
     def close(self) -> None:
+        with self._readers_lock:
+            for connection in self._reader_connections:
+                with contextlib.suppress(Exception):
+                    connection.close()
+            self._reader_connections.clear()
+        self._readers = threading.local()
         if self._conn is not None:
             self._conn.close()
             self._conn = None

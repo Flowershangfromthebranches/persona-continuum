@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from persona_continuum.domain.scene import RoomSceneState
 from persona_continuum.room.case_state import RoomCaseState
 
 __all__ = [
@@ -276,6 +277,11 @@ class ParticipantSlot(BaseModel):
     reasoning_selection: str = "default"  # specific effort string, "default", or "random"
     auth_profile_id: str | None = None
     permission_profile: str = "chat_safe"
+    # Context strategy for THIS participant: "auto" (default), "quality",
+    # "balanced" or "local_constrained".  It selects a ContextProfile -- how
+    # much of the model's capability one turn may fill -- and never changes
+    # what the persona remembers.
+    context_strategy: str = "auto"
     allow_mcp: bool = True
     allow_dynamic_recall: bool = True
     allow_agent_tools: bool = True
@@ -287,6 +293,9 @@ class ParticipantSlot(BaseModel):
     max_consecutive_turns: int = 2
     expertise: list[str] = Field(default_factory=list)
     relationships: dict[str, float] = Field(default_factory=dict)
+    counterpart_id: str | None = None
+    initial_relationship: dict[str, Any] = Field(default_factory=dict)
+    relationship_priors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     runtime_pool: list[dict[str, Any]] = Field(default_factory=list)
     model_pool: list[dict[str, Any]] = Field(default_factory=list)
     reasoning_pool: list[dict[str, Any]] = Field(default_factory=list)
@@ -381,6 +390,7 @@ class RoomSessionState(BaseModel):
     # Long-lived description of what the room is about.  A follow-up must
     # never overwrite it -- follow-ups merge into ``case_state`` instead.
     case_state: RoomCaseState = Field(default_factory=RoomCaseState)
+    scene_state: RoomSceneState = Field(default_factory=RoomSceneState)
     protocol_state: RoomProtocolState = Field(default_factory=RoomProtocolState)
     protocol_events: list[RoomProtocolEvent] = Field(default_factory=list)
     mode: RoomMode = RoomMode.AUTONOMOUS

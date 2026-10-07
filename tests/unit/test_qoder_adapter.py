@@ -4,7 +4,12 @@ import pytest
 
 from persona_continuum.agent.adapters import other_vendors
 from persona_continuum.agent.adapters.other_vendors import QoderAdapter
-from persona_continuum.agent.models import ReasoningCapabilityMode, ResearchVerificationStatus
+from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.models import (
+    AgentSessionConfig,
+    ReasoningCapabilityMode,
+    ResearchVerificationStatus,
+)
 
 SAMPLE_LISTING = """MODEL
 Auto
@@ -15,6 +20,20 @@ GLM-5.3
 Kimi-K2.7-Code
 MiniMax-M2.7
 """
+
+
+def test_qoder_binds_requested_context_window_flag() -> None:
+    adapter = QoderAdapter()
+    assert adapter.context_window_mode == ContextWindowMode.CONFIGURABLE_AND_DISCOVERABLE
+    args = adapter.build_extra_cli_args(
+        AgentSessionConfig(
+            room_id="r",
+            participant_id="p",
+            persona_id="x",
+            extra={"requested_context_window": 1_000_000},
+        )
+    )
+    assert args == ["--context-window", "1000000"]
 
 
 def test_qoder_parse_models_skips_header_and_infers_provider() -> None:
@@ -82,7 +101,7 @@ async def test_qoder_list_models_merges_logged_in_editions_and_pins(
 
 
 @pytest.mark.anyio
-async def test_qoder_list_models_falls_back_when_no_edition_is_logged_in(
+async def test_qoder_does_not_advertise_models_when_no_edition_is_logged_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def fake_exec(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -93,11 +112,9 @@ async def test_qoder_list_models_falls_back_when_no_edition_is_logged_in(
     monkeypatch.setattr(adapter, "_candidate_binaries", lambda: ["/bin/qodercli"])
 
     models = await adapter.list_models()
-    ids = {m.id for m in models}
     assert adapter._resolved_binary is None
-    # The stale 4-model scaffold must be gone: current verified catalog.
-    assert {"Qwen3.8-Max", "GLM-5.3", "Kimi-K2.7-Code", "MiniMax-M2.7"} <= ids
-    assert all(m.source == "config" for m in models)
+    assert models == []
+    assert adapter._listing_auth_required is True
 
 
 def test_qoder_declares_native_web_research() -> None:

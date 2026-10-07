@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -84,6 +84,9 @@ class MemoryRecord(BaseModel):
     persona_id: str
     content: str
     type: MemoryType
+    retrieval_role: Literal["fact", "event", "relationship", "voice_exemplar", "raw_archive"] = (
+        "fact"
+    )
     occurred_at: datetime | None = None
     written_at: datetime = Field(default_factory=utc_now)
     participants: list[str] = Field(default_factory=list)
@@ -108,6 +111,12 @@ class MemoryRecord(BaseModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
+        metadata = data.get("metadata") or {}
+        data.setdefault("retrieval_role", metadata.get("retrieval_role", "fact"))
+        if data.get("type") == "digital_experience" and not metadata.get(
+            "semantic_experience_version"
+        ):
+            data["retrieval_role"] = "raw_archive"
         for field in ("source_confidence", "importance"):
             normalized = safe_probability(data.get(field), default=0.5)
             data[field] = normalized if normalized is not None else 0.5

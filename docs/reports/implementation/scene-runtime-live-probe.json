@@ -1,0 +1,44 @@
+{
+  "host": "grok",
+  "model": "grok-4.6",
+  "effort": "high",
+  "synthetic_identity": true,
+  "cases": [
+    {
+      "input": "第二天早上我醒了。早呀，你想先聊点什么？",
+      "raw_model_output": "{\"speech\": \"早呀。刚醒，脑子还慢半拍。我没什么非要先说的，你想聊啥都行，随便扯也行。\",\"actions\": [{\"type\": \"physical_action\", \"action\": \"坐直身子，揉了揉眼睛\", \"target\": \"self\"}], \"scene_updates\": []}",
+      "speech": "早呀。刚醒，脑子还慢半拍。我没什么非要先说的，你想聊啥都行，随便扯也行。",
+      "actions": [
+        {
+          "type": "physical_action",
+          "payload": {
+            "action": "坐直身子，揉了揉眼睛",
+            "target": "self"
+          }
+        }
+      ],
+      "error": null,
+      "scene_time": "2026-09-19T08:00:00.003465+08:00",
+      "raw_has_stage_directions": false,
+      "speech_has_stage_directions": false
+    },
+    {
+      "input": "抱我一下，然后跟我说声晚安。",
+      "raw_model_output": "{\"speech\": \"刚说完早，又要晚安？行，抱一下。晚安。\",\"actions\": [{\"type\": \"physical_action\", \"action\": \"伸手轻轻抱了对方一下\", \"target\": \"user\"}], \"scene_updates\": []}",
+      "speech": "刚说完早，又要晚安？行，抱一下。晚安。",
+      "actions": [
+        {
+          "type": "physical_action",
+          "payload": {
+            "action": "伸手轻轻抱了对方一下",
+            "target": "user"
+          }
+        }
+      ],
+      "error": null,
+      "scene_time": "2026-09-19T08:00:32.960324+08:00",
+      "raw_has_stage_directions": false,
+      "speech_has_stage_directions": false
+    }
+  ]
+}

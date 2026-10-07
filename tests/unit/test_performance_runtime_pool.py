@@ -215,6 +215,37 @@ def test_twenty_logical_sessions_share_four_physical_runtimes_without_starvation
     asyncio.run(scenario())
 
 
+def test_hundred_material_windows_do_not_starve_pool() -> None:
+    """A PER_WINDOW workload acquires + releases per window, never pinning one."""
+
+    async def scenario() -> None:
+        pool = AgentRuntimePool(max_processes_per_key=4)
+        counter = {"spawns": 0}
+        make = _factory(counter)
+        completed: list[int] = []
+
+        async def window(index: int) -> None:
+            lease = await pool.acquire("grok:material", make)
+            await lease.managed.ensure_initialized(_noop_init)
+            try:
+                await asyncio.sleep(0.001)
+                completed.append(index)
+            finally:
+                await lease.release()
+
+        await asyncio.wait_for(
+            asyncio.gather(*(window(index) for index in range(100))), timeout=10
+        )
+        assert len(completed) == 100
+        assert counter["spawns"] <= 4
+        snapshot = pool.snapshot()
+        assert snapshot["active_leases"] == 0
+        assert snapshot["logical_sessions"] == 0
+        await pool.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_dimension_persona_world_and_room_logical_groups_exceed_pool_capacity() -> None:
     async def scenario() -> None:
         pool = AgentRuntimePool(max_processes_per_key=4)

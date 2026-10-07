@@ -51,3 +51,4 @@ def test_merge_targeted_repair_artifact_includes_new_source_ids():
     # Pydantic validation must pass without claim_source_id_not_in_artifact
     artifact = ResearchArtifact.model_validate(merged)
     assert len(artifact.claims) == 2
+

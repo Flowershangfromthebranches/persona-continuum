@@ -351,6 +351,7 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
         title: str | None = None,
         counterpart_id: str = "user",
         branch_id: str | None = None,
+        initial_relationship: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return guarded(
             lambda: context.app().sessions.start_session(
@@ -358,6 +359,7 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
                 title,
                 counterpart_id=counterpart_id,
                 branch_id=branch_id,
+                initial_relationship=initial_relationship,
             )
         )
 
@@ -434,8 +436,14 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
         return guarded(lambda: context.app().runtime_state(persona_id, branch_id))
 
     @server.tool()
-    def persona_run_reflection(persona_id: str) -> dict[str, Any]:
-        return guarded(lambda: context.app().sessions.run_reflection(persona_id))
+    def persona_run_reflection(
+        persona_id: str, branch_id: str | None = None, artifact: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return guarded(
+            lambda: context.app().sessions.run_reflection(
+                persona_id, branch_id=branch_id, artifact=artifact
+            )
+        )
 
     @server.tool()
     def persona_prepare_reflection(
@@ -588,8 +596,14 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
         return guarded(lambda: context.app().continuations.compile_persona(continuation_id))
 
     @server.tool()
-    def persona_create_room(persona_ids: list[str], topic: str | None = None) -> dict[str, Any]:
-        return guarded(lambda: context.app().rooms.create_room(persona_ids, topic))
+    def persona_create_room(
+        persona_ids: list[str],
+        topic: str | None = None,
+        initial_relationships: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        return guarded(
+            lambda: context.app().rooms.create_room(persona_ids, topic, initial_relationships)
+        )
 
     @server.tool()
     def persona_room_add_persona(room_id: str, persona_id: str) -> dict[str, Any]:
@@ -847,7 +861,6 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
             }
 
         return guarded(_call)
-
 
     # ------------------------------------------------------------------
     # Narrative Studio
@@ -1268,9 +1281,7 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
         return guarded(_call)
 
     @server.tool()
-    def narrative_get_video_prompt_package(
-        project_id: str, package_id: str
-    ) -> dict[str, Any]:
+    def narrative_get_video_prompt_package(project_id: str, package_id: str) -> dict[str, Any]:
         """Reads one model prompt package with the derived profile-update flag."""
 
         def _call() -> dict[str, Any]:
@@ -1283,8 +1294,8 @@ def create_mcp_server(app_context: MCPApplicationContext | None = None) -> FastM
             data = _serialize(package)
             try:
                 current = get_profile(package.target_profile_id)
-                data["profile_update_available"] = (
-                    str(package.target_profile_version) != str(current.profile_version)
+                data["profile_update_available"] = str(package.target_profile_version) != str(
+                    current.profile_version
                 )
             except ValueError:
                 data["profile_update_available"] = False

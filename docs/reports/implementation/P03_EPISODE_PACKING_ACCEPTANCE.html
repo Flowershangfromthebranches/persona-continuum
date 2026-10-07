@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="1b9XIjR3EkZWSCvHO1Qq3u">
+<head data-page-node-id="zRvsfWXBrOitUwwShciDQg">
+<meta charset="UTF-8" data-page-node-id="DZGRTi6LfkFcqUw4mZm3MJ">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="hu7OUXI8AO2w9QzdzPen2c">
+<title>P0.3 Episode Packing + ShadowGate 验收报告</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --surface: rgba(255,255,255,0.055);
+    --surface-strong: rgba(255,255,255,0.09);
+    --border: rgba(255,255,255,0.12);
+    --text: #f2f4f8;
+    --muted: #9aa3b2;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --blue: #6ea8fe;
+    --purple: #b18cfe;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(110,168,254,0.14), transparent 60%),
+      radial-gradient(1000px 500px at 110% 10%, rgba(177,140,254,0.12), transparent 55%),
+      radial-gradient(800px 500px at 50% 110%, rgba(52,211,153,0.08), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    line-height: 1.65;
+    padding: 48px 20px 80px;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: 0.2px; }
+  h2 { font-size: 21px; font-weight: 700; margin: 44px 0 16px; }
+  h3 { font-size: 16px; font-weight: 650; margin: 22px 0 10px; }
+  .sub { color: var(--muted); margin-top: 8px; font-size: 14px; }
+  .glass {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 22px 24px;
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+  }
+  .grid { display: grid; gap: 16px; }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .cols-2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 860px) { .cols-3, .cols-2 { grid-template-columns: 1fr; } }
+  .kpi .label { color: var(--muted); font-size: 12.5px; letter-spacing: 0.4px; }
+  .kpi .value { font-size: 30px; font-weight: 750; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .kpi .delta { font-size: 13px; margin-top: 2px; }
+  .green { color: var(--green); } .red { color: var(--red); } .amber { color: var(--amber); }
+  .blue { color: var(--blue); } .purple { color: var(--purple); } .muted { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; letter-spacing: 0.4px; }
+  tr:last-child td { border-bottom: none; }
+  .tag {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; border: 1px solid var(--border);
+    background: var(--surface-strong); margin-right: 6px;
+  }
+  .pill-pass { color: var(--green); border-color: rgba(52,211,153,0.4); }
+  .pill-fail { color: var(--red); border-color: rgba(248,113,113,0.4); }
+  .pill-warn { color: var(--amber); border-color: rgba(251,191,36,0.4); }
+  code, .mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12.5px; color: var(--blue); }
+  ul { padding-left: 20px; } li { margin: 5px 0; }
+  .note {
+    border-left: 3px solid var(--amber);
+    padding: 10px 14px; margin-top: 14px;
+    background: rgba(251,191,36,0.06); border-radius: 0 12px 12px 0;
+    font-size: 13.5px;
+  }
+  .footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; text-align: center; }
+  .bar-wrap { margin-top: 8px; }
+  .bar { height: 10px; border-radius: 6px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .bar > span { display: block; height: 100%; border-radius: 6px; }
+</style>
+</head>
+<body data-page-node-id="olYTgYGlkAyvg903RgCaq3">
+<div class="wrap" data-page-node-id="LezLNGb8OHDf6jgGHxgqwV">
+
+  <h1 data-page-node-id="FiK82G6Pl8gKtPLKEQ1zez">P0.3 Episode-aware Window Packing + P1 ShadowGate 验收报告</h1>
+  <p class="sub" data-page-node-id="mG1WHpsJhn15K0mYpzFAbM">Persona Continuum · 真实 10k subset + realistic synthetic benchmark · 2026-09-09 · 全程本地运行：0 次 Agent/API 调用、0 次 DB 写入、0 条私人正文进入报告</p>
+
+  <h2 data-page-node-id="VUXQaCvxBejJG6VhqOqSi1">核心结论</h2>
+  <div class="glass grid cols-3" data-page-node-id="zf7LKRQkBXVDf8OscCEER6">
+    <div class="kpi" data-page-node-id="ueeRfXCOLwMvtApLNSFZ6W">
+      <div class="label" data-page-node-id="Dk7Noy9G2JsNsAHyWKMv8k">FULL agent calls（真实 10k）</div>
+      <div class="value green" data-page-node-id="VUFjdEhyNUlCDv9YsToqAi">67 → 4</div>
+      <div class="delta green" data-page-node-id="REOmmGgYndpGqjfobjd6Sh">−94.0%（目标：显著低于 68 ✓）</div>
+    </div>
+    <div class="kpi" data-page-node-id="2HAX4hFQNDRJFC3DXdxVL6">
+      <div class="label" data-page-node-id="VP38op97RBnk8KqhBDYF2O">BALANCED agent calls（真实 10k）</div>
+      <div class="value green" data-page-node-id="cRzXdWhOMctUYxnxoVb9Gk">68 → 3</div>
+      <div class="delta green" data-page-node-id="OVfBJRyKP6d7BSMAZYHfeJ">−95.6%，且 balanced(3) &lt; full(4) ✓</div>
+    </div>
+    <div class="kpi" data-page-node-id="Ay4SUmjf7McIZ98bhkE89R">
+      <div class="label" data-page-node-id="fHYHXrIJgB8tC08VvVWHD7">平均单次调用 payload</div>
+      <div class="value blue" data-page-node-id="CYlCH5dYgFvL5HOZRRe349">2.2k → 37.4k</div>
+      <div class="delta blue" data-page-node-id="lLMV4gKQSibf7EE3L27EFx">tokens/call；budget utilization 0.036 → 0.629</div>
+    </div>
+  </div>
+
+  <div class="note" style="border-left-color: var(--red); background: rgba(248,113,113,0.06);" data-page-node-id="ZHe9OCD58H2sSt68DYbh9h">
+    <strong data-page-node-id="yiL35VaXfAFX49a33CS3tS">诚实上报（P1-B）：</strong>ShadowGate 离线质量回放显示当前 balanced gate 的 evidence recall 仅
+    <strong data-page-node-id="28NQogoipI9CHN39sQfPHJ">0.590</strong>（调整前 0.491），远低于 95% 验收线 → <strong data-page-node-id="srp0W2Hj8NoClKKjFhX9Pg">大聊天 auto 模式继续回退 full</strong>。
+    按要求仅新增确定性 bypass（问题邻接回答 + 第一人称立场），未扩大随机 reserve、未放宽阈值凑指标。
+    P0.3 之后 dispatch 次数由 packing 决定，balanced 的剩余价值只是 token 节省（10k subset −26%），
+    在质量验收通过前不启用。
+  </div>
+
+  <h2 data-page-node-id="eCyhEJYG2EDkFsCysWcBP3">1. 真实 10k subset 对比（旧 2h 强制 flush vs 新 episode packing）</h2>
+  <div class="glass" data-page-node-id="DaJFicmqwdpIah2s43VCVD">
+    <p class="muted" style="margin-bottom:10px;" data-page-node-id="HMJfcBz2EspbPPnGqi7qrc">数据源：真实私人聊天 ledger 前 10,000 条（只读），target messages = 4380，target turns = 2319（与此前 FULL/BALANCED 基线完全一致）</p>
+    <table data-page-node-id="GpmwaAxnJ0MRB74cXFj2d3">
+      <tr data-page-node-id="7FZmGAxsePXcSXs2BCT9eX"><th data-page-node-id="ZsNTg6snmlBjFzhJjwsb7y">模式</th><th data-page-node-id="q9bzorLmD7rHkY401G2XpB">策略</th><th data-page-node-id="gxALlBb5NvONqXheYrK5eU">agent calls</th><th data-page-node-id="b7gIsCTHCZ6T3BpY08HJFv">windows</th><th data-page-node-id="EUMtLXP3H9Bil56F8ryKBm">avg tokens/call</th><th data-page-node-id="dpHvdHqC9vnj3zOar5pttB">budget util</th><th data-page-node-id="v5xZmVdQwq5SnXb0D2L0Ur">episodes/window</th><th data-page-node-id="Pl7YDWSqiqoduGxuVKuFb8">elapsed*</th></tr>
+      <tr data-page-node-id="t0nDhhY7fvZsQvcKpSrZED"><td rowspan="2" data-page-node-id="an7qJtJZNKSTTIU1qzu4l0"><strong data-page-node-id="dDbBoiNtEaIbiPZpIcfwHo">FULL</strong></td><td data-page-node-id="nsRfqfXEW3FyvFITil1wCK">旧：2h 强制 flush</td><td class="red" data-page-node-id="GhCBSdnNNEMFDjm359zLGr">67</td><td data-page-node-id="Ds5C0FFxx6YDczbLtfcMw0">71</td><td data-page-node-id="Zv8On6jak1qGHXXAdxRfRg">2,233</td><td data-page-node-id="BEF3e7B5sa0rYQk1M0L79p">0.036</td><td data-page-node-id="H9b4g63b4eEbTjGhJvSrK1">1.0</td><td data-page-node-id="8z9bjyweICST8N9BMI9G6f">75.4s</td></tr>
+      <tr data-page-node-id="tbJyo5Y0PK2uGQZPYFsoJS"><td data-page-node-id="yBLVxaBHnTWOdcBFPdVIL5"><strong data-page-node-id="gGT0yAMf96AaXVpQtSbVjk">新：episode packing</strong></td><td class="green" data-page-node-id="oQRAOihtRJVXcXh9OCcsRV">4</td><td data-page-node-id="KXO1MLOToHPOz42sxxLjk8">4</td><td data-page-node-id="gcmGt8vgBjBbmWHnxKJbCM">37,414</td><td data-page-node-id="jkXapD2Fyv3Xij3WXUHTdx">0.629</td><td data-page-node-id="LDvC3HPiwTXuYCzFfCcI8N">18.25</td><td class="green" data-page-node-id="grncmwHcNTfJhSnxz6xXeW">4.5s</td></tr>
+      <tr data-page-node-id="wP6UhaJuctGRNNNlbADJCO"><td rowspan="2" data-page-node-id="oYAeHQcmB7EHjI5Pa1WJUy"><strong data-page-node-id="YtsNheVlUGDAcNC7cRl99L">BALANCED</strong></td><td data-page-node-id="1wv5Rt7W7SHbTdTjOsWhpM">旧：2h 强制 flush</td><td class="red" data-page-node-id="SqfzICvFXwwYueG6Ynx7Y4">68</td><td data-page-node-id="tqDVeb3sHjxLqvSwrh2j30">71</td><td data-page-node-id="TkjGhv2jEbJ57QYzX1XXsT">1,630</td><td data-page-node-id="Ct41MqydMYsjTyg2aH4wYT">0.027</td><td data-page-node-id="quokjTm1Gy5X0nAw0voa9T">1.0</td><td data-page-node-id="VTNZ7I6xOiUlJsVG5SKDKn">76.5s</td></tr>
+      <tr data-page-node-id="DeyshoCqb7N1uhLj10JpmL"><td data-page-node-id="VaFSFap9iiF8ochW9TnCjM"><strong data-page-node-id="xaZNQfOm4AB2XK3U8Jn4Iq">新：episode packing</strong></td><td class="green" data-page-node-id="TlbDA8wPhvg484Py4f09ZX">3</td><td data-page-node-id="OnOarvR6pWsI2GUtXN9aWQ">3</td><td data-page-node-id="DCCkiS6DjjIlCBT8K9ObKD">36,952</td><td data-page-node-id="Bgez0JJujZdidJTm3njdiq">0.628</td><td data-page-node-id="DsWDcSXPTOPIfbIxCVrhF2">23.7</td><td class="green" data-page-node-id="a6JVm5hj7it3kDTlQTNC51">3.4s</td></tr>
+    </table>
+    <p class="muted" style="margin-top:10px;" data-page-node-id="faBUJ7w278YxVDrFTDGhxT">* elapsed 为 workers=4、单次调用 4.5s 假设下的投影（无真实 API 调用）。input tokens：FULL 149,585→149,657；BALANCED 110,862→110,857。</p>
+    <div class="bar-wrap" data-page-node-id="GrFHDF9PAnHhmE97KrEFG8">
+      <div class="label muted" data-page-node-id="Xgava8SzVqjWG31x7AAc9C">FULL / BALANCED calls 对比</div>
+      <div class="bar" style="margin-top:6px;" data-page-node-id="8JErMGAseEr0u94WG9RelN"><span style="width:100%;background:linear-gradient(90deg,#f87171,#fb923c);" data-page-node-id="92VgA2v4gLDYfnMSIxLnt5"></span></div>
+      <div class="bar" style="margin-top:4px;" data-page-node-id="ybgDTv04NahmTVaefWY5Nl"><span style="width:6%;background:linear-gradient(90deg,#34d399,#6ea8fe);" data-page-node-id="fiOiHlOKIH3KBOp4yN8W2x"></span></div>
+    </div>
+  </div>
+
+  <h2 data-page-node-id="DDKJ6DjhY1iyLi5Yd18nQO">2. Realistic synthetic benchmark（P0.3-E）</h2>
+  <div class="glass grid cols-3" data-page-node-id="sx2aedHTrlsGJft8Iz1HZY">
+    <div class="kpi" data-page-node-id="cQsizqGexe3B24fPGGE39e"><div class="label" data-page-node-id="qJooNPDALSrH5rgI25yFlx">规模</div><div class="value" data-page-node-id="Z4upg0sIJv8nbyuzmqt9n6">600 sessions</div><div class="delta muted" data-page-node-id="ivQjJUEl4AED99ZOQaWqrJ">14,539 条消息 / 3,904+ turns / 跨度 534 天</div></div>
+    <div class="kpi" data-page-node-id="XXNjCWtHdvpiERE9AUlryW"><div class="label" data-page-node-id="w87MHhkJeY8yeD655mH8BF">agent calls</div><div class="value green" data-page-node-id="Vx4eRSrP8ZeQPfeCoCMLxW">504 → 21</div><div class="delta green" data-page-node-id="Vk8HxGmNhpkSzRwJYZVmR7">−95.8%</div></div>
+    <div class="kpi" data-page-node-id="fHa0gGEKuZ6j1KH8zKVEem"><div class="label" data-page-node-id="nuxawH0aQGsZYiVlHXSbTp">tokens/window</div><div class="value blue" data-page-node-id="e9GKLkXnJjnLAwWf5bhdEl">757 → 18,156</div><div class="delta blue" data-page-node-id="fDDCbdtcGKhmDSxMbBFDjy">utilization 0.013 → 0.308</div></div>
+  </div>
+  <div class="glass" style="margin-top:16px;" data-page-node-id="5z8L7AFZnTSpF7chyQ0nHI">
+    <p class="muted" data-page-node-id="sFpiWCXbMeOx2NXxZ6diRG">生成规则：一天多次聊天、episode 间隔 2h～60h、多年跨度、burst（&lt;90s 连发）与长时间静默混合。
+    该 benchmark 覆盖了旧 <code data-page-node-id="StVHVXpnRBsNKbSEvx8afx">timestamp += 1 minute</code> 合成数据永远无法暴露的真实成本：短 burst 之间的静默把每次 dispatch
+    都裁成 ~750 token 的小窗。旧拓扑 504 次调用中 96% 的 payload 低于预算 6%。
+    realistic balanced 与 full calls 相同是因为短 session 下 24 episodes/window 上限先于 token 预算触顶；真实聊天（更长 session）下如上表 balanced(3) &lt; full(4)。</p>
+  </div>
+
+  <h2 data-page-node-id="GsDhue95bSHh3Jw5Pd2icA">3. ShadowGate 离线质量报告（P1-A/B，真实分类 checkpoint 回放）</h2>
+  <div class="glass" data-page-node-id="Z5pXJFrUPUVMMSMrSixIqc">
+    <p class="muted" style="margin-bottom:10px;" data-page-node-id="5Ztfy9SCYCRBQUlcbiAFeJ">
+      输入：真实 ledger 全量 385,034 条 chat 行（只读、含未分类行以保证 gate sketch 状态保真）；
+      对已 classification 的 target turns（evidence_extracted / reviewed_no_independent_evidence）重新执行
+      SemanticGate("balanced")，不修改任何数据库状态。
+      Ground truth：9,368 个 evidence turns（正例）、11,602 个 reviewed turns（真负例）、66,502 个未知结果 turns（不计入分母）。
+    </p>
+    <table data-page-node-id="j1z1ymBy2FpzMs4Yny8Z4B">
+      <tr data-page-node-id="lpHmwIaM6iIwhJUQbzRfpm"><th data-page-node-id="a0ryksPsPagwOQ98FfjRD2">指标</th><th data-page-node-id="IJeCI1WBWuRlWNOxE1cVWy">调整前</th><th data-page-node-id="6MxAD8uE6TYx46rEEHnwjZ">调整后</th><th data-page-node-id="7GbZfpEsKl5uZtDWy1JipS">验收线</th><th data-page-node-id="4XEHTF8iLblF3qxL4S83rN">判定</th></tr>
+      <tr data-page-node-id="olCZYxOR1tHkJFIuTyb4CI"><td data-page-node-id="Fuqx2cuhf5qCk5PJiFxU7E">overall evidence recall</td><td data-page-node-id="r1KlGx5kh8512I6eNhLGuU">0.4910</td><td data-page-node-id="yVL6eM3SMP9o36w2VUWmgs"><strong data-page-node-id="xHK4GgEfUlnbcMak4SN5Np">0.5897</strong></td><td data-page-node-id="xfMaYAlMTydh1ojBgrBntw">≥ 0.95</td><td class="red" data-page-node-id="p8GtD8TAsIE1NiPn32lZTq">未通过</td></tr>
+      <tr data-page-node-id="m8yZ2Ba4PHVhUlH7Xe3MPo"><td data-page-node-id="AttnbgQq13qcjno5dsxZDN">high-confidence evidence recall</td><td data-page-node-id="4FpSoRJwKuMr0V1hstPtLn">0.5025</td><td data-page-node-id="UwacKlVLBGVES1piYSb5nf"><strong data-page-node-id="QTyhr9EQHk4N2GtA7pQF2w">0.6018</strong></td><td data-page-node-id="xVu7XfB4fwFtKqFZMoUsFD">≥ 0.95</td><td class="red" data-page-node-id="GG39sfMherixFXQ7QwYqMS">未通过</td></tr>
+      <tr data-page-node-id="FuHxTbRmXvlnt2a8tOyoCn"><td data-page-node-id="ySpQxbldzmSPJq0swMKD2s">dimension recall（8 维最低）</td><td data-page-node-id="8oMJj492i54X1FSZ8cNXwa">0.488</td><td data-page-node-id="lFPSJjG6sjDbtkT0XzooCF"><strong data-page-node-id="seXdfBgQz0kDHOCeWyK5ki">0.571</strong></td><td data-page-node-id="xpnbR5rTj2yBPCAzHdKGKI">≥ 0.90</td><td class="red" data-page-node-id="d7IaHQ3v5opi2cWhkuL5f6">未通过</td></tr>
+      <tr data-page-node-id="Sjblrk4bcXkoamVkTq9Ljf"><td data-page-node-id="jfjRZ76GarVzbCkVcSepTx">relationship recall</td><td data-page-node-id="zrsaQpzCDQo005aksF0uoy">0.486</td><td data-page-node-id="aOkzlQXoNwH1zDmzDFIAw1"><strong data-page-node-id="rCrjOEn9kWERlIALuHBGGN">0.583</strong></td><td data-page-node-id="IT9HEAUMyOJ1f7fpGdbMxY">—</td><td class="muted" data-page-node-id="ju4WXGHi4lLyC3CpO6CtCI">参考</td></tr>
+      <tr data-page-node-id="JT3X9OiB68vB2rGLEuiRGU"><td data-page-node-id="0dAG1x5hIGLwrUHQoaFOO2">contradiction-support recall</td><td data-page-node-id="BGGsUWHNgnFXoz1OFGrOop">—</td><td data-page-node-id="Mg2uSVvXwBEJLEmrwvkEVF"><strong data-page-node-id="qvf5zEX1GVX2csSJ8xAzBW">0.728</strong></td><td data-page-node-id="rs0ZAgJUvKs2dfQFdcMDbZ">—</td><td class="muted" data-page-node-id="XvM63yaFWH1DiQIOgzLAOX">参考</td></tr>
+      <tr data-page-node-id="dRQ533mNTVSPaIHPXOd1l4"><td data-page-node-id="79ZJUFWSLVpfK8o2Srx0G3">temporal coverage（月覆盖）</td><td data-page-node-id="rac6oKC7DO66lwnyHn1SD3">1.0</td><td data-page-node-id="lFGW1Q66hUbJg0RgtJg9nn"><strong data-page-node-id="QvGRcLNuFhzkOmfOa3NA83">1.0</strong></td><td data-page-node-id="UFacRFOU4YiHF35llZ1Yyu">—</td><td class="green" data-page-node-id="ePOT0UWDLzSI4PNSofj47z">通过（4/4 已分类月份全覆盖）</td></tr>
+      <tr data-page-node-id="M7PgcqbFAkjbTHs2pyVYFM"><td data-page-node-id="lZIvhxb9Yl6OdQ89cXpi36">selected ratio</td><td data-page-node-id="8wrSnxP4QYq31RWBgEwoaM">0.437</td><td data-page-node-id="cjlzDjFYuL2hKkHiL4EP31"><strong data-page-node-id="9Tu5lo8uBAcUxQgHYukzfh">0.529</strong></td><td data-page-node-id="qJ3Eg0tJhnLY1wZRhu89IN">—</td><td class="muted" data-page-node-id="I7Xp5u2ZD1DcJcLl1Gtvq4">46,244 / 87,472 turns</td></tr>
+    </table>
+    <h3 data-page-node-id="iEqErF8fmztQX8Ml1vs1ru">False-negative category aggregate（纯计数，无正文）</h3>
+    <p class="mono" style="color:var(--muted); font-size:12px; line-height:1.9;" data-page-node-id="QXnNzv2oGYukAPlUTuHezD">
+      very_short: 2349 · high_confidence: 3056 · expression_dna: 1457 · affect_relationship_defense: 1205 ·
+      decisions_and_behavior: 937 · identity_and_timeline: 563 · contains_numbers: 498 · relationship_signal: 365 ·
+      interviews_and_dialogue: 359 · values_desires_contradictions: 250 · works_and_views: 118 ·
+      third_party_views: 116 · contradiction_support_signal: 85 · no_local_signal: 71
+    </p>
+    <div class="note" style="border-left-color: var(--red); background: rgba(248,113,113,0.06);" data-page-node-id="eawQvXF2CWMuNhhlEuwwOQ">
+      结论：证据性消息与日常寒暄在纯文本特征上不可分（question-adjacency + first-person 两个最强确定性规则合计也只覆盖 ~14% FN）。
+      达到 95% recall 需要选择几乎全部 turns（等价于放弃 sparse），因此 balanced 未通过验收。
+      后续提升方向：dispatch 内 ±1 neighbor 已天然覆盖相邻证据；真正的缺口在「短句+强语境」消息，需模型级信号（非 reserve）才能区分。
+    </div>
+  </div>
+
+  <h2 data-page-node-id="XIGx7A7JfCkgHaVuUEEmhI">4. 变更清单</h2>
+  <div class="glass" data-page-node-id="B0ge8M32AcFmf1v6Zemu0T">
+    <table data-page-node-id="uJd8VHyGIDIPqDuZO10YnZ">
+      <tr data-page-node-id="ZfOgNKOdTt6BWJY9Q4oCk3"><th data-page-node-id="wZOHEiic4q42MaM6gWxmmd">文件</th><th data-page-node-id="BLHuKIpb7flkC0DvjTF29u">变更</th></tr>
+      <tr data-page-node-id="hLwQKPg6lvKwGTcVpXAsNI"><td class="mono" data-page-node-id="e15wPE8Vdv2XWy2hupGTYO">application/material_pipeline.py</td><td style="text-align:left;" data-page-node-id="zE9wY1lIzlTwIqtlcxMHaf">P0.3-A/B/C：新增 <code data-page-node-id="lFtU9AI1jVCEGNC9dIzCXW">EpisodeSpan</code> / <code data-page-node-id="KaB1embwxWahKMzCyK6a1b">build_conversation_episodes()</code>；<code data-page-node-id="r1GsC1MxiiyhGjQxGH3s0m">build_analysis_windows()</code> 重写为 episode-aware packing（gap 不再强制 flush；source/conversation 身份边界由 EPISODE 标记承载）；窗口文本输出 EPISODE_BEGIN/END；新增 <code data-page-node-id="budDFKPDpgd9EwBRUnbiqr">window_episode_metrics()</code> 与 metrics 记录/ finalize 方法</td></tr>
+      <tr data-page-node-id="KOB4DCgzj3fHU88Z5yiUay"><td class="mono" data-page-node-id="CZOD0UzxYk6pWFQTwI4Cej">application/material_intelligence.py</td><td style="text-align:left;" data-page-node-id="fKLoDWrZiHkXzZcf0TkdCH">P0.3-B/C：dispatch 窗口打包接入 episode 参数；request payload 携带 <code data-page-node-id="RQFwJSYhieMXGBFtJfGpCe">episodes</code> 结构与 episode contract；classify system prompt 增加 episode 边界规则；P0.3-D：非 selected 的 target turn 全部降级 context_only（不计 max_units / target count / billing）；metrics 新增 episodes_total、episodes_per_window_avg/max、prompt_budget_utilization_avg/p50/p95；新增 <code data-page-node-id="59iXWNDO4EXqZHsTCttz21">count_chat_target_units()</code>；P1-C：全链路 <code data-page-node-id="IKC1QnzE8i8D4QZDm4qhJo">semantic_gate_mode</code> 透传</td></tr>
+      <tr data-page-node-id="mOyIY7hHOoNi4cVEYwJfXb"><td class="mono" data-page-node-id="hzZEegoGKWAphDrHUgGjdM">application/semantic_gate.py</td><td style="text-align:left;" data-page-node-id="OmmN5pengV77CGmJnjkjCd">P1-B：新增 answer_to_direct_question / first_person_stance 两个确定性 bypass（routine 回复守卫），FN 数据驱动，未动 reserve；P1-C：<code data-page-node-id="uOe2z1Bv7Fk4QhiI0iimen">resolve_task_semantic_gate_mode()</code> + LARGE_CHAT 阈值</td></tr>
+      <tr data-page-node-id="q2PVBZhIfAhZmBbInIxjsX"><td class="mono" data-page-node-id="zWGmoso492Vjg98LJQE7g3">application/shadow_gate.py</td><td style="text-align:left;" data-page-node-id="klGm9lJL2IPoUf5Enp748A">P1-A：新增 <code data-page-node-id="UXYYDWMElosbYSlhDy4ITr">evaluate_shadow_gate()</code>（本地回放，无 API、无 DB 写、报告零正文）+ <code data-page-node-id="x8tANlJpip3Mpwhhbzjf5E">load_shadow_gate_acceptance()</code></td></tr>
+      <tr data-page-node-id="0EyKHJGQwERgsYg8uN28qj"><td class="mono" data-page-node-id="V3fEI8Ca7ww6OB75ncP3uv">application/persona_creation_service.py</td><td style="text-align:left;" data-page-node-id="hFWUVbJiI5gMZMddWbyWNg">P1-C：任务级 gate 策略解析（auto/full/balanced/fast），解析结果与原因写入 job_config 并透传 <code data-page-node-id="hRm5jU6gchSrMiLcmtVYwY">analyze_sources_async</code></td></tr>
+      <tr data-page-node-id="RVoKz3HPr9L0AX5EfhCzjc"><td class="mono" data-page-node-id="bgFVuMhd5wsfo81U21AbBo">web/api.py · web/static/*</td><td style="text-align:left;" data-page-node-id="zZCRLZU8R86pFvAccoWc9W">P1-C：创建任务接受 <code data-page-node-id="xN6dEbq5KcW7jPAeBaFc20">material_semantic_gate_mode</code>；前端 Persona 创建表单新增「语义分析策略」下拉（自动/完整保真/平衡/快速）</td></tr>
+      <tr data-page-node-id="HDNOnFrpAz2bYNvkAnX85E"><td class="mono" data-page-node-id="oIG748s5UUorykdUmvrexh">config.py · container.py</td><td style="text-align:left;" data-page-node-id="WXZB0ALKebVdm1AMruWpDH">新增 material_conversation_episode_gap_seconds=7200、material_analysis_window_max_episodes=24 并接入服务</td></tr>
+      <tr data-page-node-id="lFzeyzvv84E71L8hT5dD19"><td class="mono" data-page-node-id="Bqo5KsiTwakjxdlZ2jgQyM">scripts/shadow_gate_evaluation.py</td><td style="text-align:left;" data-page-node-id="U54McM95IRcJrvMG1dYUTv">P1-A：离线评估入口（只读 sqlite mode=ro），<code data-page-node-id="9MFlBvhnLgwrH9VxhLDD9T">--write-acceptance</code> 产出 P1-C 所需 acceptance 记录</td></tr>
+      <tr data-page-node-id="NmDR4weMbs9glyAC252IXO"><td class="mono" data-page-node-id="HrjVvnZv5hZEA6c4XB3DmI">scripts/real_subset_benchmark.py<br data-page-node-id="wJrarAsj6tZRlkkfVW1vZc"><span class="mono" data-page-node-id="aOEKJ3RCoImGCs3AGmCHJB">scripts/realistic_chat_benchmark.py</span></td><td style="text-align:left;" data-page-node-id="6Y4fWeCP2OLgwr60iYCfE4">P0.3 验收 + realistic synthetic benchmark（old 2h flush vs new packing，记录 calls/windows/episodes/tokens/utilization/workers/elapsed）</td></tr>
+      <tr data-page-node-id="b3T9OhxPLM6FGU7Fp00wSx"><td class="mono" data-page-node-id="2YUuH5952E7AUiY6kXFHl0">tests/unit/test_semantic_gate_episode_packing.py</td><td style="text-align:left;" data-page-node-id="83ofKZ4J2Z1OUGsGNN5fuJ">19 条新测试：packing 拓扑、EPISODE 标记、legacy 对比、episode cap、metrics、resolver 规则、ShadowGate 指标与零正文断言、P1-D 续跑兼容</td></tr>
+    </table>
+  </div>
+
+  <h2 data-page-node-id="fNRMGHXCwbUSFrZ8QaXOkg">5. P1-D 当前任务续跑兼容</h2>
+  <div class="glass" data-page-node-id="7tJdx2ofl3SmZkwFUouFBy">
+    <ul data-page-node-id="OLMmAkdPfiiVFPbGFIJNoS">
+      <li data-page-node-id="SJTWgvn3KEiBb3kXYn8UqH">未 bump <code data-page-node-id="T2mHPj5UQ4q9sC0IiB6pJB">conversation-evidence-v4</code> / <code data-page-node-id="7Ubk70F4xSGmgWbbZKra2d">TURN_POLICY_VERSION</code>（episode packing 只是 dispatch strategy）。</li>
+      <li data-page-node-id="W4bqARv5PvzABSjFh9BcGi">V4 完成判定走「persisted semantic_status + contract stamp」，与 live cache key 解耦 → <strong data-page-node-id="AsWZ7GM6sl3zC4F5pF00pv">已完成的 26,094 条（evidence_extracted + reviewed_no_independent_evidence）不会重新调用模型</strong>（有专项单测）。</li>
+      <li data-page-node-id="6CFZwY1WZtLLOsR5iYjWlr">full → balanced 切换：gate 只对 remaining <code data-page-node-id="xazjrgB1FRkWldX7ZaFvMp">target_pending</code> 运行；cached <code data-page-node-id="MgRodNOJqbUsDbni5gkjCG">semantic_gate_skipped</code> 在 gate mode 匹配时保持 done，mode 变化时自动重新参与 gate 决策（不是重新调模型）。</li>
+      <li data-page-node-id="rvKImubPjPvvxGBCzZo0LF">prompt 追加 episode 规则只影响新单元的 cache key；已完成 V4 行按 status 复用，不受影响。</li>
+    </ul>
+  </div>
+
+  <h2 data-page-node-id="TN74Xg5ViGWoZIBwSRBdiV">6. 质量门禁</h2>
+  <div class="glass grid cols-3" data-page-node-id="uNWeaEoEERLmfnZFodhChw">
+    <div class="kpi" data-page-node-id="E6vQmmxfXWcz3aoPSXfHox"><div class="label" data-page-node-id="maDhhG3Qskwda8EQGu8fIL">新增单测</div><div class="value green" data-page-node-id="rYqum2Ah5C70eOVtCr0nKy">19/19</div><div class="delta muted" data-page-node-id="vOv2ez3rU9YNaNLnlfFYwq">test_semantic_gate_episode_packing.py</div></div>
+    <div class="kpi" data-page-node-id="a4UF1Dqe7bPHkHnVTCt2Xt"><div class="label" data-page-node-id="6zYJo7u4b5fbFhiD22FstI">相关回归</div><div class="value green" data-page-node-id="ZwoqL9HyuhtkiQ8XXvDBwL">119+ passed</div><div class="delta muted" data-page-node-id="D23VpdUFJ7zFuy1hU4GBqW">v2 / p02 / integrity / stall_fix / streaming / persona creation</div></div>
+    <div class="kpi" data-page-node-id="vFGGpYg7nZdIaZKZaciWCV"><div class="label" data-page-node-id="gKh4ctZEHOqmvKKEu5wGJh">ruff / mypy</div><div class="value green" data-page-node-id="4XLYWoIxMTFvdZtMPvDRWb">clean</div><div class="delta muted" data-page-node-id="g9PqmkQ37HpkfRKDCF60Q9">改动文件零告警（service 文件剩余项均为既有）</div></div>
+  </div>
+
+  <h2 data-page-node-id="4OrA0qJTwtqABNRHXsGYd6">7. 方法论与隐私声明</h2>
+  <div class="glass" data-page-node-id="WfmwIPNCssJClHLPHfyrDz">
+    <ul data-page-node-id="1d8aR1wS93Frav3Ldy0XOc">
+      <li data-page-node-id="OBXLi6C7Z4X9T8m62t21rC">本轮所有 benchmark 与 ShadowGate 评估均为<strong data-page-node-id="g6eyjJ91OHJpbboUphBc53">纯本地离线</strong>：agent_calls 为「含 selected target 的窗口数」（与管线计费语义一致），input_tokens 为窗口 token 估算；未调用任何外部 API。</li>
+      <li data-page-node-id="99CZFJ3EnXTd6VeAYWCFpK">数据库访问全程只读（sqlite <code data-page-node-id="QyNzfSghFjthvkBs6Qknli">mode=ro</code>），ShadowGate 不修改任何状态。</li>
+      <li data-page-node-id="k91Gu2LNS4wBgTTIIlZ3bK">报告中所有质量指标均为 turn 级聚合计数与比率，<strong data-page-node-id="6EZK8Snzmv510LjiZeXiUh">不含任何私人聊天正文</strong>（有专项单测断言）。</li>
+      <li data-page-node-id="tx2lAIseIBw1KcKNrtEVkE">未提交 PR；全部改动在工作区。</li>
+      <li data-page-node-id="Rzmwo1WXHHGTfWkTNNye0H">产物：<code data-page-node-id="VTNqWOS1qAxajEJbgq7CSe">docs/reports/implementation/p03-real-subset-benchmark.json</code> · <code data-page-node-id="HApglyoIVkDHFFuXneFI8l">p03-realistic-synthetic-benchmark.json</code> · <code data-page-node-id="1PIHEwvj6dM736n8mehgHk">p03-shadow-gate-quality.json</code></li>
+    </ul>
+  </div>
+
+  <p class="footer" data-page-node-id="Al0JzYkHOL4Z06724OV1LJ">P0.3-A ✓ · P0.3-B ✓ · P0.3-C ✓ · P0.3-D ✓ · P0.3-E ✓ · P1-A ✓ · P1-B ✓（验收未通过 → auto 保持 full，诚实上报） · P1-C ✓ · P1-D ✓</p>
+</div>
+</body>
+</html>

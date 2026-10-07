@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import os
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from persona_continuum.agent.discovery import AgentDiscoveryService
@@ -24,27 +27,47 @@ from persona_continuum.agent.response_collector import (
     AgentCancelledError,
     AgentResponseCollector,
     AgentRuntimeError,
+    AgentTransportError,
     PromptTransportLimitExceededError,
     compact_tool_result,
 )
 from persona_continuum.agent.runtime_executor import RuntimeSessionBinding
 from persona_continuum.application._utils import dumps, loads, new_id, parse_dt
-from persona_continuum.auth.profiles import AuthProfileService
+from persona_continuum.auth.profiles import AuthProfileService, redact_secrets
+from persona_continuum.domain.episode import EpisodeStatus
+from persona_continuum.domain.scene import RoomSceneState, SceneEvent, SceneOutput
 from persona_continuum.room.attachments import (
     attachment_public_url,
     decode_base64_payload,
     store_room_attachment,
 )
 from persona_continuum.room.case_state import RoomCaseState, merge_case_state
+from persona_continuum.runtime.scene_runtime import SceneRuntime
+from persona_continuum.runtime.temporal_parser import parse_temporal_input
+from persona_continuum.runtime.turn_normalizer import normalize_turn
 
 if TYPE_CHECKING:
     from persona_continuum.application.container import PersonaContinuum
-from persona_continuum.room.context_manager import RoomContextManager
+from persona_continuum.domain.memory_bundle import MemoryBundle, RetrievalMode
+from persona_continuum.room.context_manager import (
+    CANONICAL_SUMMARY_VERSION,
+    RoomContextManager,
+    is_canonical_summary,
+)
 from persona_continuum.room.context_packer import (
     ABSOLUTE_FLOOR_BYTES,
     ContextPacker,
     budget_for,
     byte_length,
+)
+from persona_continuum.room.context_policy import (
+    ContextPolicyRequest,
+    ContextProfile,
+    ContextStrategy,
+    ResolvedContextPolicy,
+    local_profile_from_config,
+    normalize_strategy,
+    resolve_context_policy,
 )
 from persona_continuum.room.director import SpeakerDirector
 from persona_continuum.room.discussion_director import DiscussionDirector
@@ -65,7 +88,7 @@ from persona_continuum.room.models import (
     RoomStatus,
     RoomTranscriptRecord,
 )
-from persona_continuum.room.prompt_composer import PromptComposer
+from persona_continuum.room.prompt_composer import PromptComposer, _clip_to_tokens
 from persona_continuum.room.protocol_runtime import ProtocolActionRequest, RoomProtocolRuntime
 from persona_continuum.room.protocols import default_protocol_registry
 from persona_continuum.room.random_resolver import RandomBindingResolver
@@ -103,8 +126,66 @@ _LEGACY_REMOVED_TOOL_NAMES: frozenset[str] = frozenset(
 
 
 def _estimate_tokens(text: str) -> int:
-    # Coarse char/4 estimate is sufficient for prompt-size trend metrics.
-    return max(0, len(text) // 4)
+    """Coarse token estimate used for prompt-size trend metrics.
+
+    CJK is counted per character and everything else at ~4 chars/token: the old
+    flat ``len // 4`` under-counted Chinese persona prompts by roughly 4x, which
+    made the context report useless for exactly the rooms that matter here.
+    """
+
+    if not text:
+        return 0
+    cjk = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", text))
+    return cjk + max(0, len(text) - cjk) // 4
+
+
+#: Room-metadata keys owned by *asynchronous* writers (the rolling-summary
+#: refresh, and the one-off scene/style migrations) rather than by the turn that
+#: happens to be holding an in-memory snapshot.
+#:
+#: A turn reads its room state once at the start and saves the whole object at
+#: the end.  A summary refresh runs in the background and takes minutes, so the
+#: next turn's snapshot almost always predates it.  Saving that snapshot used to
+#: whole-object replace the cache and the row, silently reverting the summary --
+#: which is exactly how a valid v2 summary disappeared at the next turn.
+#:
+#: These keys are therefore merged from the database instead of being taken from
+#: the snapshot (see ``_merge_protected_room_metadata``).
+_PROTECTED_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "rolling_summary",
+        "rolling_summary_version",
+        "rolling_summary_updated_at",
+        "rolling_summary_through_message_index",
+        "rolling_summary_quarantined_at",
+    }
+)
+_PROTECTED_METADATA_PREFIXES: tuple[str, ...] = ("rolling_summary", "raw_archive_")
+
+#: Temporary write tracing, off unless explicitly enabled:
+#:   PERSONA_CONTINUUM_DEBUG_METADATA_WRITES=1
+_METADATA_WRITE_TRACE = os.environ.get(
+    "PERSONA_CONTINUUM_DEBUG_METADATA_WRITES", ""
+).lower() in {"1", "true", "yes", "on"}
+_metadata_trace_logger = logging.getLogger("persona_continuum.room.metadata")
+
+
+def _protected_metadata_keys(metadata: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key in metadata
+        if key in _PROTECTED_METADATA_KEYS
+        or key.startswith(_PROTECTED_METADATA_PREFIXES)
+    ]
+
+
+def _summary_fingerprint(metadata: dict[str, Any]) -> tuple[Any, int]:
+    """(version, length) fingerprint -- never the summary body."""
+
+    value = metadata.get("rolling_summary")
+    return metadata.get("rolling_summary_version"), (
+        len(value) if isinstance(value, str) else 0
+    )
 
 
 def _latest_user_injection(state: RoomSessionState) -> str:
@@ -176,6 +257,65 @@ class RoomBusyError(Exception):
         self.message = message
 
 
+def _trim_bundle_for_stage(
+    bundle: MemoryBundle | None, stage_index: int, mem_limit: int | None
+) -> MemoryBundle | None:
+    """Trim memory bundle components according to the profile degradation ladder."""
+    if bundle is None or stage_index == 0:
+        return bundle
+
+    # Step 1: trim low-relevance summaries
+    trimmed_summaries = list(bundle.hierarchical_summaries)
+    if stage_index >= 1:
+        trimmed_summaries = [s for s in trimmed_summaries if s.relevance_score >= 0.5][:1]
+    if stage_index >= 3:
+        trimmed_summaries = []
+
+    # Step 2: trim low-relevance episodes
+    trimmed_episodes = list(bundle.relevant_episodes)
+    if stage_index >= 2:
+        trimmed_episodes = [e for e in trimmed_episodes if e.relevance_score >= 0.5][:1]
+    if stage_index >= 4:
+        trimmed_episodes = []
+
+    # Step 3: trim facts
+    trimmed_facts = list(bundle.semantic_facts)
+    if stage_index >= 3:
+        limit = mem_limit or 2
+        trimmed_facts = trimmed_facts[:limit]
+    if stage_index >= 5:
+        trimmed_facts = trimmed_facts[:1]
+
+    # Step 4: trim raw excerpts
+    trimmed_excerpts = list(bundle.historical_excerpts)
+    if stage_index >= 3:
+        trimmed_excerpts = trimmed_excerpts[:1]
+    if stage_index >= 4:
+        trimmed_excerpts = []
+
+    # Step 5: live threads
+    trimmed_threads = list(bundle.active_threads)
+    if stage_index >= 5:
+        trimmed_threads = [t for t in trimmed_threads if t.is_live][:1]
+
+    return MemoryBundle(
+        persona_id=bundle.persona_id,
+        counterpart_id=bundle.counterpart_id,
+        branch_id=bundle.branch_id,
+        current_arc=bundle.current_arc,
+        current_arc_tokens=bundle.current_arc_tokens,
+        recent_dialogue=bundle.recent_dialogue,
+        recent_dialogue_tokens=bundle.recent_dialogue_tokens,
+        semantic_facts=trimmed_facts,
+        active_threads=trimmed_threads,
+        relevant_episodes=trimmed_episodes,
+        relationship_context=bundle.relationship_context,
+        hierarchical_summaries=trimmed_summaries,
+        historical_excerpts=trimmed_excerpts,
+        retrieval_metadata=bundle.retrieval_metadata,
+    )
+
+
 class MultiAgentOrchestrator:
     def __init__(
         self,
@@ -191,6 +331,7 @@ class MultiAgentOrchestrator:
         self.auth_service = auth_service
         self.resolver = RandomBindingResolver(self.registry, seed=random_seed)
         self.recall_gate = RecallGate(self.continuum.memories)
+        self.retrieval_planner = getattr(continuum, "retrieval_planner", None)
         self.director = SpeakerDirector(seed=random_seed)
         self.discussion_director = DiscussionDirector()
         self.runtime_executor = getattr(continuum, "agent_runtime_executor", None)
@@ -215,11 +356,80 @@ class MultiAgentOrchestrator:
             transcript_recorder=self._record_protocol_public_message,
         )
         room_cfg = getattr(continuum, "config", None)
+        # Window semantics: a transcript ENTRY is one message -- a user message
+        # and a persona reply are two entries -- so a window of 8 is roughly
+        # four exchanges.  ``room_raw_message_window`` is the explicit name;
+        # ``room_raw_turn_window`` remains a fallback for older deployments.
+        raw_window = max(
+            4,
+            int(
+                getattr(room_cfg, "room_raw_message_window", None)
+                or getattr(room_cfg, "room_raw_turn_window", 8)
+                or 8
+            ),
+        )
         self.context_manager = RoomContextManager(
             cursor_enabled=bool(getattr(room_cfg, "room_context_cursor_enabled", True)),
-            raw_window=max(4, int(getattr(room_cfg, "room_raw_turn_window", 8) or 8)),
-            summary_every_turns=max(4, int(getattr(room_cfg, "room_raw_turn_window", 8) or 8) * 2),
+            raw_window=raw_window,
+            summary_every_turns=max(4, raw_window * 2),
+            summary_refresh_every_turns=max(
+                2, int(getattr(room_cfg, "room_summary_refresh_every_turns", 4) or 4)
+            ),
+            summary_max_chars=max(
+                400, int(getattr(room_cfg, "room_summary_max_chars", 2400) or 2400)
+            ),
+            summary_output_max_tokens=max(
+                100, int(getattr(room_cfg, "room_summary_output_max_tokens", 800) or 800)
+            ),
+            summary_input_max_tokens=max(
+                512, int(getattr(room_cfg, "room_summary_input_max_tokens", 4096) or 4096)
+            ),
         )
+        # Long-term memories retrieved/injected per room turn.  This is the
+        # *fallback* value now: every turn resolves a ContextProfile and uses
+        # that profile's ``recall_top_k`` (see ``resolve_turn_context_policy``).
+        self._room_recall_top_k = max(
+            1, int(getattr(room_cfg, "room_recall_top_k", 8) or 8)
+        )
+        # Conservative prompt budget for THIS machine (see Config for why it is
+        # far below the model's 16384 context).  These stay the LOCAL profile's
+        # numbers and are no longer a global ceiling: they are only applied when
+        # the resolved ContextProfile is ``local_constrained``.
+        self._room_prompt_target_tokens = max(
+            1024, int(getattr(room_cfg, "room_prompt_target_tokens", 6000) or 6000)
+        )
+        self._room_prompt_hard_tokens = max(
+            self._room_prompt_target_tokens,
+            int(getattr(room_cfg, "room_prompt_hard_tokens", 7000) or 7000),
+        )
+        self._room_memory_max_tokens = max(
+            0, int(getattr(room_cfg, "room_memory_max_tokens", 400) or 400)
+        )
+        # Context strategy policy: the local profile keeps reading Config (so
+        # the stress-tested numbers stay the user's), while balanced /
+        # remote_quality scale with the model's real capability.
+        self._local_context_profile = local_profile_from_config(room_cfg)
+        self._default_context_strategy = normalize_strategy(
+            getattr(room_cfg, "room_context_strategy", ContextStrategy.AUTO.value)
+        )
+        self._local_memory_constrained = getattr(
+            room_cfg, "room_context_local_memory_constrained", None
+        )
+        # Per-participant resolved policy, keyed by the capability signature it
+        # was resolved from, so a re-bind to another model re-resolves instead
+        # of reusing a stale budget.  Keys are ``(room_id, participant_id)``.
+        self._turn_context_policies: dict[
+            tuple[str, str], tuple[tuple[Any, ...], ResolvedContextPolicy]
+        ] = {}
+        self._last_context_policy: dict[tuple[str, str], ResolvedContextPolicy] = {}
+        # Prompt token ceiling for one room turn (None = derive from provider).
+        self._room_prompt_max_tokens = getattr(room_cfg, "room_prompt_max_tokens", None)
+        # Single-flight for local inference.  A rolling-summary refresh is a full
+        # model pass and must never overlap a live turn: two concurrent 27B
+        # prefills on a 24 GiB machine is exactly the Metal OOM this work is
+        # trying to avoid (observed: summary 8.2k + turn 4.4k prefill together
+        # pushed a turn past its first-response deadline).
+        self._summary_inference_lock = asyncio.Lock()
         self.kernel_cache = (
             default_static_kernel_cache()
             if bool(getattr(room_cfg, "room_static_persona_cache", True))
@@ -265,6 +475,8 @@ class MultiAgentOrchestrator:
         self._event_replay: dict[str, list[dict[str, Any]]] = {}
         # Single-flight background summary refresh per room (room_id -> task).
         self._summary_tasks: dict[str, asyncio.Task[None]] = {}
+        # Single-flight background Episode consolidation per room.
+        self._episode_tasks: dict[str, asyncio.Task[None]] = {}
         # Uploaded room attachments: attachment_id -> attachment metadata
         # (room_id, stored_name, filename, mime, size, kind).  Files live
         # under config.room_uploads_dir/{room_id}/; the registry only maps
@@ -348,6 +560,7 @@ class MultiAgentOrchestrator:
         shared_context: RoomSharedContext | None = None,
         template_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        scene_state: RoomSceneState | None = None,
     ) -> RoomSessionState:
         if request_id:
             row = self.continuum.database.conn.execute(
@@ -358,6 +571,13 @@ class MultiAgentOrchestrator:
                 if existing:
                     return existing
         room_participants = participants or []
+        if mode == RoomMode.DIRECT_CHAT:
+            for slot in room_participants:
+                slot.allow_mcp = False
+                slot.allow_agent_tools = False
+                slot.counterpart_id = slot.counterpart_id or "user"
+                if not slot.initial_relationship:
+                    slot.initial_relationship = {"relationship_kind": "partner"}
         if mode == RoomMode.DIRECT_CHAT:
             if protocol != RoomProtocolType.FREE_DISCUSSION:
                 raise ValueError("direct_chat_requires_free_discussion_protocol")
@@ -384,6 +604,7 @@ class MultiAgentOrchestrator:
             turn_index=0,
             host_participant_id=host_participant_id,
             director_config=director_config or DirectorConfig(),
+            scene_state=scene_state or RoomSceneState(scene_time=now, clock_wall_time=now),
             transcript=[],
             metadata={**(metadata or {}), **({"request_id": request_id} if request_id else {})},
             created_at=now,
@@ -408,6 +629,45 @@ class MultiAgentOrchestrator:
                         self.delete_room(room_id)
                         return existing
         return state
+
+    def _runtime_counterpart(self, state: RoomSessionState, slot: ParticipantSlot) -> str:
+        session_id = self._persona_session_ids.get(state.id, {}).get(slot.participant_id)
+        if session_id:
+            # Keep existing session bindings valid when opening an older room.
+            for session in self.continuum.sessions.list_sessions(slot.persona_id):
+                if session.id == session_id:
+                    return str(session.metadata.get("counterpart_id", f"room:{state.id}"))
+        return slot.counterpart_id or (
+            "user" if state.mode == RoomMode.DIRECT_CHAT else f"room:{state.id}"
+        )
+
+    def _attach_relationship_context(
+        self, state: RoomSessionState, slot: ParticipantSlot, prepared: Any
+    ) -> None:
+        from persona_continuum.runtime.bond_dynamics import relationship_stance
+
+        branch = str(
+            prepared.compiled_persona_context.get("runtime_version", {}).get("active_branch_id")
+            or "main"
+        )
+        needs = {need.name: need.level for need in prepared.current_needs}
+        for other in state.participants:
+            if other.persona_id == slot.persona_id:
+                continue
+            prior = slot.relationship_priors.get(other.persona_id, {})
+            shared = state.shared_context.relationships.get(slot.participant_id, {})
+            if not prior and isinstance(shared, dict):
+                prior = shared.get(other.participant_id, {})
+            if isinstance(prior, str):
+                prior = {"relationship_kind": prior}
+            if prior:
+                self.continuum.sessions.initialize_relationship(
+                    slot.persona_id, other.persona_id, prior, branch
+                )
+            relationship = self.continuum.relationships.get_relationship(
+                slot.persona_id, other.persona_id, branch
+            )
+            prepared.relationship_stance += "\n\n" + relationship_stance(relationship, needs)
 
     def validate_persona_bindings(self, participants: list[ParticipantSlot]) -> None:
         """Public persona-binding preflight shared with the web API layer.
@@ -571,7 +831,8 @@ class MultiAgentOrchestrator:
                 cont_sess = self.continuum.sessions.start_session(
                     persona_id=slot.persona_id,
                     title=f"Room {room_id} [{slot.participant_id}]",
-                    counterpart_id=f"room:{room_id}",
+                    counterpart_id=self._runtime_counterpart(state, slot),
+                    initial_relationship=slot.initial_relationship,
                     session_type="multi_agent_room",
                     room_id=room_id,
                 )
@@ -612,6 +873,10 @@ class MultiAgentOrchestrator:
                     },
                 },
             )
+            # Opening a room is the natural moment to work through Episode
+            # summaries it still owes -- e.g. history folded in by a lazy
+            # backfill, which has no live turn to piggyback on.
+            self._schedule_episode_consolidation(state)
 
             return state
 
@@ -704,9 +969,7 @@ class MultiAgentOrchestrator:
         # proper error with a reason the UI can render.
         deadline_seconds = 120.0
         try:
-            return await asyncio.wait_for(
-                self.start_room(room_id), timeout=deadline_seconds
-            )
+            return await asyncio.wait_for(self.start_room(room_id), timeout=deadline_seconds)
         except TimeoutError:
             exc = RuntimeError(
                 f"Room initialization timed out after {deadline_seconds:g}s; "
@@ -719,9 +982,7 @@ class MultiAgentOrchestrator:
             await self._mark_initialization_failed(room_id, exc)
             raise
 
-    async def _mark_initialization_failed(
-        self, room_id: str, exc: BaseException
-    ) -> None:
+    async def _mark_initialization_failed(self, room_id: str, exc: BaseException) -> None:
         state = self.get_room(room_id)
         if state:
             state.status = RoomStatus.ERROR
@@ -753,9 +1014,7 @@ class MultiAgentOrchestrator:
         but make the interrupted operation explicit and retryable.
         """
 
-        rows = self.continuum.database.conn.execute(
-            "SELECT state_json FROM rooms"
-        ).fetchall()
+        rows = self.continuum.database.conn.execute("SELECT state_json FROM rooms").fetchall()
         recovered = 0
         for row in rows:
             with contextlib.suppress(Exception):
@@ -772,10 +1031,7 @@ class MultiAgentOrchestrator:
                     continue
 
                 now = datetime.now(UTC)
-                reason = (
-                    "上一轮房间任务因服务重启或后台任务中断而未完成，"
-                    "请重新初始化或重试。"
-                )
+                reason = "上一轮房间任务因服务重启或后台任务中断而未完成，请重新初始化或重试。"
                 state.status = RoomStatus.ERROR
                 state.last_error = reason
                 if state.initialization_stage not in {"ready", "error"}:
@@ -811,9 +1067,7 @@ class MultiAgentOrchestrator:
         and field is preserved so legacy rooms stay openable.
         """
 
-        rows = self.continuum.database.conn.execute(
-            "SELECT state_json FROM rooms"
-        ).fetchall()
+        rows = self.continuum.database.conn.execute("SELECT state_json FROM rooms").fetchall()
         normalized = 0
         for row in rows:
             with contextlib.suppress(Exception):
@@ -837,9 +1091,7 @@ class MultiAgentOrchestrator:
                     normalized += 1
         return normalized
 
-    async def mark_background_turn_failed(
-        self, room_id: str, exc: BaseException
-    ) -> None:
+    async def mark_background_turn_failed(self, room_id: str, exc: BaseException) -> None:
         """Persist a terminal state when a detached turn task crashes."""
 
         state = self.get_room(room_id)
@@ -894,6 +1146,31 @@ class MultiAgentOrchestrator:
 
         lock = self._room_locks.setdefault(room_id, asyncio.Lock())
         async with lock:
+            if (
+                not user_message
+                and state.transcript
+                and state.transcript[-1].get("participant_id") == "user"
+            ):
+                user_message = str(
+                    state.transcript[-1].get("raw_content")
+                    or state.transcript[-1].get("content")
+                    or ""
+                )
+            if user_message and not (
+                state.transcript
+                and state.transcript[-1].get("participant_id") == "user"
+                and (
+                    state.transcript[-1].get("raw_content") == user_message
+                    or state.transcript[-1].get("content") == user_message
+                )
+            ):
+                injected_event = await self._inject_message_locked(
+                    room_id, user_message, _schedule_reply=False
+                )
+                state = self.get_room(room_id) or state
+                yield injected_event
+            else:
+                SceneRuntime.tick(state.scene_state)
             # 1. Select Speaker
             if manual_speaker_id:
                 speaker_id = manual_speaker_id
@@ -954,7 +1231,43 @@ class MultiAgentOrchestrator:
             yield speaker_event
             await self._broadcast_event(room_id, speaker_event)
 
-            # 2. Recall Gate Analysis (single shared retrieval for the turn)
+            resets = state.metadata.get("voice_reset_participants", [])
+            if speaker_id in resets:
+                logical_session = self._persona_session_ids.get(room_id, {}).get(speaker_id)
+                if not await self.restart_session(room_id, speaker_id):
+                    raise RuntimeError("style_firewall_runtime_reset_failed")
+                if logical_session:
+                    self._persona_session_ids.setdefault(room_id, {})[speaker_id] = logical_session
+                resets.remove(speaker_id)
+                self._save_room_state(state, force=True)
+
+            # 2. Context Policy Resolution (before any retrieval)
+            #
+            # The profile decides how many memories this turn may retrieve and
+            # how much of them it may show; retrieval itself must therefore
+            # happen after it.  Resolving it here also keeps the local survival
+            # profile from dictating what a 1M-context model is allowed to see.
+            adapter = self.registry.get_adapter(snapshot.agent_runtime_id)
+            agent_session = self._active_agent_sessions.get(room_id, {}).get(speaker_id)
+            agent_binding = self._active_agent_bindings.get(room_id, {}).get(speaker_id)
+            context_policy = self.resolve_turn_context_policy(
+                state, slot, agent_session=agent_session, snapshot=snapshot, adapter=adapter
+            )
+            policy_report = context_policy.as_dict()
+            policy_event = {
+                "event": "room_context_policy",
+                "room_id": room_id,
+                "participant_id": speaker_id,
+                "persona_id": slot.persona_id,
+                "turn_index": state.turn_index,
+                "adapter_id": snapshot.agent_runtime_id,
+                "model_id": snapshot.model_id,
+                **policy_report,
+            }
+            yield policy_event
+            await self._broadcast_event(room_id, policy_event)
+
+            # 3. Recall Gate Analysis (single shared retrieval for the turn)
             from persona_continuum.performance.tracing import default_tracer
 
             tracer = default_tracer()
@@ -976,6 +1289,13 @@ class MultiAgentOrchestrator:
             yield recall_start_event
             await self._broadcast_event(room_id, recall_start_event)
 
+            phase8_active = bool(
+                state.metadata.get(
+                    "phase8_context_assembly",
+                    getattr(self.continuum.config, "phase8_context_assembly", True),
+                )
+            )
+
             with tracer.span(turn_task_id, "prepare_turn"):
                 with tracer.span(turn_task_id, "memory_search"):
                     gate_plan = self.recall_gate.plan_turn(
@@ -991,32 +1311,61 @@ class MultiAgentOrchestrator:
                         shared_memories = self.continuum.memories.search_memories(
                             persona_id=slot.persona_id,
                             query=gate_plan.query,
-                            limit=8,
+                            limit=context_policy.profile.recall_top_k,
                             branch_id="main",
                             include_main_history=True,
                             include_shared_pre_divergence=True,
                         )
-                recall_result = RecallGate.attach_memories(
-                    gate_plan, list(shared_memories or [])
-                )
+                recall_result = RecallGate.attach_memories(gate_plan, list(shared_memories or []))
 
-            # 3. Context Preparation
-            adapter = self.registry.get_adapter(snapshot.agent_runtime_id)
-            agent_session = self._active_agent_sessions.get(room_id, {}).get(speaker_id)
-            agent_binding = self._active_agent_bindings.get(room_id, {}).get(speaker_id)
+                memory_bundle: MemoryBundle | None = None
+                if phase8_active and self.retrieval_planner is not None:
+                    with tracer.span(turn_task_id, "bundle_retrieval"):
+                        memory_bundle = self.retrieval_planner.plan_and_retrieve(
+                            persona_id=slot.persona_id,
+                            counterpart_id=self._runtime_counterpart(state, slot),
+                            branch_id="main",
+                            user_message=user_message or "",
+                            recent_transcript=list(state.transcript or []),
+                            room_topic=state.topic,
+                            stored_rolling_summary=state.metadata.get("rolling_summary"),
+                            context_profile=context_policy.profile,
+                            recall_gate_signal=gate_plan,
+                        )
 
+            # 4. Context Preparation
             recall_complete_event = {
                 "event": "recall_completed",
                 "room_id": room_id,
                 "participant_id": speaker_id,
                 "persona_id": slot.persona_id,
-                "triggered": recall_result.triggered,
-                "reasons": recall_result.reasons,
-                "retrieved_count": len(recall_result.memories),
+                "triggered": recall_result.triggered or bool(
+                    memory_bundle
+                    and memory_bundle.retrieval_metadata.mode != RetrievalMode.BASE
+                ),
+                "reasons": (
+                    memory_bundle.retrieval_metadata.reasons
+                    if memory_bundle
+                    else recall_result.reasons
+                ),
+                "retrieved_count": (
+                    (
+                        len(memory_bundle.semantic_facts)
+                        + len(memory_bundle.active_threads)
+                        + len(memory_bundle.relevant_episodes)
+                        + len(memory_bundle.historical_excerpts)
+                        + len(memory_bundle.hierarchical_summaries)
+                    )
+                    if memory_bundle
+                    else len(recall_result.memories)
+                ),
                 "retrieved_memories": [
                     {"id": m.id, "content": m.content, "importance": m.importance}
                     for m in recall_result.memories
                 ],
+                "retrieval_mode": (
+                    memory_bundle.retrieval_metadata.mode.value if memory_bundle else "base"
+                ),
                 "timestamp": datetime.now(UTC).isoformat(),
             }
             yield recall_complete_event
@@ -1027,29 +1376,78 @@ class MultiAgentOrchestrator:
                 cont_sess = self.continuum.sessions.start_session(
                     persona_id=slot.persona_id,
                     title=f"Room {room_id} [{slot.participant_id}]",
-                    counterpart_id=f"room:{room_id}",
+                    counterpart_id=self._runtime_counterpart(state, slot),
+                    initial_relationship=slot.initial_relationship,
                     session_type="multi_agent_room",
                     room_id=room_id,
                 )
                 sess_id = cont_sess.id
                 self._persona_session_ids.setdefault(room_id, {})[speaker_id] = sess_id
 
+            interaction_counterpart = None
+            interaction_message = None
+            if state.mode != RoomMode.DIRECT_CHAT:
+                if user_message:
+                    interaction_counterpart, interaction_message = "user", user_message
+                elif state.transcript:
+                    previous = state.transcript[-1]
+                    previous_persona = previous.get("persona_id")
+                    if previous_persona and previous_persona != slot.persona_id:
+                        interaction_counterpart = str(previous_persona)
+                        interaction_message = str(previous.get("content") or "")
+                if interaction_counterpart:
+                    prior = slot.relationship_priors.get(interaction_counterpart, {})
+                    if not prior:
+                        shared = state.shared_context.relationships.get(slot.participant_id, {})
+                        other_slot = next(
+                            (
+                                p
+                                for p in state.participants
+                                if p.persona_id == interaction_counterpart
+                            ),
+                            None,
+                        )
+                        if isinstance(shared, dict) and other_slot:
+                            prior = shared.get(other_slot.participant_id, {})
+                    if isinstance(prior, str):
+                        prior = {"relationship_kind": prior}
+                    self.continuum.sessions.initialize_relationship(
+                        slot.persona_id, interaction_counterpart, prior
+                    )
             with tracer.span(turn_task_id, "context_build"):
                 prepared = self.continuum.sessions.prepare_turn(
                     persona_id=slot.persona_id,
                     session_id=sess_id,
                     user_message=user_message or state.topic or "Continue the discussion",
-                    counterpart_id=f"room:{room_id}",
+                    counterpart_id=self._runtime_counterpart(state, slot),
                     preset_memories=shared_memories,
+                    interaction_counterpart_id=interaction_counterpart,
+                    interaction_message=interaction_message,
+                    current_time=state.scene_state.scene_time,
+                    # Without this the recalled set is truncated a SECOND time
+                    # to prepare_turn's own default of 8, which silently
+                    # defeated any profile that retrieves more.
+                    max_context_items=context_policy.profile.recall_top_k,
                 )
 
+            self._attach_relationship_context(state, slot, prepared)
             persistent = self._participant_is_persistent(
                 adapter=adapter,
                 session=agent_session,
                 snapshot=snapshot,
             )
             stored_summary = state.metadata.get("rolling_summary")
-            summary_block = stored_summary if isinstance(stored_summary, str) else None
+            # Only a canonical summary may be injected.  A missing, failed or
+            # in-flight refresh must NOT fall back to the full transcript (the
+            # context manager bounds the window unconditionally); it simply
+            # means this turn has no summary block.
+            summary_block = (
+                stored_summary
+                if is_canonical_summary(
+                    stored_summary, state.metadata.get("rolling_summary_version")
+                )
+                else None
+            )
             transport_capability = self._resolve_transport_capability(
                 room_id, speaker_id, adapter, snapshot.agent_runtime_id
             )
@@ -1060,6 +1458,11 @@ class MultiAgentOrchestrator:
                 persistent=persistent,
                 summary_block=summary_block,
                 transport_budget_bytes=budget_for(transport_capability),
+                # Working memory is sized by a TOKEN budget; the message count
+                # is only a secondary cap.  Both come from this turn's profile,
+                # so a 24 GiB Mac no longer decides what a 1M model may read.
+                message_window=context_policy.profile.recent_message_window,
+                recent_token_budget=context_policy.profile.recent_dialogue_token_budget,
             )
             if turn_ctx.mode == "rehydrated":
                 rehydrate_ev = {
@@ -1083,23 +1486,134 @@ class MultiAgentOrchestrator:
                     if turn_ctx.mode == "delta" and turn_ctx.turns
                     else None
                 )
-                system_prompt, composed_user_prompt, _ = self.prompt_composer.compose_turn_prompt(
-                    slot=slot,
-                    binding=snapshot,
-                    prepared=prepared,
-                    dynamic_recall_memories=recall_result.memories,
-                    recent_transcript=turn_ctx.turns,
-                    room_topic=state.topic,
-                    user_message=user_message,
-                    kernel=kernel,
-                    context_mode=turn_ctx.mode,
-                    summary_block=(
-                        turn_ctx.summary_block
-                        if turn_ctx.mode in {"windowed", "rehydrated"}
-                        else None
-                    ),
-                    cursor_span=cursor_span,
+                # --- component-aware prompt budget -----------------------
+                # Measured with the real Qwen tokenizer on a live 8756-token
+                # turn: retrieved memories 3454 (39%!), persona kernel ~3300,
+                # scene facts 827, recent dialogue 817, current message 17.
+                # Memories are the only large block that can be given back
+                # without changing who the persona is or what the user just
+                # said, so they go first; then the oldest raw dialogue; then the
+                # summary.  Identity, constraints, the output contract and the
+                # current message are never trimmed.
+                #
+                # Which rungs exist, how far memories may be cut and how much
+                # summary survives all come from this turn's ContextProfile.
+                # ``local_constrained`` reproduces the historical six-rung
+                # ladder exactly; ``remote_quality`` has a single rung, so a
+                # large model is never degraded for being large.
+                summary_for_prompt = (
+                    turn_ctx.summary_block
+                    if turn_ctx.mode in {"windowed", "rehydrated", "full"}
+                    else None
                 )
+                base_transcript = list(turn_ctx.turns)
+                active_profile = context_policy.profile
+                budget_stages: list[tuple[int, int, int | None, int | None]] = [
+                    (stage.memory_limit or 0, stage.memory_max_tokens, stage.recent_window,
+                     stage.summary_max_tokens)
+                    for stage in active_profile.trim_ladder(
+                        top_k=active_profile.recall_top_k,
+                        memory_max_tokens=active_profile.memory_max_tokens,
+                        memory_budget_tokens=active_profile.memory_budget_tokens,
+                    )
+                ]
+                prompt_target_tokens = context_policy.prompt_target_tokens
+                prompt_hard_tokens = context_policy.prompt_hard_tokens
+                prompt_tokens = 0
+                budget_stage_used = -1
+                budget_trimmed = False
+                # Filled by the composer for the prompt that is finally kept,
+                # so the Context Assembly Report can name the block that
+                # consumed the budget instead of only reporting a total.
+                assembly_report: dict[str, Any] = {}
+                for stage_index, (mem_limit, mem_tokens, keep_raw, sum_cap) in enumerate(
+                    budget_stages
+                ):
+                    transcript_for_prompt = (
+                        base_transcript if keep_raw is None else base_transcript[-keep_raw:]
+                    )
+                    summary_value = summary_for_prompt
+                    if summary_value and sum_cap:
+                        clipped = _clip_to_tokens(summary_value, sum_cap)
+                        summary_value = clipped if clipped == summary_value else clipped + "…"
+                    stage_bundle = (
+                        _trim_bundle_for_stage(memory_bundle, stage_index, mem_limit)
+                        if (phase8_active and memory_bundle is not None)
+                        else None
+                    )
+                    system_prompt, composed_user_prompt, _ = (
+                        self.prompt_composer.compose_turn_prompt(
+                            slot=slot,
+                            binding=snapshot,
+                            prepared=prepared,
+                            dynamic_recall_memories=recall_result.memories,
+                            recent_transcript=transcript_for_prompt,
+                            room_topic=state.topic,
+                            user_message=user_message,
+                            kernel=kernel,
+                            context_mode=turn_ctx.mode,
+                            summary_block=summary_value,
+                            cursor_span=cursor_span,
+                            scene_state=state.scene_state,
+                            structured_actions=True,
+                            memory_limit=mem_limit,
+                            memory_max_tokens=mem_tokens,
+                            memory_bundle=stage_bundle,
+                            report=assembly_report,
+                        )
+                    )
+                    prompt_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(
+                        composed_user_prompt
+                    )
+                    budget_stage_used = stage_index
+                    if stage_index > 0:
+                        budget_trimmed = True
+                    if prompt_tokens <= prompt_target_tokens:
+                        break
+                if prompt_tokens > prompt_hard_tokens:
+                    # Refuse rather than hand a prompt larger than the model's
+                    # own effective budget to a provider that will reject it.
+                    # Reaching this means the fixed blocks alone (identity +
+                    # constraints + contract + current message) already blew
+                    # the budget -- for a remote_quality profile that is the
+                    # capability-derived ceiling, not a 7000-token constant.
+                    budget_error = AgentTransportError(
+                        "Room prompt exceeds the hard token budget",
+                        phase="session_prompt",
+                        diagnostics={
+                            "protocol": "openai_compatible_http",
+                            "failure_code": "ROOM_CONTEXT_BUDGET_EXCEEDED",
+                            "context_profile": active_profile.name,
+                            "estimated_prompt_tokens": prompt_tokens,
+                            "hard_limit_tokens": prompt_hard_tokens,
+                            "target_tokens": prompt_target_tokens,
+                            "budget_stage": budget_stage_used,
+                            "room_id": room_id,
+                            "turn_index": state.turn_index,
+                        },
+                    )
+                    yield {
+                        "event": "agent_error",
+                        "room_id": room_id,
+                        "participant_id": speaker_id,
+                        "error": "Room prompt exceeds the hard token budget",
+                        "failure_code": "ROOM_CONTEXT_BUDGET_EXCEEDED",
+                        "diagnostics": dict(budget_error.diagnostics),
+                    }
+                    return
+                if prompt_tokens > prompt_target_tokens:
+                    # Sent, but recorded: the trim stages could not get under the
+                    # soft target without harming the persona.
+                    _metadata_trace_logger.warning(
+                        "ROOM_PROMPT_SOFT_LIMIT_EXCEEDED room=%s turn=%s profile=%s "
+                        "estimated_tokens=%s target=%s stage=%s",
+                        room_id,
+                        state.turn_index,
+                        active_profile.name,
+                        prompt_tokens,
+                        prompt_target_tokens,
+                        budget_stage_used,
+                    )
                 # One computation feeds both the advertised tool list and the
                 # prompt block, so they can never drift apart.
                 tools_for_turn = await self._tools_for_slot(slot)
@@ -1131,8 +1645,7 @@ class MultiAgentOrchestrator:
                     # even when the raw transcript cannot.
                     salvaged = "\n".join(f"- {fact}" for fact in turn_ctx.salvaged_facts)
                     composed_user_prompt = (
-                        f"Earlier user statements (salvaged):\n{salvaged}\n\n"
-                        f"{composed_user_prompt}"
+                        f"Earlier user statements (salvaged):\n{salvaged}\n\n{composed_user_prompt}"
                     )
                 # The free-discussion path advertises exactly the tools
                 # `tools_for_turn` and `_execute_tool_cb` will accept.
@@ -1140,16 +1653,199 @@ class MultiAgentOrchestrator:
             tracer.count(
                 turn_task_id,
                 "transcript_tokens_sent",
-                _estimate_tokens(
-                    "\n".join(str(t.get("content") or "") for t in turn_ctx.turns)
-                ),
+                _estimate_tokens("\n".join(str(t.get("content") or "") for t in turn_ctx.turns)),
             )
-            tracer.observe(
-                turn_task_id, "memory_results_count", len(prepared.relevant_memories)
-            )
+            tracer.observe(turn_task_id, "memory_results_count", len(prepared.relevant_memories))
             tracer.count(turn_task_id, f"ctx_{turn_ctx.mode}", 1)
             if turn_ctx.mode == "delta":
                 tracer.count(turn_task_id, "delta", 1)
+
+            # --- Context Assembly Report --------------------------------------
+            # A compact, machine-readable record of what actually reaches the
+            # model this turn.  This is the acceptance instrument: it proves the
+            # prompt stays bounded as turns accumulate, and it makes a
+            # full-transcript regression immediately visible.  It is emitted as
+            # a room event (never into the model prompt) and deliberately does
+            # not carry the raw recall query text or any dialogue body.
+            stored_summary = state.metadata.get("rolling_summary")
+            memory_candidates = len(getattr(recall_result, "memories", []) or [])
+            episodes = getattr(self.continuum, "episodes", None)
+            facts = getattr(self.continuum, "facts", None)
+            threads = getattr(self.continuum, "threads", None)
+            context_report = {
+                "event": "room_context_report",
+                "room_id": room_id,
+                "participant_id": speaker_id,
+                "persona_id": slot.persona_id,
+                "context_mode": turn_ctx.mode,
+                "turn_index": state.turn_index,
+                # -- policy --------------------------------------------------
+                "context_profile": context_policy.profile_name,
+                "context_strategy_requested": context_policy.requested_strategy,
+                "context_profile_reasons": list(context_policy.reasons),
+                "adapter_id": snapshot.agent_runtime_id,
+                "model_id": snapshot.model_id,
+                "context_window": context_policy.context_window,
+                "context_window_source": context_policy.context_window_source,
+                "context_window_verified": context_policy.context_window_verified,
+                "local_endpoint": context_policy.local_endpoint,
+                "local_safety_ceiling_applied": context_policy.local_safety_ceiling_applied,
+                "effective_context_budget": context_policy.effective_context_budget,
+                "capability_budget_tokens": context_policy.capability_budget_tokens,
+                "profile_budget_tokens": context_policy.profile_budget_tokens,
+                "context_capacity_ceiling": context_policy.context_capacity_ceiling,
+                "context_target_budget": context_policy.context_target_budget,
+                "context_hard_budget": context_policy.context_hard_budget,
+                "generation_reserve_tokens": context_policy.generation_reserve_tokens,
+                "reasoning_reserve_tokens": context_policy.reasoning_reserve_tokens,
+                "safety_reserve_tokens": context_policy.safety_reserve_tokens,
+                # -- what entered the prompt ---------------------------------
+                "transcript_total_entries": len(state.transcript or []),
+                "transcript_in_prompt": len(turn_ctx.turns),
+                "raw_window": context_policy.profile.recent_message_window,
+                "recent_dialogue_token_budget": (
+                    context_policy.profile.recent_dialogue_token_budget
+                ),
+                "recent_dialogue_tokens": assembly_report.get("recent_dialogue_tokens", 0),
+                "persona_tokens": assembly_report.get("persona_identity_tokens", 0)
+                + assembly_report.get("persona_constraints_tokens", 0),
+                "dynamic_state_tokens": assembly_report.get("dynamic_state_tokens", 0),
+                "voice_exemplar_tokens": assembly_report.get("voice_exemplar_tokens", 0),
+                "memory_tokens": assembly_report.get("memory_tokens", 0),
+                "summary_tokens": assembly_report.get("summary_tokens", 0),
+                "scene_facts_tokens": assembly_report.get("scene_facts_tokens", 0),
+                "current_message_tokens": assembly_report.get("current_message_tokens", 0),
+                "static_system_tokens": _estimate_tokens(system_prompt),
+                "estimated_prompt_tokens": _estimate_tokens(system_prompt)
+                + _estimate_tokens(composed_user_prompt),
+                "prompt_target_tokens": prompt_target_tokens,
+                "prompt_hard_tokens": prompt_hard_tokens,
+                "prompt_budget_stage": budget_stage_used,
+                "prompt_budget_trimmed": budget_trimmed,
+                "prompt_budget_stages_available": len(budget_stages),
+                # -- memory ---------------------------------------------------
+                "rolling_summary_version": state.metadata.get("rolling_summary_version"),
+                "rolling_summary_canonical": is_canonical_summary(
+                    stored_summary, state.metadata.get("rolling_summary_version")
+                ),
+                "recall_triggered": bool(getattr(recall_result, "triggered", False)),
+                "recall_reasons": list(getattr(recall_result, "reasons", []) or []),
+                "recall_query_chars": len(str(getattr(recall_result, "query", "") or "")),
+                "memory_top_k": context_policy.profile.recall_top_k,
+                "memory_candidates": memory_candidates,
+                "memory_retrieved": memory_candidates,
+                "memory_selected": assembly_report.get("memory_lines_rendered", 0),
+                "memory_injected": len(prepared.relevant_memories),
+                "memory_max_tokens": context_policy.profile.memory_max_tokens,
+                "retrieval_mode": (
+                    memory_bundle.retrieval_metadata.mode.value if memory_bundle else "base"
+                ),
+                "retrieval_timings_ms": (
+                    memory_bundle.retrieval_metadata.timings.model_dump()
+                    if memory_bundle
+                    else None
+                ),
+                "episodes_selected": (
+                    assembly_report.get("episodes_rendered", 0) if phase8_active else 0
+                ),
+                "episode_tokens": (
+                    assembly_report.get("episode_tokens", 0) if phase8_active else 0
+                ),
+                "episode_injection": "phase8_active" if phase8_active else "phase8_not_enabled",
+                "episodes_available": (
+                    episodes.count_episodes(room_id=room_id)
+                    if episodes is not None
+                    else None
+                ),
+                "semantic_facts_available": (
+                    facts.count_active(persona_id=slot.persona_id) if facts is not None else None
+                ),
+                "semantic_memory_tokens": (
+                    assembly_report.get("semantic_fact_tokens", 0) if phase8_active else 0
+                ),
+                "facts_selected": (
+                    assembly_report.get("facts_rendered", 0) if phase8_active else 0
+                ),
+                "fact_injection": "phase8_active" if phase8_active else "phase8_not_enabled",
+                "threads_available": (
+                    threads.count_live(persona_id=slot.persona_id)
+                    if threads is not None
+                    else None
+                ),
+                "threads_selected": (
+                    assembly_report.get("threads_rendered", 0) if phase8_active else 0
+                ),
+                "thread_tokens": (
+                    assembly_report.get("thread_tokens", 0) if phase8_active else 0
+                ),
+                "thread_injection": "phase8_active" if phase8_active else "phase8_not_enabled",
+                "threads_pending_resolution": (
+                    threads.count_pending_resolution(persona_id=slot.persona_id)
+                    if threads is not None
+                    else None
+                ),
+                "relationship_event_tokens": None,
+            }
+            raw_recall = getattr(self.continuum, "raw_recall", None)
+            context_report.update(
+                {
+                    "historical_excerpt_tokens": (
+                        assembly_report.get("historical_excerpt_tokens", 0)
+                        if phase8_active
+                        else 0
+                    ),
+                    "raw_excerpts_selected": (
+                        assembly_report.get("raw_excerpts_rendered", 0)
+                        if phase8_active
+                        else 0
+                    ),
+                    "raw_excerpts_expanded": (
+                        assembly_report.get("raw_excerpts_rendered", 0)
+                        if phase8_active
+                        else 0
+                    ),
+                    "raw_excerpt_injection": (
+                        "phase8_active" if phase8_active else "phase8_not_enabled"
+                    ),
+                    "raw_recall_available": bool(raw_recall is not None),
+                }
+            )
+            hierarchies = getattr(self.continuum, "hierarchies", None)
+            context_report.update(
+                {
+                    "hierarchical_summaries_available": (
+                        hierarchies.count_available(persona_id=slot.persona_id)
+                        if hierarchies is not None
+                        else None
+                    ),
+                    "hierarchical_summary_tokens": (
+                        assembly_report.get("hierarchical_summary_tokens", 0)
+                        if phase8_active
+                        else 0
+                    ),
+                    "summary_injection": (
+                        "phase8_active" if phase8_active else "phase8_not_enabled"
+                    ),
+                    "hierarchical_summaries_pending": (
+                        hierarchies.count_pending(persona_id=slot.persona_id)
+                        if hierarchies is not None
+                        else None
+                    ),
+                }
+            )
+            tracer.count(
+                turn_task_id,
+                "prompt_tokens_sent",
+                context_report["estimated_prompt_tokens"],
+            )
+            tracer.count(
+                turn_task_id,
+                "transcript_entries_sent",
+                context_report["transcript_in_prompt"],
+            )
+            yield context_report
+            await self._broadcast_event(room_id, context_report)
+
             self.context_manager.commit(room_id, speaker_id, turn_ctx)
 
             if not adapter or not agent_session:
@@ -1231,6 +1927,13 @@ class MultiAgentOrchestrator:
                 diagnostics={"room_id": room_id, "participant_id": speaker_id},
             )
 
+            # A live turn takes precedence over background summarisation: if a
+            # summary prefill is in flight, let it finish before starting ours
+            # rather than running two model passes at once.
+            if self._summary_inference_lock.locked():
+                await self._summary_inference_lock.acquire()
+                self._summary_inference_lock.release()
+
             stream_started = time.monotonic()
             first_token_at: float | None = None
             turn_attachments = self._turn_attachments(state)
@@ -1245,6 +1948,12 @@ class MultiAgentOrchestrator:
                         or "Continue conversation"
                     ),
                     attachments=turn_attachments or None,
+                    expected_output=(
+                        SceneOutput.model_json_schema()
+                        if snapshot.capabilities.get("structured_output_mode")
+                        in {"native_schema", "tool_schema"}
+                        else None
+                    ),
                     tools=tools_for_turn if use_tools else [],
                     phase="room_agent_turn",
                     metadata={
@@ -1261,8 +1970,8 @@ class MultiAgentOrchestrator:
                                 tracer.record(
                                     turn_task_id,
                                     agent_ttft_ms=round(
-                                    (first_token_at - stream_started) * 1000, 1
-                                ),
+                                        (first_token_at - stream_started) * 1000, 1
+                                    ),
                                 )
                             if event.metadata.get("replace_response"):
                                 full_response_parts.clear()
@@ -1520,12 +2229,36 @@ class MultiAgentOrchestrator:
                 tracer.finish_task(turn_task_id)
                 return
 
+            raw_final_content = str(redact_secrets(final_content))
+            channels = normalize_turn(raw_final_content, actor=slot.persona_id)
+            next_scene = state.scene_state.model_copy(deep=True)
+            channels, scene_events = SceneRuntime().accept_turn(
+                next_scene,
+                room_id=room_id,
+                turn_id=turn_id,
+                actor=slot.persona_id,
+                raw_content=raw_final_content,
+                channels=channels,
+                advance_clock=False,
+            )
+            final_content = channels.spoken_text
+            speech_event = {
+                "event": "agent_message_delta",
+                "room_id": room_id,
+                "participant_id": speaker_id,
+                "delta": final_content,
+                "replace_response": True,
+            }
+            yield speech_event
+            await self._broadcast_event(room_id, speech_event)
             state.last_error = None
             agent_completed_ev = {
                 "event": "agent_completed",
                 "room_id": room_id,
                 "participant_id": speaker_id,
                 "content": final_content,
+                "actions": channels.actions,
+                "scene_events": channels.scene_events,
                 "usage": completion_metadata.get("usage", {}),
                 "model_id": snapshot.model_id,
                 "agent_runtime_id": snapshot.agent_runtime_id,
@@ -1546,15 +2279,25 @@ class MultiAgentOrchestrator:
             await self._broadcast_event(room_id, commit_start_ev)
 
             recall_ids = [m.id for m in recall_result.memories]
+            shared_user_turn = self._shared_user_turn(state)
             commit_res = self.continuum.sessions.commit_turn(
                 persona_id=slot.persona_id,
                 session_id=sess_id,
                 user_message=user_message or state.topic or "Room discussion turn",
-                persona_response=final_content,
+                persona_response=raw_final_content,
+                occurred_at=state.scene_state.scene_time,
+                source_turn_id=turn_id,
+                scene_events=channels.scene_events,
                 used_memory_ids=recall_ids,
-                counterpart_id=f"room:{room_id}",
+                counterpart_id=self._runtime_counterpart(state, slot),
+                shared_user_turn=shared_user_turn,
             )
 
+            state.scene_state = next_scene
+            if channels.non_voice_context or (
+                "（" in raw_final_content or "(" in raw_final_content
+            ):
+                state.metadata.setdefault("voice_reset_participants", []).append(speaker_id)
             commit_complete_ev = {
                 "event": "persona_commit_completed",
                 "room_id": room_id,
@@ -1562,12 +2305,19 @@ class MultiAgentOrchestrator:
                 "persona_id": slot.persona_id,
                 "turn_id": commit_res.get("turn_id"),
                 "memory_id": commit_res.get("memory_id"),
+                "episode_id": commit_res.get("episode_id"),
+                "reflection_due": commit_res.get("reflection_due", False),
                 # Public delta summary ("anxiety 18% -> 27% +9%").  The UI
                 # refetches runtime state on this event instead of polling.
                 "state_summary": commit_res.get("state_summary") or "",
             }
             yield commit_complete_ev
             await self._broadcast_event(room_id, commit_complete_ev)
+
+            # 5b. Memory Episodes: the turn is already durable, so this only
+            # queues the description of what was just recorded.  The reply the
+            # user is waiting for is never delayed by it.
+            self._schedule_episode_consolidation(state, commit_res)
 
             # 6. Save Transcript Record
             now_str = datetime.now(UTC).isoformat()
@@ -1580,6 +2330,8 @@ class MultiAgentOrchestrator:
                 "model_id": snapshot.model_id,
                 "reasoning_effort": snapshot.reasoning_effort,
                 "content": final_content,
+                **channels.model_dump(mode="json"),
+                "scene_time": state.scene_state.scene_time.isoformat(),
                 "director_reason": director_reason,
                 "recall_ids": recall_ids,
                 "created_at": now_str,
@@ -1601,9 +2353,7 @@ class MultiAgentOrchestrator:
             )
             usage = completion_metadata.get("usage") or {}
             if isinstance(usage, dict):
-                tracer.observe(
-                    turn_task_id, "prompt_tokens", int(usage.get("input_tokens") or 0)
-                )
+                tracer.observe(turn_task_id, "prompt_tokens", int(usage.get("input_tokens") or 0))
                 tracer.observe(
                     turn_task_id, "completion_tokens", int(usage.get("output_tokens") or 0)
                 )
@@ -1635,6 +2385,10 @@ class MultiAgentOrchestrator:
                     metadata={
                         "usage": completion_metadata.get("usage", {}),
                         "decision_source": "llm",
+                        "channels": {
+                            **channels.model_dump(mode="json"),
+                            "scene_time": state.scene_state.scene_time.isoformat(),
+                        },
                     },
                 )
             )
@@ -1771,19 +2525,26 @@ class MultiAgentOrchestrator:
                 "room_converting",
                 "房间正在进行协议迁移，请等待迁移完成后重试。",
             )
+        SceneRuntime.tick(state.scene_state)
+        if question and not (
+            state.transcript
+            and state.transcript[-1].get("participant_id") == "user"
+            and state.transcript[-1].get("content") == question
+        ):
+            await self._inject_message_locked(room_id, question, _schedule_reply=False)
+            state = self.get_room(room_id) or state
         # Validate BEFORE mutating: a participant/runtime pre-check failure
         # must never leave the room stuck in DISCUSSING (fix #4).
         definition = self.protocol_registry.get(state.protocol, state.protocol_config)
         self.protocol_registry.validate_participants(definition, state.participants)
         self._clear_session_cancel_events(room_id)
+        question = normalize_turn(question).spoken_text
         # New user input merges into the case state; room.topic stays stable
         # so follow-ups never displace the original case anchor.  An empty
         # question falls back to the topic for EXECUTION only -- the merge
         # still uses the raw question and is skipped entirely when empty.
         if str(question).strip():
-            state.case_state = merge_case_state(
-                _coerce_case_state(state.case_state), question
-            )
+            state.case_state = merge_case_state(_coerce_case_state(state.case_state), question)
         state.status = RoomStatus.DISCUSSING
         self._save_room_state(state, force=True)
         try:
@@ -1822,9 +2583,8 @@ class MultiAgentOrchestrator:
             state.status = RoomStatus.ERROR
             detail = ""
             for task in getattr(protocol_state, "tasks", []):
-                if (
-                    getattr(task, "status", None) == ProtocolTaskStatus.FAILED
-                    and getattr(task, "error", None)
+                if getattr(task, "status", None) == ProtocolTaskStatus.FAILED and getattr(
+                    task, "error", None
                 ):
                     detail = f": {task.error}"
                     break
@@ -1891,8 +2651,7 @@ class MultiAgentOrchestrator:
         try:
             finalized = await self.protocol_runtime.force_finalize(
                 state,
-                _coerce_case_state(state.case_state).problem_definition
-                or "立即总结当前已完成结果",
+                _coerce_case_state(state.case_state).problem_definition or "立即总结当前已完成结果",
                 self._execute_protocol_action,
             )
         except asyncio.CancelledError:
@@ -1914,11 +2673,7 @@ class MultiAgentOrchestrator:
             )
             raise
         state.protocol_state = finalized
-        state.status = (
-            RoomStatus.READY
-            if finalized.status.value == "success"
-            else RoomStatus.ERROR
-        )
+        state.status = RoomStatus.READY if finalized.status.value == "success" else RoomStatus.ERROR
         state.last_error = None if state.status == RoomStatus.READY else "room_finalize_failed"
         self._save_room_state(state, force=True)
         return state
@@ -1966,9 +2721,7 @@ class MultiAgentOrchestrator:
         # mutating entry point rejects via the same set.
         self._converting_rooms.add(room_id)
         try:
-            return await self._convert_room_protocol_locked(
-                room_id, target_protocol, role_mapping
-            )
+            return await self._convert_room_protocol_locked(room_id, target_protocol, role_mapping)
         finally:
             self._converting_rooms.discard(room_id)
 
@@ -2030,9 +2783,12 @@ class MultiAgentOrchestrator:
         }
 
         def _preview() -> str:
-            return "；".join(
-                f"{name_by_id.get(pid, pid)}→{role}" for pid, role in role_mapping.items()
-            ) or "（空）"
+            return (
+                "；".join(
+                    f"{name_by_id.get(pid, pid)}→{role}" for pid, role in role_mapping.items()
+                )
+                or "（空）"
+            )
 
         unknown = sorted(pid for pid in role_mapping if pid not in known_ids)
         if unknown:
@@ -2153,9 +2909,175 @@ class MultiAgentOrchestrator:
         cache[participant_id] = (runtime_id, capability)
         return capability
 
-    async def _execute_protocol_action(
-        self, request: ProtocolActionRequest
-    ) -> dict[str, Any]:
+    # --- Context policy -----------------------------------------------------
+
+    @staticmethod
+    def _session_context_facts(
+        agent_session: Any,
+        snapshot: Any,
+    ) -> tuple[str | None, int | None, str, bool]:
+        """``(model_id, context_window, source, verified)`` for one participant.
+
+        Reads only capabilities the runtime actually reported.  An unknown
+        window stays ``None`` -- the resolver treats Unknown as Unknown instead
+        of assuming 32K, which is what used to mis-size large models.
+        """
+
+        from persona_continuum.agent.context_capability import source_is_verified
+        from persona_continuum.numeric import safe_int
+
+        data = getattr(agent_session, "session_data", None)
+        data = data if isinstance(data, dict) else {}
+        snapshot_model = str(getattr(snapshot, "model_id", "") or "") or None
+        model_id: str | None = None
+        capability = data.get("model_capability")
+        if isinstance(capability, dict):
+            model_id = (
+                str(capability.get("id") or capability.get("model_id") or "") or snapshot_model
+            )
+            window = safe_int(capability.get("context_window"), default=None, minimum=1)
+            if window is not None:
+                source = str(
+                    capability.get("source")
+                    or data.get("effective_context_window_source")
+                    or "agent_model_metadata"
+                )
+                return model_id, window, source, source_is_verified(source)
+        for key, default_source in (
+            ("effective_context_window", "agent_model_metadata"),
+            ("native_context_window", "agent_model_metadata"),
+        ):
+            window = safe_int(data.get(key), default=None, minimum=1)
+            if window is not None:
+                source = str(
+                    data.get("effective_context_window_source")
+                    or data.get("context_window_source")
+                    or default_source
+                )
+                verified = bool(data.get("context_verified")) or source_is_verified(source)
+                return model_id or snapshot_model, window, source, verified
+        return model_id or snapshot_model, None, "unknown", False
+
+    def resolve_turn_context_policy(
+        self,
+        state: RoomSessionState,
+        slot: ParticipantSlot,
+        *,
+        agent_session: Any = None,
+        snapshot: Any = None,
+        adapter: Any = None,
+        strategy: str | None = None,
+    ) -> ResolvedContextPolicy:
+        """Resolve how much of THIS participant's model one turn may use.
+
+        Resolution order for the strategy: explicit argument, participant
+        slot, room metadata, global config default.  ``auto`` then decides from
+        the provider, the reported context window, endpoint locality and the
+        model capability.  The result is cached per participant keyed by the
+        capability signature, so a re-bind to another model re-resolves.
+        """
+
+        model_id, window, source, verified = self._session_context_facts(
+            agent_session, snapshot
+        )
+        # Resolution order: explicit argument, participant slot, room metadata,
+        # global config default.  ``auto`` means "no opinion", so it falls
+        # through to the next level instead of pinning the whole room.
+        resolved_strategy = ContextStrategy.AUTO.value
+        for candidate in (
+            strategy,
+            getattr(slot, "context_strategy", None),
+            (state.metadata or {}).get("context_strategy"),
+            self._default_context_strategy,
+        ):
+            normalized = normalize_strategy(candidate)
+            if normalized != ContextStrategy.AUTO.value:
+                resolved_strategy = normalized
+                break
+        base_url = getattr(adapter, "base_url", None) if adapter is not None else None
+        if base_url is None:
+            data = getattr(agent_session, "session_data", None)
+            if isinstance(data, dict):
+                base_url = data.get("base_url")
+        runtime_source = (
+            "openai_compatible_api" if base_url else ("local_cli" if adapter else "unknown")
+        )
+        cache_key = (
+            resolved_strategy,
+            model_id,
+            window,
+            source,
+            bool(base_url),
+            self._local_memory_constrained,
+        )
+        policy_key = (state.id, slot.participant_id)
+        cached = self._turn_context_policies.get(policy_key)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        policy = resolve_context_policy(
+            ContextPolicyRequest(
+                strategy=resolved_strategy,
+                adapter_id=str(getattr(adapter, "adapter_id", "") or ""),
+                runtime_source=runtime_source,
+                base_url=str(base_url) if base_url else None,
+                model_id=model_id,
+                context_window=window,
+                context_window_source=source,
+                context_verified=verified,
+                local_memory_constrained=self._local_memory_constrained,
+                local_profile=self._local_context_profile,
+            )
+        )
+        self._turn_context_policies[policy_key] = (cache_key, policy)
+        self._last_context_policy[policy_key] = policy
+        return policy
+
+    def _room_summary_boundary(self, state: RoomSessionState) -> int:
+        """Conservative eviction boundary for the shared rolling summary.
+
+        The summary is shared by every participant, so it must cover whatever
+        has left the SMALLEST window in the room.  Taking the minimum over the
+        participants' resolved policies is what guarantees no committed turn
+        becomes an orphan (gone from the prompt and never summarised).  With no
+        resolved policy yet, the manager's own (local, smallest) window is the
+        conservative answer.
+        """
+
+        transcript = list(state.transcript or [])
+        boundaries: list[int] = []
+        for slot in state.participants:
+            policy = self._last_context_policy.get((state.id, slot.participant_id))
+            if policy is None:
+                continue
+            boundaries.append(
+                self.context_manager.eviction_boundary(
+                    transcript,
+                    message_window=policy.profile.recent_message_window,
+                    recent_token_budget=policy.profile.recent_dialogue_token_budget,
+                )
+            )
+        if boundaries:
+            return min(boundaries)
+        return self.context_manager.eviction_boundary(transcript)
+
+    def _room_summary_profile(self, state: RoomSessionState) -> ContextProfile | None:
+        """Profile of the *summariser* (the host agent), if it is resolved yet."""
+
+        host_id = state.host_participant_id
+        if host_id:
+            policy = self._last_context_policy.get((state.id, host_id))
+            if policy is not None:
+                return policy.profile
+        room_policies = [
+            policy
+            for (room_id, _), policy in self._last_context_policy.items()
+            if room_id == state.id
+        ]
+        if len(room_policies) == 1:
+            return room_policies[0].profile
+        return None
+
+    async def _execute_protocol_action(self, request: ProtocolActionRequest) -> dict[str, Any]:
         state = self.get_room(request.room_id)
         if not state:
             raise KeyError(request.room_id)
@@ -2171,6 +3093,12 @@ class MultiAgentOrchestrator:
         if binding is None:
             binding = await self.runtime_executor.bind_existing_session(adapter, agent_session)
             self._active_agent_bindings.setdefault(state.id, {})[slot.participant_id] = binding
+        # Protocol turns resolve the same ContextProfile as free turns: a
+        # protocol step on a 1M-context model must not be capped by the local
+        # survival profile either.
+        protocol_policy = self.resolve_turn_context_policy(
+            state, slot, agent_session=agent_session, snapshot=snapshot, adapter=adapter
+        )
 
         recall_started = {
             "event": "recall_started",
@@ -2187,19 +3115,21 @@ class MultiAgentOrchestrator:
             user_message=request.question,
             recent_transcript=state.transcript,
         )
-        memories = (
-            self.continuum.memories.search_memories(
+        # ``None`` -- not ``[]`` -- means "no preset memories".  prepare_turn
+        # treats ``None`` as "run your own search" but ``[]`` as "use zero
+        # memories", so the old ``else []`` silently disabled long-term recall
+        # for every protocol turn the gate did not trigger on.
+        memories: list[Any] | None = None
+        if gate_plan.triggered:
+            memories = self.continuum.memories.search_memories(
                 persona_id=slot.persona_id,
                 query=gate_plan.query,
-                limit=8,
+                limit=protocol_policy.profile.recall_top_k,
                 branch_id="main",
                 include_main_history=True,
                 include_shared_pre_divergence=True,
             )
-            if gate_plan.triggered
-            else []
-        )
-        recall_result = RecallGate.attach_memories(gate_plan, list(memories))
+        recall_result = RecallGate.attach_memories(gate_plan, list(memories or []))
         await self._broadcast_event(
             state.id,
             {
@@ -2218,7 +3148,8 @@ class MultiAgentOrchestrator:
             continuum_session = self.continuum.sessions.start_session(
                 persona_id=slot.persona_id,
                 title=f"Room {state.id} [{slot.participant_id}]",
-                counterpart_id=f"room:{state.id}",
+                counterpart_id=self._runtime_counterpart(state, slot),
+                initial_relationship=slot.initial_relationship,
                 session_type="room_protocol",
                 room_id=state.id,
             )
@@ -2228,9 +3159,12 @@ class MultiAgentOrchestrator:
             persona_id=slot.persona_id,
             session_id=session_id,
             user_message=request.question,
-            counterpart_id=f"room:{state.id}",
+            current_time=state.scene_state.scene_time,
+            counterpart_id=self._runtime_counterpart(state, slot),
             preset_memories=memories,
+            max_context_items=protocol_policy.profile.recall_top_k,
         )
+        self._attach_relationship_context(state, slot, prepared)
         kernel = (
             self.kernel_cache.get_or_build(
                 prepared, display_name=slot.display_name or slot.persona_id
@@ -2249,6 +3183,7 @@ class MultiAgentOrchestrator:
             room_topic=state.topic,
             kernel=kernel,
             context_mode="windowed",
+            scene_state=state.scene_state,
         )
         # The protocol path advertises exactly what _execute_tool below will
         # accept: availability intersected with this action's permissions.
@@ -2265,9 +3200,7 @@ class MultiAgentOrchestrator:
         case_state_block = task_context.pop("case_state", None)
         stage_instruction = str(task_context.pop("stage_instruction", "") or "")
         special_task = {
-            key: value
-            for key, value in task_context.items()
-            if key != "independent_first"
+            key: value for key, value in task_context.items() if key != "independent_first"
         }
         capability = self._resolve_transport_capability(
             state.id, slot.participant_id, adapter, snapshot.agent_runtime_id
@@ -2286,6 +3219,15 @@ class MultiAgentOrchestrator:
                 packed_budget - self._SYNTHESIS_REPAIR_RESERVE_BYTES,
             )
         stored_summary = state.metadata.get("rolling_summary")
+        # ``is_canonical_summary`` only ever accepts a non-empty string, so the
+        # coercion is a no-op that keeps the packed section typed as ``str``.
+        canonical_summary = (
+            str(stored_summary)
+            if is_canonical_summary(
+                stored_summary, state.metadata.get("rolling_summary_version")
+            )
+            else ""
+        )
         packed = ContextPacker(capability, budget_bytes=packed_budget).pack(
             system=system_prompt,
             current_task={
@@ -2300,10 +3242,9 @@ class MultiAgentOrchestrator:
             shared_context=request.room_context,
             recent_dialogue=request.conversation_context,
             # Durable rolling summary (may be absent); the packer skips the
-            # section when empty.
-            room_summary=(
-                stored_summary if isinstance(stored_summary, str) and stored_summary else ""
-            ),
+            # section when empty.  Legacy evidence dumps are not canonical and
+            # are excluded above.
+            room_summary=canonical_summary,
         )
         packed_payload = packed.payload()
         # The system section (identity kernel + constraints + tools) keeps
@@ -2394,9 +3335,7 @@ class MultiAgentOrchestrator:
             if isinstance(exc, AgentCancelledError) or not exc.retriable:
                 raise
             restarted = await self.restart_session(state.id, slot.participant_id)
-            retry_binding = self._active_agent_bindings.get(state.id, {}).get(
-                slot.participant_id
-            )
+            retry_binding = self._active_agent_bindings.get(state.id, {}).get(slot.participant_id)
             if not restarted or retry_binding is None:
                 raise
             await self._broadcast_event(
@@ -2473,11 +3412,7 @@ class MultiAgentOrchestrator:
             # from the clarification ask, else from the problem definition.
             output.setdefault(
                 "content",
-                str(
-                    output.get("clarification_question")
-                    or output.get("problem_definition")
-                    or ""
-                ),
+                str(output.get("clarification_question") or output.get("problem_definition") or ""),
             )
         # Only analysis/synthesis are persona-facing public answers worth
         # remembering; routing/review/rebuttal/host_analysis/vote live on as
@@ -2489,8 +3424,9 @@ class MultiAgentOrchestrator:
                 session_id=session_id,
                 user_message=request.question,
                 persona_response=public_text,
+                occurred_at=prepared.current_time,
                 used_memory_ids=[memory.id for memory in recall_result.memories],
-                counterpart_id=f"room:{state.id}",
+                counterpart_id=self._runtime_counterpart(state, slot),
             )
             output.setdefault("turn_id", commit.get("turn_id"))
         await self._broadcast_event(
@@ -2826,6 +3762,28 @@ class MultiAgentOrchestrator:
         injection_type: str = "external_information",
         client_message_id: str | None = None,
         attachment_ids: list[str] | None = None,
+        input_mode: str = "speech",
+    ) -> dict[str, Any]:
+        lock = self._room_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            return await self._inject_message_locked(
+                room_id,
+                content,
+                injection_type,
+                client_message_id,
+                attachment_ids,
+                input_mode=input_mode,
+            )
+
+    async def _inject_message_locked(
+        self,
+        room_id: str,
+        content: str,
+        injection_type: str = "external_information",
+        client_message_id: str | None = None,
+        attachment_ids: list[str] | None = None,
+        _schedule_reply: bool = True,
+        input_mode: str = "speech",
     ) -> dict[str, Any]:
         state = self.get_room(room_id)
         if not state:
@@ -2835,7 +3793,7 @@ class MultiAgentOrchestrator:
                 f"Room injection requires ready/discussing/paused status, got {state.status.value}"
             )
         attachments = self._resolve_inject_attachments(room_id, attachment_ids or [])
-        message = content.strip()
+        message = str(redact_secrets(content)).strip()
         if not message and not attachments:
             raise ValueError("Injected room message cannot be empty")
 
@@ -2886,15 +3844,65 @@ class MultiAgentOrchestrator:
             "commit_status": "user_injected",
             "created_at": datetime.now(UTC).isoformat(),
         }
-        if attachments:
-            entry["attachments"] = attachments
-            entry["metadata"] = {"injection_type": injection_type, "attachments": attachments}
-        state.transcript.append(entry)
-        state.metadata.setdefault("injections", []).append(entry)
-        state.updated_at = datetime.now(UTC)
-        # Persist the injection into the event store as well, so history
-        # survives the state-snapshot transcript window.
-        with contextlib.suppress(Exception):
+        if input_mode == "time":
+            parsed_time = parse_temporal_input(
+                message,
+                reference_time=state.scene_state.scene_time,
+                timezone_str=state.scene_state.timezone,
+            )
+            old_time = state.scene_state.scene_time
+            state.scene_state.scene_time = parsed_time.target_scene_time or (
+                old_time + timedelta(seconds=parsed_time.seconds)
+            )
+            state.scene_state.elapsed_since_last_interaction = max(
+                0.0, (state.scene_state.scene_time - old_time).total_seconds()
+            )
+            state.scene_state.last_interaction_scene_time = state.scene_state.scene_time
+            state.scene_state.last_interaction_wall_time = datetime.now(UTC)
+
+            for p in state.participants:
+                with contextlib.suppress(Exception):
+                    self.continuum.affect.get_emotions(
+                        p.persona_id, now=state.scene_state.scene_time
+                    )
+                    self.continuum.motivation.get_needs(
+                        p.persona_id, now=state.scene_state.scene_time
+                    )
+                    self.continuum.motivation.update_needs(
+                        p.persona_id,
+                        {},
+                        "scene_time_elapsed",
+                        now=state.scene_state.scene_time,
+                        commit=False,
+                    )
+            self.continuum.database.conn.commit()
+
+            time_event = SceneEvent(
+                id=f"scene:{room_id}:{turn_id}:tadv",
+                room_id=room_id,
+                source_turn_id=turn_id,
+                actor="user",
+                type="time_advance",
+                payload={
+                    "intent": parsed_time.kind,
+                    "seconds": parsed_time.seconds,
+                    "previous_scene_time": old_time.isoformat(),
+                    "current_scene_time": state.scene_state.scene_time.isoformat(),
+                    "description": parsed_time.description,
+                },
+                scene_time=state.scene_state.scene_time,
+                created_at=datetime.now(UTC),
+            )
+            state.scene_state.recent_events = (state.scene_state.recent_events + [time_event])[-30:]
+            entry["content"] = parsed_time.description
+            entry["spoken_text"] = ""
+            entry["input_mode"] = "time"
+            entry["actions"] = []
+            entry["scene_events"] = [time_event.model_dump(mode="json")]
+            entry["scene_time"] = state.scene_state.scene_time.isoformat()
+            state.transcript.append(entry)
+            state.metadata.setdefault("injections", []).append(entry)
+            state.updated_at = datetime.now(UTC)
             self._save_transcript_record(
                 RoomTranscriptRecord(
                     id=new_id("rturn"),
@@ -2904,16 +3912,69 @@ class MultiAgentOrchestrator:
                     persona_id="user",
                     speaker_name="User",
                     agent_runtime_id="",
-                    content=message,
+                    content=parsed_time.description,
                     commit_status="user_injected",
-                    metadata=(
-                        {"injection_type": injection_type, "attachments": attachments}
-                        if attachments
-                        else {"injection_type": injection_type}
-                    ),
+                    metadata={
+                        "injection_type": injection_type,
+                        "channels": {
+                            "raw_content": message,
+                            "spoken_text": "",
+                            "input_mode": "time",
+                            "actions": [],
+                            "scene_events": [time_event.model_dump(mode="json")],
+                            "scene_time": state.scene_state.scene_time.isoformat(),
+                        },
+                    },
                     created_at=datetime.now(UTC),
                 )
             )
+            self._save_room_state(state, force=True)
+            event = {"event": "room_message_injected", "room_id": room_id, "message": entry}
+            await self._broadcast_event(room_id, event)
+            return event
+        else:
+            channels, scene_events = SceneRuntime().accept_turn(
+                state.scene_state,
+                room_id=room_id,
+                turn_id=turn_id,
+                actor="user",
+                raw_content=message,
+                input_mode=input_mode,
+            )
+            entry.update(channels.model_dump(mode="json"))
+            entry["scene_time"] = state.scene_state.scene_time.isoformat()
+            if attachments:
+                entry["attachments"] = attachments
+                entry["metadata"] = {"injection_type": injection_type, "attachments": attachments}
+            state.transcript.append(entry)
+            state.metadata.setdefault("injections", []).append(entry)
+            state.updated_at = datetime.now(UTC)
+        # Persist the injection into the event store as well, so history
+        # survives the state-snapshot transcript window.
+        self._save_transcript_record(
+            RoomTranscriptRecord(
+                id=new_id("rturn"),
+                room_id=room_id,
+                turn_id=turn_id,
+                participant_id="user",
+                persona_id="user",
+                speaker_name="User",
+                agent_runtime_id="",
+                content=message,
+                commit_status="user_injected",
+                metadata=(
+                    {
+                        "injection_type": injection_type,
+                        "attachments": attachments,
+                        "channels": {
+                            **channels.model_dump(mode="json"),
+                            "scene_time": state.scene_state.scene_time.isoformat(),
+                        },
+                    }
+                ),
+                created_at=datetime.now(UTC),
+            )
+        )
         self._save_room_state(state, force=True)
         event = {"event": "room_message_injected", "room_id": room_id, "message": entry}
         await self._broadcast_event(room_id, event)
@@ -2922,7 +3983,7 @@ class MultiAgentOrchestrator:
         # protocol rooms advance through RoomProtocolRuntime only.  Injection
         # has already been persisted, so a failure to start a run must never
         # be reported as a failed message save.
-        if state.status == RoomStatus.READY:
+        if _schedule_reply and state.status == RoomStatus.READY:
             if state.protocol == RoomProtocolType.FREE_DISCUSSION:
                 if state.mode == RoomMode.AUTONOMOUS:
                     with contextlib.suppress(Exception):
@@ -2956,9 +4017,7 @@ class MultiAgentOrchestrator:
             raise KeyError(room_id)
         raw_bytes = decode_base64_payload(content_base64)
         uploads_root = self.continuum.config.room_uploads_dir
-        record = store_room_attachment(
-            uploads_root, room_id, filename, mime, raw_bytes
-        )
+        record = store_room_attachment(uploads_root, room_id, filename, mime, raw_bytes)
         full = {
             **record,
             "room_id": room_id,
@@ -3051,9 +4110,7 @@ class MultiAgentOrchestrator:
         for item in reversed(transcript or []):
             if item.get("participant_id") != "user":
                 continue
-            attachments = item.get("attachments") or (item.get("metadata") or {}).get(
-                "attachments"
-            )
+            attachments = item.get("attachments") or (item.get("metadata") or {}).get("attachments")
             if attachments:
                 return [dict(a) for a in attachments if isinstance(a, dict)]
             if str(item.get("content") or "").strip():
@@ -3089,9 +4146,7 @@ class MultiAgentOrchestrator:
                 mime_type=str(item.get("mime") or "application/octet-stream"),
                 filename=str(item.get("filename") or "attachment"),
                 size_bytes=int(item.get("size") or 0),
-                local_path=str(
-                    self.continuum.config.room_uploads_dir / room_id / stored
-                ),
+                local_path=str(self.continuum.config.room_uploads_dir / room_id / stored),
                 url=str(item.get("url") or ""),
             )
             canonical.append(record.model_dump(mode="python"))
@@ -3120,14 +4175,14 @@ class MultiAgentOrchestrator:
             if not full or not stored:
                 continue
             try:
-                path = self.continuum.config.room_uploads_dir / str(
-                    full.get("room_id") or state.id
-                ) / str(stored)
+                path = (
+                    self.continuum.config.room_uploads_dir
+                    / str(full.get("room_id") or state.id)
+                    / str(stored)
+                )
                 from persona_continuum.security.paths import ensure_child_path
 
-                data = ensure_child_path(
-                    self.continuum.config.room_uploads_dir, path
-                ).read_bytes()
+                data = ensure_child_path(self.continuum.config.room_uploads_dir, path).read_bytes()
             except Exception:
                 continue
             import base64
@@ -3145,9 +4200,7 @@ class MultiAgentOrchestrator:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{image['media_type']};base64,{image['data']}"
-                    },
+                    "image_url": {"url": f"data:{image['media_type']};base64,{image['data']}"},
                 }
             )
         return [{"role": "user", "content": content}], inline
@@ -3410,9 +4463,7 @@ class MultiAgentOrchestrator:
             return False
         host_snapshot = state.binding_snapshots.get(host_slot.participant_id)
         host_adapter = (
-            self.registry.get_adapter(host_snapshot.agent_runtime_id)
-            if host_snapshot
-            else None
+            self.registry.get_adapter(host_snapshot.agent_runtime_id) if host_snapshot else None
         )
         if not (host_snapshot and host_adapter):
             return False
@@ -3606,6 +4657,10 @@ class MultiAgentOrchestrator:
             warmup_task.cancel()
         self._tool_preflight.pop(room_id, None)
         self._transport_capabilities.pop(room_id, None)
+        for key in [k for k in self._turn_context_policies if k[0] == room_id]:
+            self._turn_context_policies.pop(key, None)
+        for key in [k for k in self._last_context_policy if k[0] == room_id]:
+            self._last_context_policy.pop(key, None)
 
         # Close all active sessions
         sessions = self._active_agent_sessions.pop(room_id, {})
@@ -3706,7 +4761,8 @@ class MultiAgentOrchestrator:
                 new_sess = self.continuum.sessions.start_session(
                     persona_id=slot.persona_id,
                     title=f"Room {room_id} [{slot.participant_id}]",
-                    counterpart_id=f"room:{room_id}",
+                    counterpart_id=self._runtime_counterpart(state, slot),
+                    initial_relationship=slot.initial_relationship,
                     session_type="multi_agent_room",
                     room_id=room_id,
                 )
@@ -3744,9 +4800,7 @@ class MultiAgentOrchestrator:
     # runtime reset, final participant validation and protocol_converted
     # audit of convert_room_protocol breaks the migration contract.  Any
     # change goes through POST /api/rooms/{id}/protocol/convert instead.
-    _NON_PATCHABLE_ROOM_FIELDS: frozenset[str] = frozenset(
-        {"protocol", "protocol_config"}
-    )
+    _NON_PATCHABLE_ROOM_FIELDS: frozenset[str] = frozenset({"protocol", "protocol_config"})
 
     def update_room(self, room_id: str, patch: dict[str, Any]) -> RoomSessionState:
         rejected = sorted(set(patch) & self._NON_PATCHABLE_ROOM_FIELDS)
@@ -3797,12 +4851,8 @@ class MultiAgentOrchestrator:
                 )
         return rooms
 
-    def delete_room(self, room_id: str) -> bool:
-        self.continuum.database.conn.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
-        self.continuum.database.conn.execute(
-            "DELETE FROM room_transcripts WHERE room_id = ?", (room_id,)
-        )
-        self.continuum.database.conn.commit()
+    def forget_room_runtime(self, room_id: str) -> None:
+        """Drop in-process room handles after the SQL row is already gone."""
         self._active_agent_sessions.pop(room_id, None)
         self._active_agent_bindings.pop(room_id, None)
         self._persona_session_ids.pop(room_id, None)
@@ -3824,11 +4874,39 @@ class MultiAgentOrchestrator:
         summary_task = self._summary_tasks.pop(room_id, None)
         if summary_task and not summary_task.done():
             summary_task.cancel()
+        # Episode rows are memory, not runtime: cancelling the task must never
+        # delete them.  A cancelled consolidation stays PENDING and is resumed
+        # by the next schedule, a restart, or the backfill sweep.
+        episode_task = self._episode_tasks.pop(room_id, None)
+        if episode_task and not episode_task.done():
+            episode_task.cancel()
         warmup_task = self._tool_warmup_tasks.pop(room_id, None)
         if warmup_task and not warmup_task.done():
             warmup_task.cancel()
         self._tool_preflight.pop(room_id, None)
         self._transport_capabilities.pop(room_id, None)
+        for key in [k for k in self._turn_context_policies if k[0] == room_id]:
+            self._turn_context_policies.pop(key, None)
+        for key in [k for k in self._last_context_policy if k[0] == room_id]:
+            self._last_context_policy.pop(key, None)
+
+    def delete_room(self, room_id: str) -> bool:
+        self.continuum.database.conn.execute(
+            "DELETE FROM room_scene_events WHERE room_id = ?", (room_id,)
+        )
+        self.continuum.database.conn.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+        self.continuum.database.conn.execute(
+            "DELETE FROM room_transcripts WHERE room_id = ?", (room_id,)
+        )
+        self.continuum.database.conn.commit()
+        # Episodes are persona memory and survive a room deletion, but the
+        # shared-user provenance they recorded inside this room is gone.  Say so
+        # explicitly instead of leaving it silently unresolvable.
+        episodes = getattr(self.continuum, "episodes", None)
+        if episodes is not None:
+            with contextlib.suppress(Exception):
+                episodes.mark_room_sources_unavailable(room_id)
+        self.forget_room_runtime(room_id)
         return True
 
     async def shutdown(self) -> None:
@@ -3842,6 +4920,10 @@ class MultiAgentOrchestrator:
             if not task.done():
                 task.cancel()
         self._direct_reply_tasks.clear()
+        for task in list(self._episode_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._episode_tasks.clear()
         for task in list(self._tool_warmup_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -3856,6 +4938,10 @@ class MultiAgentOrchestrator:
             if not task.done():
                 task.cancel()
         self._direct_reply_tasks.clear()
+        for task in list(self._episode_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._episode_tasks.clear()
         for task in list(self._tool_warmup_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -3902,9 +4988,7 @@ class MultiAgentOrchestrator:
         """
 
         conn = self.continuum.database.conn
-        cursor = conn.execute(
-            "DELETE FROM room_transcripts WHERE room_id = ?", (room_id,)
-        )
+        cursor = conn.execute("DELETE FROM room_transcripts WHERE room_id = ?", (room_id,))
         removed = int(cursor.rowcount or 0)
         state = self.get_room(room_id)
         if state is not None:
@@ -3955,6 +5039,31 @@ class MultiAgentOrchestrator:
         mode = str(session.session_data.get("mode") or "")
         return mode not in {"cli_exec_fallback", "exec", "oneshot"}
 
+    def _should_refresh_room_summary(self, state: RoomSessionState) -> bool:
+        """Whether this room needs a (re)built rolling summary right now.
+
+        The first summary is produced as soon as dialogue leaves the recent
+        window -- waiting for ``2 * raw_window`` turns left the prompt without a
+        summary for the whole gap.  Afterwards it refreshes on the configured
+        cadence.  A legacy or non-canonical stored value does not count as
+        "already has one", so it gets replaced instead of trusted.
+
+        The boundary is the SMALLEST window start in the room (token-budget
+        based), so no committed turn can leave every participant's window
+        without being folded into the shared summary.
+        """
+
+        stored = state.metadata.get("rolling_summary")
+        has_summary = is_canonical_summary(
+            stored, state.metadata.get("rolling_summary_version")
+        )
+        return self.context_manager.should_update_summary(
+            state.turn_index,
+            transcript_len=len(state.transcript or []),
+            has_summary=has_summary,
+            eviction_boundary=self._room_summary_boundary(state),
+        )
+
     def _schedule_room_summary(self, state: RoomSessionState, *, persistent: bool) -> None:
         """Queue a background rolling-summary refresh (never blocks a turn).
 
@@ -3965,7 +5074,7 @@ class MultiAgentOrchestrator:
         """
         if persistent:
             return
-        if not self.context_manager.should_update_summary(state.turn_index):
+        if not self._should_refresh_room_summary(state):
             return
         existing = self._summary_tasks.get(state.id)
         if existing is not None and not existing.done():
@@ -3989,7 +5098,7 @@ class MultiAgentOrchestrator:
 
         if persistent:
             return
-        if not self.context_manager.should_update_summary(state.turn_index):
+        if not self._should_refresh_room_summary(state):
             return
         host_session = self._host_agent_sessions.get(state.id)
         host_binding = self._host_agent_bindings.get(state.id)
@@ -4002,6 +5111,11 @@ class MultiAgentOrchestrator:
             return
 
         async def _summarize(payload: dict[str, Any], schema: dict[str, Any]) -> Any:
+            # Last check before spending a full model pass: if a turn went live
+            # while we were queuing, back off rather than compete for the GPU.
+            latest = self.get_room(state.id)
+            if latest is not None and latest.status == RoomStatus.DISCUSSING:
+                raise RuntimeError("room busy; deferring summary refresh")
             result = await executor.execute_structured(
                 host_binding,
                 system_prompt=SUMMARY_PROMPT_INTRO,
@@ -4011,18 +5125,465 @@ class MultiAgentOrchestrator:
             )
             return result.value
 
-        try:
-            previous = state.metadata.get("rolling_summary")
-            summary = await self.context_manager.update_summary(
-                transcript=list(state.transcript or []),
-                previous_summary=previous if isinstance(previous, str) else None,
-                summarize=_summarize,
+        # Hold the single-flight lock for the whole summary pass so a live turn
+        # cannot start its own prefill mid-summary.
+        async with self._summary_inference_lock:
+            # Re-read the room INSIDE the lock: the snapshot this task was
+            # created with may be many turns old (the call takes minutes, and a
+            # turn preempts it), and folding a stale eviction boundary would
+            # summarise the wrong slice and then overwrite newer state.
+            latest = self.get_room(state.id)
+            if latest is None or latest.status == RoomStatus.DISCUSSING:
+                return
+            previous = latest.metadata.get("rolling_summary")
+            checkpoint = latest.metadata.get("rolling_summary_through_message_index")
+            summary_profile = self._room_summary_profile(latest)
+            try:
+                summary, new_checkpoint, summary_report = (
+                    await self.context_manager.update_summary(
+                        transcript=list(latest.transcript or []),
+                        previous_summary=previous if isinstance(previous, str) else None,
+                        summarize=_summarize,
+                        checkpoint=(
+                            int(checkpoint) if isinstance(checkpoint, int) else None
+                        ),
+                        # The eviction boundary is the smallest window start in
+                        # the room; the summary caps belong to the summariser
+                        # (the host agent), not to whoever spoke last.
+                        eviction_boundary=self._room_summary_boundary(latest),
+                        summary_max_chars=(
+                            summary_profile.summary_max_chars if summary_profile else None
+                        ),
+                        summary_output_max_tokens=(
+                            summary_profile.summary_output_max_tokens
+                            if summary_profile
+                            else None
+                        ),
+                        summary_input_max_tokens=(
+                            summary_profile.summary_input_max_tokens
+                            if summary_profile
+                            else None
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                summary_report = {"reason": f"update_summary_failed:{type(exc).__name__}"}
+                summary, new_checkpoint = None, None
+            summary_report.update(
+                {
+                    "event": "room_summary_report",
+                    "room_id": state.id,
+                    "turn_index": latest.turn_index,
+                }
             )
-        except Exception:
+            _metadata_trace_logger.warning(
+                "room_summary_report %s",
+                json.dumps(
+                    {k: v for k, v in summary_report.items() if k != "event"},
+                    ensure_ascii=False,
+                ),
+            )
+            await self._broadcast_event(state.id, summary_report)
+            # Persist inside the lock: writing after releasing it lets a turn's
+            # own state save land in between and drop the freshly built summary
+            # (observed: a valid v2 summary disappeared at the next turn).
+            if summary:
+                # A background summary must not overwrite newer dialogue or scene time.
+                latest = self.get_room(state.id)
+                if latest is not None:
+                    latest.metadata["rolling_summary"] = summary
+                    latest.metadata["rolling_summary_version"] = CANONICAL_SUMMARY_VERSION
+                    # Stamp the write so the merge in _save_room_state can tell a
+                    # fresh summary from one an older snapshot is reverting.
+                    latest.metadata["rolling_summary_updated_at"] = datetime.now(
+                        UTC
+                    ).isoformat()
+                    if isinstance(new_checkpoint, int):
+                        latest.metadata[
+                            "rolling_summary_through_message_index"
+                        ] = new_checkpoint
+                    self._save_room_state(latest, force=True)
+
+    # --- Memory Episodes (Phase 3) ------------------------------------------
+
+    @staticmethod
+    def _shared_user_turn(state: RoomSessionState) -> dict[str, Any] | None:
+        """The room-level user message this turn is answering, if any.
+
+        In a multi-persona room the user speaks ONCE and several personas may
+        answer.  That single raw turn must be reachable from every persona's
+        Episode instead of being invisible to all of them -- without copying it
+        per persona.  The newest user entry is the shared trigger until the user
+        speaks again.
+        """
+
+        for entry in reversed(state.transcript or []):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("participant_id") or "") != "user":
+                continue
+            turn_id = str(entry.get("turn_id") or "").strip()
+            if not turn_id:
+                continue
+            created = entry.get("scene_time") or entry.get("created_at")
+            occurred = parse_dt(str(created)) if created else None
+            return {
+                "turn_id": turn_id,
+                "text": str(entry.get("content") or ""),
+                "occurred_at": occurred,
+            }
+        return None
+
+    def _episode_summariser_binding(self, state: RoomSessionState) -> Any:
+        """A model binding that may summarise this room's Episodes.
+
+        The host agent is the neutral summariser and is preferred.  A
+        direct-chat room has no host, so the single participant's binding is
+        used instead -- the same persona that lived the episode is the one
+        asking itself what happened, which is exactly what a person does.
+        """
+
+        host_binding = self._host_agent_bindings.get(state.id)
+        if host_binding is not None:
+            return host_binding
+        bindings = self._active_agent_bindings.get(state.id, {})
+        for participant_id in sorted(bindings):
+            return bindings[participant_id]
+        return None
+
+    def _memory_backlog_pending(self, room_id: str) -> bool:
+        """Whether ANY memory layer still owes work for this room.
+
+        Opening a room is the natural moment to work through a backlog that was
+        recorded in an earlier process, and the backlog is now three layers
+        deep: Episodes, Facts, and Active Threads.  Checking only Episodes would
+        leave already-summarised Episodes owing facts/threads untouched forever.
+        """
+
+        episodes = getattr(self.continuum, "episodes", None)
+        facts = getattr(self.continuum, "facts", None)
+        threads = getattr(self.continuum, "threads", None)
+        if episodes is not None and episodes.pending_episodes(room_id=room_id, limit=1):
+            return True
+        if facts is not None and facts.pending_extraction_episodes(room_id=room_id, limit=1):
+            return True
+        return bool(
+            threads is not None
+            and threads.pending_resolution_episodes(room_id=room_id, limit=1)
+        )
+
+    def _schedule_episode_consolidation(
+        self, state: RoomSessionState, commit_res: dict[str, Any] | None = None
+    ) -> None:
+        """Queue Episode summarisation for this room.  Never blocks the reply.
+
+        The turn is already committed and the Episode row already exists, so
+        this only decides whether to *describe* what was just recorded.  A
+        failure here cannot lose anything: the Episode keeps
+        ``pending_consolidation`` and the next schedule (or a restart, or the
+        backfill sweep) retries it.
+
+        Called with ``commit_res=None`` when a room is reopened: an old room can
+        owe summaries for episodes recorded in an earlier process, and opening
+        it is the natural moment to work through them.
+        """
+
+        config = getattr(self.continuum, "config", None)
+        if not bool(getattr(config, "memory_episode_consolidation_enabled", True)):
             return
-        if summary:
-            state.metadata["rolling_summary"] = summary
-            self._save_room_state(state, force=True)
+        episodes = getattr(self.continuum, "episodes", None)
+        if episodes is None or self.runtime_executor is None:
+            return
+        if commit_res is not None:
+            report = commit_res.get("episode") if isinstance(commit_res, dict) else None
+            if not isinstance(report, dict) or not report.get("current_episode_id"):
+                return
+        elif not self._memory_backlog_pending(state.id):
+            return
+        existing = self._episode_tasks.get(state.id)
+        if existing is not None and not existing.done():
+            return
+        self._episode_tasks[state.id] = asyncio.create_task(
+            self._maybe_consolidate_episodes(state),
+            name=f"room-episodes-{state.id}",
+        )
+
+    async def _maybe_consolidate_episodes(self, state: RoomSessionState) -> None:
+        """One bounded background pass over this room's memory layer.
+
+        Two derived layers are produced here, in order, each a separate model
+        call: the Episode summary (Phase 3) and then Semantic Facts (Phase 4).
+        Both are one-inference-at-a-time on purpose -- a memory-bound local
+        runtime must never see two concurrent prefills.
+        """
+
+        episodes = getattr(self.continuum, "episodes", None)
+        if episodes is None or self.runtime_executor is None:
+            return
+        binding = self._episode_summariser_binding(state)
+        if binding is None:
+            return
+        executor = self.runtime_executor
+        config = getattr(self.continuum, "config", None)
+        batch = max(1, int(getattr(config, "memory_episode_consolidation_batch", 3) or 3))
+
+        async def _summarize(payload: dict[str, Any], schema: dict[str, Any]) -> Any:
+            from persona_continuum.application.episode_service import EPISODE_SUMMARY_INTRO
+
+            result = await executor.execute_structured(
+                binding,
+                system_prompt=EPISODE_SUMMARY_INTRO,
+                user_message=json.dumps(payload, ensure_ascii=False),
+                schema=schema,
+                phase="memory_episode_consolidation",
+            )
+            return result.value
+
+        for episode in episodes.pending_episodes(room_id=state.id, limit=batch):
+            # Same rule as the rolling summary: never compete with a live turn
+            # for the model.  On a memory-bound local runtime two concurrent
+            # prefills are exactly the failure mode this must avoid.
+            latest = self.get_room(state.id)
+            if latest is not None and latest.status == RoomStatus.DISCUSSING:
+                return
+            async with self._summary_inference_lock:
+                try:
+                    report = await episodes.consolidate_episode(
+                        episode.id,
+                        summarize=_summarize,
+                        allow_open=episode.status is EpisodeStatus.OPEN,
+                    )
+                except Exception as exc:  # noqa: BLE001 - background work
+                    report = {
+                        "episode_id": episode.id,
+                        "action": "noop",
+                        "error": f"consolidation_failed:{type(exc).__name__}",
+                        "pending": True,
+                    }
+            report.update(
+                {
+                    "event": "memory_consolidation_report",
+                    "room_id": state.id,
+                    "turn_index": state.turn_index,
+                    "episode_status": str(
+                        getattr(episodes.get_episode(episode.id), "status", "")
+                    ),
+                }
+            )
+            _metadata_trace_logger.warning(
+                "memory_consolidation_report %s",
+                json.dumps(
+                    {k: v for k, v in report.items() if k != "event"},
+                    ensure_ascii=False,
+                ),
+            )
+            await self._broadcast_event(state.id, report)
+
+        # Phase 4: distill Semantic Facts from the same raw sources.  This runs
+        # even when the summary is still pending -- facts come from the
+        # transcript, not from a summary of it.
+        facts = getattr(self.continuum, "facts", None)
+        if facts is None or not bool(
+            getattr(config, "memory_fact_extraction_enabled", True)
+        ):
+            return
+        fact_batch = max(1, int(getattr(config, "memory_fact_extraction_batch", 3) or 3))
+
+        async def _extract(payload: dict[str, Any], schema: dict[str, Any]) -> Any:
+            from persona_continuum.application.fact_service import FACT_EXTRACTION_INTRO
+
+            result = await executor.execute_structured(
+                binding,
+                system_prompt=FACT_EXTRACTION_INTRO,
+                user_message=json.dumps(payload, ensure_ascii=False),
+                schema=schema,
+                phase="memory_fact_extraction",
+            )
+            return result.value
+
+        for episode in facts.pending_extraction_episodes(room_id=state.id, limit=fact_batch):
+            latest = self.get_room(state.id)
+            if latest is not None and latest.status == RoomStatus.DISCUSSING:
+                return
+            async with self._summary_inference_lock:
+                try:
+                    fact_report = await facts.extract_episode_facts(
+                        episode.id, extract=_extract
+                    )
+                except Exception as exc:  # noqa: BLE001 - background work
+                    fact_report = {
+                        "episode_id": episode.id,
+                        "action": "noop",
+                        "error": f"fact_extraction_failed:{type(exc).__name__}",
+                        "pending": True,
+                    }
+            fact_report.update(
+                {
+                    "event": "memory_fact_report",
+                    "room_id": state.id,
+                    "turn_index": state.turn_index,
+                }
+            )
+            _metadata_trace_logger.warning(
+                "memory_fact_report %s",
+                json.dumps(
+                    {k: v for k, v in fact_report.items() if k != "event"},
+                    ensure_ascii=False,
+                ),
+            )
+            await self._broadcast_event(state.id, fact_report)
+
+        # Phase 5: resolve what is still in flight.  Runs LAST because it reads
+        # both the Episode's raw sources and the Facts just distilled from them.
+        # Like the layers above it, it never blocks a reply: a failure leaves the
+        # Episode's durable status pending and the next pass retries it.
+        threads = getattr(self.continuum, "threads", None)
+        if threads is None or not bool(
+            getattr(config, "memory_thread_resolution_enabled", True)
+        ):
+            return
+        thread_batch = max(
+            1, int(getattr(config, "memory_thread_resolution_batch", 2) or 2)
+        )
+
+        async def _resolve_threads(payload: dict[str, Any], schema: dict[str, Any]) -> Any:
+            from persona_continuum.application.thread_service import (
+                THREAD_RESOLUTION_INTRO,
+            )
+
+            result = await executor.execute_structured(
+                binding,
+                system_prompt=THREAD_RESOLUTION_INTRO,
+                user_message=json.dumps(payload, ensure_ascii=False),
+                schema=schema,
+                phase="memory_thread_resolution",
+            )
+            return result.value
+
+        for episode in threads.pending_resolution_episodes(
+            room_id=state.id, limit=thread_batch
+        ):
+            latest = self.get_room(state.id)
+            if latest is not None and latest.status == RoomStatus.DISCUSSING:
+                return
+            async with self._summary_inference_lock:
+                try:
+                    thread_report = await threads.resolve_episode_threads(
+                        episode.id, resolve=_resolve_threads
+                    )
+                except Exception as exc:  # noqa: BLE001 - background work
+                    thread_report = {
+                        "episode_id": episode.id,
+                        "action": "noop",
+                        "error": f"thread_resolution_failed:{type(exc).__name__}",
+                        "pending": True,
+                    }
+            thread_report.update(
+                {
+                    "event": "memory_thread_report",
+                    "room_id": state.id,
+                    "turn_index": state.turn_index,
+                }
+            )
+            _metadata_trace_logger.warning(
+                "memory_thread_report %s",
+                json.dumps(
+                    {k: v for k, v in thread_report.items() if k != "event"},
+                    ensure_ascii=False,
+                ),
+            )
+            await self._broadcast_event(state.id, thread_report)
+        # Silence downgrades a thread to STALE and never resolves it, so this
+        # sweep is a bounded, model-free UPDATE and not a judgment call.
+        threads.sweep_stale(limit=50)
+
+        # Phase 6: fold the Episodes just resolved into Chapters, and work the
+        # Chapter / Long-term backlog.  Grouping is deterministic and cheap;
+        # only the consolidation below spends a model call, and only on a
+        # summary that is actually owed.
+        hierarchies = getattr(self.continuum, "hierarchies", None)
+        if hierarchies is None or not bool(
+            getattr(config, "hierarchy_summary_enabled", True)
+        ):
+            return
+        # Grouping only touches Episodes this room owns, and only those no
+        # Chapter owns yet: a reopened room works its own backlog instead of
+        # re-scanning the database.
+        scopes: set[tuple[str, str, str]] = set()
+        for source_episode in episodes.list_episodes(
+            room_id=state.id, limit=max(8, batch * 8)
+        ):
+            scopes.add(
+                (
+                    source_episode.persona_id,
+                    source_episode.counterpart_id,
+                    source_episode.branch_id,
+                )
+            )
+            hierarchies.assign_episode(source_episode)
+        for persona_id, counterpart_id, branch_id in sorted(scopes):
+            hierarchies.plan_long_term(
+                persona_id=persona_id,
+                counterpart_id=counterpart_id,
+                branch_id=branch_id,
+            )
+
+        async def _summarize_hierarchy(
+            payload: dict[str, Any], schema: dict[str, Any]
+        ) -> Any:
+            from persona_continuum.application.hierarchy_service import (
+                CHAPTER_SUMMARY_INTRO,
+                LONG_TERM_SUMMARY_INTRO,
+            )
+
+            intro = (
+                LONG_TERM_SUMMARY_INTRO
+                if int((payload.get("summary") or {}).get("level") or 1) > 1
+                else CHAPTER_SUMMARY_INTRO
+            )
+            result = await executor.execute_structured(
+                binding,
+                system_prompt=intro,
+                user_message=json.dumps(payload, ensure_ascii=False),
+                schema=schema,
+                phase="memory_hierarchy_summary",
+            )
+            return result.value
+
+        hierarchy_batch = max(
+            1, int(getattr(config, "hierarchy_consolidation_batch", 1) or 1)
+        )
+        for summary in hierarchies.pending_summaries(room_id=state.id, limit=hierarchy_batch):
+            latest = self.get_room(state.id)
+            if latest is not None and latest.status == RoomStatus.DISCUSSING:
+                return
+            async with self._summary_inference_lock:
+                try:
+                    hierarchy_report = await hierarchies.consolidate_summary(
+                        summary.id, summarize=_summarize_hierarchy
+                    )
+                except Exception as exc:  # noqa: BLE001 - background work
+                    hierarchy_report = {
+                        "summary_id": summary.id,
+                        "action": "noop",
+                        "error": f"hierarchy_summary_failed:{type(exc).__name__}",
+                        "pending": True,
+                    }
+            hierarchy_report.update(
+                {
+                    "event": "memory_hierarchy_report",
+                    "room_id": state.id,
+                    "turn_index": state.turn_index,
+                }
+            )
+            _metadata_trace_logger.warning(
+                "memory_hierarchy_report %s",
+                json.dumps(
+                    {k: v for k, v in hierarchy_report.items() if k != "event"},
+                    ensure_ascii=False,
+                ),
+            )
+            await self._broadcast_event(state.id, hierarchy_report)
 
     def subscribe_events(self, room_id: str) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -4186,7 +5747,103 @@ class MultiAgentOrchestrator:
             with contextlib.suppress(Exception):
                 q.put_nowait(event)
 
+    def _read_room_metadata(self, room_id: str) -> dict[str, Any]:
+        row = self.continuum.database.conn.execute(
+            "SELECT state_json FROM rooms WHERE id = ?", (room_id,)
+        ).fetchone()
+        if not row:
+            return {}
+        try:
+            metadata = (loads(row["state_json"]) or {}).get("metadata")
+        except Exception:
+            return {}
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def _merge_protected_room_metadata(self, state: RoomSessionState) -> None:
+        """Fold asynchronous writers' metadata keys back into this snapshot.
+
+        The database row is the authority for keys owned by background writers
+        (the rolling summary, migration archives).  A snapshot taken before one
+        of those writes must not revert it, so every protected key this snapshot
+        does not carry -- or carries an older revision of -- is adopted from the
+        stored row.  This is a field-level merge, never a whole-object replace.
+        """
+
+        current_metadata = self._read_room_metadata(state.id)
+        if not current_metadata:
+            return
+        incoming = state.metadata if isinstance(state.metadata, dict) else {}
+        protected = _protected_metadata_keys(current_metadata)
+        if not protected:
+            return
+
+        current_stamp = str(current_metadata.get("rolling_summary_updated_at") or "")
+        incoming_stamp = str(incoming.get("rolling_summary_updated_at") or "")
+
+        for key in protected:
+            db_value = current_metadata[key]
+            if key not in incoming:
+                # This snapshot predates the writer that owns the key.
+                incoming[key] = db_value
+                continue
+            if incoming[key] == db_value:
+                continue
+            # Both sides carry a value and they differ: the newer stamp wins,
+            # and a missing stamp counts as older.
+            if current_stamp > incoming_stamp:
+                incoming[key] = db_value
+        state.metadata = incoming
+
+    def _trace_metadata_write(
+        self,
+        state: RoomSessionState,
+        before: dict[str, Any],
+        *,
+        writer: str,
+    ) -> None:
+        """Temporary observability for room-metadata writers (debug only).
+
+        Logs key sets and a (version, length) fingerprint of the rolling
+        summary -- never the summary body.  A version going to None is logged at
+        ERROR because that is a lost-update regression.
+        """
+
+        if not _METADATA_WRITE_TRACE:
+            return
+        after = state.metadata if isinstance(state.metadata, dict) else {}
+        b_ver, b_len = _summary_fingerprint(before)
+        a_ver, a_len = _summary_fingerprint(after)
+        keys_before = sorted(_protected_metadata_keys(before))
+        keys_after = sorted(_protected_metadata_keys(after))
+        if b_ver == a_ver and b_len == a_len and keys_before == keys_after:
+            return
+        _metadata_trace_logger.warning(
+            "room_metadata_write writer=%s room=%s turn_index=%s "
+            "summary_version=%r->%r summary_len=%s->%s protected_keys=%s->%s",
+            writer,
+            state.id,
+            getattr(state, "turn_index", None),
+            b_ver,
+            a_ver,
+            b_len,
+            a_len,
+            keys_before,
+            keys_after,
+        )
+        if b_ver is not None and a_ver is None:
+            _metadata_trace_logger.error(
+                "room_metadata_write LOST SUMMARY writer=%s room=%s turn_index=%s "
+                "(rolling_summary_version %r -> None)",
+                writer,
+                state.id,
+                getattr(state, "turn_index", None),
+                b_ver,
+            )
+
     def _save_room_state(self, state: RoomSessionState, *, force: bool = False) -> None:
+        # Merge-safe: adopt any protected key a background writer has stored
+        # since this snapshot was taken, BEFORE it reaches the cache or the row.
+        self._merge_protected_room_metadata(state)
         # Always keep the in-process mirror authoritative for reads.
         try:
             self._room_state_cache[state.id] = state.model_copy(deep=True)
@@ -4196,7 +5853,7 @@ class MultiAgentOrchestrator:
             now_monotonic = asyncio.get_running_loop().time()
         except RuntimeError:
             now_monotonic = 0.0
-            self._persist_room_state(state)
+            self._persist_room_state(state, writer="save_room_state_sync", merged=True)
             return
         last = self._room_state_last_commit.get(state.id, 0.0)
         if (
@@ -4206,27 +5863,38 @@ class MultiAgentOrchestrator:
         ):
             self._room_state_dirty.add(state.id)
             return
-        self._persist_room_state(state)
+        self._persist_room_state(state, writer="save_room_state", merged=True)
         self._room_state_last_commit[state.id] = now_monotonic
         self._room_state_dirty.discard(state.id)
 
     def flush_room_state(self, room_id: str) -> None:
         """Force a durable write for one room (terminal transitions)."""
 
-        if room_id not in self._room_state_dirty:
-            # Still write the authoritative copy so callers can rely on it.
-            cached = self._room_state_cache.get(room_id)
-            if cached is not None:
-                self._persist_room_state(cached)
-            return
         cached = self._room_state_cache.get(room_id)
-        if cached is not None:
-            self._persist_room_state(cached)
+        if cached is None:
+            return
+        self._merge_protected_room_metadata(cached)
+        self._persist_room_state(cached, writer="flush_room_state", merged=True)
         self._room_state_dirty.discard(room_id)
         with contextlib.suppress(RuntimeError):
             self._room_state_last_commit[room_id] = asyncio.get_running_loop().time()
 
-    def _persist_room_state(self, state: RoomSessionState) -> None:
+    def _persist_room_state(
+        self,
+        state: RoomSessionState,
+        *,
+        writer: str = "unknown",
+        merged: bool = False,
+    ) -> None:
+        if not merged:
+            # Direct callers must get the same protection as _save_room_state.
+            before = self._read_room_metadata(state.id)
+            self._merge_protected_room_metadata(state)
+            self._trace_metadata_write(state, before, writer=writer)
+        elif _METADATA_WRITE_TRACE:
+            self._trace_metadata_write(
+                state, self._read_room_metadata(state.id), writer=writer
+            )
         persona_ids = [p.persona_id for p in state.participants]
         state_dict = state.model_dump(mode="json")
         # The append-only room_transcripts table is the authority for full
@@ -4282,10 +5950,7 @@ class MultiAgentOrchestrator:
         if not records:
             return
         retained = [entry for entry in data.get("transcript") or [] if isinstance(entry, dict)]
-        known_turn_ids = {
-            str(t.turn_id)
-            for t in records
-        }
+        known_turn_ids = {str(t.turn_id) for t in records}
         state_only = [
             entry for entry in retained if str(entry.get("turn_id") or "") not in known_turn_ids
         ]
@@ -4299,6 +5964,7 @@ class MultiAgentOrchestrator:
                 "model_id": t.model_id,
                 "reasoning_effort": t.reasoning_effort,
                 "content": t.content,
+                **(t.metadata.get("channels") or {}),
                 "director_reason": t.director_reason,
                 "recall_ids": t.recall_ids,
                 "commit_status": t.commit_status,
@@ -4314,6 +5980,15 @@ class MultiAgentOrchestrator:
         data["transcript"] = merged
 
     def _save_transcript_record(self, record: RoomTranscriptRecord) -> None:
+        channels = record.metadata.get("channels") or {}
+        for event in channels.get("scene_events", []):
+            if not event.get("id"):
+                continue
+            self.continuum.database.conn.execute(
+                "INSERT OR IGNORE INTO room_scene_events "
+                "(id, room_id, source_turn_id, event_json) VALUES (?, ?, ?, ?)",
+                (event["id"], record.room_id, record.turn_id, dumps(redact_secrets(event))),
+            )
         self.continuum.database.conn.execute(
             """
             INSERT INTO room_transcripts (

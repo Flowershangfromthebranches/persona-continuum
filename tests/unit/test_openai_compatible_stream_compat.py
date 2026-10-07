@@ -91,6 +91,134 @@ async def test_parses_non_sse_json_completion(
 
 
 @pytest.mark.anyio
+async def test_json_object_mode_injects_json_word_into_messages(
+    monkeypatch: pytest.MonkeyPatch, app: PersonaContinuum
+) -> None:
+    app.credentials.create(
+        credential_id="compat-json-word",
+        provider="openai_compatible",
+        api_key="sk-test-json-word",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    adapter = OpenAICompatibleAPIAdapter(
+        adapter_id="api_compat-json-word",
+        name="API: json word",
+        base_url="http://127.0.0.1:11434/v1",
+        credential_manager=app.credentials,
+        credential_id="compat-json-word",
+    )
+    ok = {"choices": [{"delta": {"content": "{\"question\":\"你好\"}"}}]}
+    ok_stream = [f"data: {json.dumps(ok)}\n\n", "data: [DONE]\n\n"]
+    transport = SequenceTransport([httpx.Response(200, stream=MockByteStream(ok_stream))])
+    orig = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    session = await adapter.create_session(
+        AgentSessionConfig(
+            room_id="room_1",
+            participant_id="guided_interview",
+            persona_id="jiang",
+            model_id="qwen3.8-flash",
+        )
+    )
+    events = [
+        event
+        async for event in adapter.send(
+            session,
+            AgentTurn(
+                turn_id="interview",
+                system_prompt="你是 Guided Persona Interview interviewer。只生成问题，不编造答案。",
+                user_message="动态生成一个最能补齐缺口的问题。",
+                expected_output={
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}},
+                },
+            ),
+        )
+    ]
+    assert events[-1].type != AgentEventType.ERROR
+    assert transport.payloads
+    payload = transport.payloads[0]
+    assert payload.get("response_format") == {"type": "json_object"}
+    blob = json.dumps(payload.get("messages") or [], ensure_ascii=False).casefold()
+    assert "json" in blob
+    system = next(
+        message["content"] for message in payload["messages"] if message["role"] == "system"
+    )
+    assert "只生成问题，不编造答案" in system
+    assert '"properties": {"question": {"type": "string"}}' in system
+
+
+@pytest.mark.anyio
+async def test_json_object_400_retries_after_missing_json_word(
+    monkeypatch: pytest.MonkeyPatch, app: PersonaContinuum
+) -> None:
+    app.credentials.create(
+        credential_id="compat-json-400",
+        provider="openai_compatible",
+        api_key="sk-test-json-400",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    adapter = OpenAICompatibleAPIAdapter(
+        adapter_id="api_compat-json-400",
+        name="API: json 400",
+        base_url="http://127.0.0.1:11434/v1",
+        credential_manager=app.credentials,
+        credential_id="compat-json-400",
+    )
+    error_body = (
+        '{"error":{"code":"invalid_parameter_error","message":'
+        "\"'messages' must contain the word 'json' in some form, "
+        "to use 'response_format' of type 'json_object'.\"}}"
+    )
+    ok = {"choices": [{"delta": {"content": "{\"question\":\"ok\"}"}}]}
+    transport = SequenceTransport(
+        [
+            httpx.Response(400, stream=MockByteStream([error_body])),
+            httpx.Response(
+                200, stream=MockByteStream([f"data: {json.dumps(ok)}\n\n", "data: [DONE]\n\n"])
+            ),
+        ]
+    )
+    orig = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    session = await adapter.create_session(
+        AgentSessionConfig(
+            room_id="room_1",
+            participant_id="guided_interview",
+            persona_id="jiang",
+            model_id="qwen3.8-flash",
+        )
+    )
+    events = [
+        event
+        async for event in adapter.send(
+            session,
+            AgentTurn(
+                turn_id="interview",
+                user_message="Hello",
+                expected_output={"type": "object"},
+            ),
+        )
+    ]
+    mentioned = any(
+        "json" in json.dumps(payload.get("messages") or []).casefold()
+        for payload in transport.payloads
+    )
+    assert mentioned
+    assert events[-1].type != AgentEventType.ERROR
+
+
+@pytest.mark.anyio
 async def test_retries_400_then_reads_completion(
     monkeypatch: pytest.MonkeyPatch, app: PersonaContinuum
 ) -> None:

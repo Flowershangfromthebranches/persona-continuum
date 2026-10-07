@@ -1,7 +1,30 @@
 from __future__ import annotations
 
+from persona_continuum.agent.context_capability import default_model_capability_registry
 from persona_continuum.agent.models import ModelCapability, SelectionStrategy
 from persona_continuum.agent.protocols.streaming_json_cli import StreamingJsonCliAdapter
+
+
+def _claude_fallback_model(
+    model_id: str,
+    display_name: str,
+    *,
+    efforts: list[str],
+    default_effort: str,
+    retired: bool = False,
+) -> ModelCapability:
+    record = default_model_capability_registry().lookup(model_id)
+    return ModelCapability(
+        id=model_id,
+        display_name=display_name,
+        provider="anthropic",
+        supported_reasoning_efforts=efforts,
+        default_reasoning_effort=default_effort,
+        context_window=record.native_context_window if record is not None else None,
+        source="official_capability_table",
+        reasoning_selection=SelectionStrategy.STARTUP,
+        selectable=not retired,
+    )
 
 
 class ClaudeCodeAdapter(StreamingJsonCliAdapter):
@@ -20,50 +43,37 @@ class ClaudeCodeAdapter(StreamingJsonCliAdapter):
             version_args=["--version"],
             exec_args=["--stream", "json"],
             default_models=[
-                ModelCapability(
-                    id="claude-sonnet-5",
-                    display_name="Claude Sonnet 5 (Hybrid Reasoning)",
-                    provider="anthropic",
-                    supported_reasoning_efforts=["none", "low", "medium", "high", "max"],
-                    default_reasoning_effort="high",
-                    source="config",
-                    reasoning_selection=SelectionStrategy.STARTUP,
+                _claude_fallback_model(
+                    "claude-sonnet-5",
+                    "Claude Sonnet 5 (Hybrid Reasoning)",
+                    efforts=["none", "low", "medium", "high", "max"],
+                    default_effort="high",
                 ),
-                ModelCapability(
-                    id="claude-opus-5",
-                    display_name="Claude Opus 5 (Deep Reasoning)",
-                    provider="anthropic",
-                    supported_reasoning_efforts=["none", "low", "medium", "high", "max"],
-                    default_reasoning_effort="high",
-                    source="config",
-                    reasoning_selection=SelectionStrategy.STARTUP,
+                _claude_fallback_model(
+                    "claude-opus-5",
+                    "Claude Opus 5 (Deep Reasoning)",
+                    efforts=["none", "low", "medium", "high", "max"],
+                    default_effort="high",
                 ),
-                ModelCapability(
-                    id="claude-haiku-4-5",
-                    display_name="Claude Haiku 4.5",
-                    provider="anthropic",
-                    supported_reasoning_efforts=["none", "low", "medium"],
-                    default_reasoning_effort="medium",
-                    source="config",
-                    reasoning_selection=SelectionStrategy.STARTUP,
+                _claude_fallback_model(
+                    "claude-haiku-4-5",
+                    "Claude Haiku 4.5",
+                    efforts=["none", "low", "medium"],
+                    default_effort="medium",
                 ),
-                ModelCapability(
-                    id="claude-3-7-sonnet-20250219",
-                    display_name="Claude 3.7 Sonnet (Hybrid Reasoning)",
-                    provider="anthropic",
-                    supported_reasoning_efforts=["none", "low", "medium", "high", "max"],
-                    default_reasoning_effort="high",
-                    source="config",
-                    reasoning_selection=SelectionStrategy.STARTUP,
+                _claude_fallback_model(
+                    "claude-3-7-sonnet-20250219",
+                    "Claude 3.7 Sonnet (retired fallback)",
+                    efforts=["none", "low", "medium", "high", "max"],
+                    default_effort="high",
+                    retired=True,
                 ),
-                ModelCapability(
-                    id="claude-3-5-haiku-20241022",
-                    display_name="Claude 3.5 Haiku",
-                    provider="anthropic",
-                    supported_reasoning_efforts=["none"],
-                    default_reasoning_effort="none",
-                    source="config",
-                    reasoning_selection=SelectionStrategy.STARTUP,
+                _claude_fallback_model(
+                    "claude-3-5-haiku-20241022",
+                    "Claude 3.5 Haiku (retired fallback)",
+                    efforts=["none"],
+                    default_effort="none",
+                    retired=True,
                 ),
             ],
             model_flag="--model",

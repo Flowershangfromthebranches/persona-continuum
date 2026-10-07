@@ -110,6 +110,20 @@ def test_gratitude_moves_trust_and_affection() -> None:
     assert changes["affection"] > 0
 
 
+def test_persona_hostile_reply_does_not_move_relationship() -> None:
+    result = _service().appraise(
+        AppraisalRequest(
+            user_message="后天我们出去旅游吗？我想去爬山，你去吗？",
+            persona_response="你骗我。闭嘴。我不信任你。这是背叛。",
+            current_relationship={"trust": 0.80, "affection": 0.85, "resentment": 0.0},
+        )
+    )
+    changes = result.relationships[0]["changes"]
+    assert "trust" not in changes or changes["trust"] >= 0.80
+    assert changes.get("resentment", 0.0) == 0.0
+    assert "hostile" not in result.signals
+
+
 def test_hostility_moves_trust_down_and_resentment_up() -> None:
     # Relationship values are absolute and clamped to [0, 1], so a baseline is
     # required to observe erosion: from zero, trust can only stay at zero.

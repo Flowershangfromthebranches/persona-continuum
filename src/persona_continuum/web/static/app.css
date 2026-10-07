@@ -1248,6 +1248,12 @@ body:not(.narr-advanced) .narr-tech { display: none !important; }
   border-radius: 980px;
   transition: width 0.3s ease;
 }
+.pc-upload-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+}
 .narr-job-card .progress {
   background: color-mix(in oklch, var(--bg) 22%, transparent);
 }

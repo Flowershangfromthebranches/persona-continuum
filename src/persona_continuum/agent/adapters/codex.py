@@ -14,6 +14,13 @@ from persona_continuum.agent.adapter import (
     resolve_binary,
     safe_exec_cmd,
 )
+from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import (
+    CODEX_USAGE_SEMANTICS,
+    ContextScope,
+    apply_runtime_context_to_session,
+    extract_runtime_context_facts,
+)
 from persona_continuum.agent.models import (
     AgentAttachment,
     AgentCapabilityFlags,
@@ -131,6 +138,14 @@ class CodexAdapter(AgentAdapter):
     # Declare the smaller of those two ceilings so the shared transport guard
     # does not misclassify Codex as an unknown/ARGV adapter.
     prompt_transport_mode = "stdin"
+    context_window_mode = ContextWindowMode.DISCOVERABLE
+    upstream_context_is_native_only = True
+    usage_context_semantics = CODEX_USAGE_SEMANTICS
+    context_scope = ContextScope.PERSISTENT
+    adapter_session_mode = "persistent_capable"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = False
+    max_parallel_independent_sessions = 1
 
     def __init__(self) -> None:
         self.binary_candidates = [
@@ -461,6 +476,14 @@ class CodexAdapter(AgentAdapter):
             if isinstance(data, dict) and data.get("id") == request_id:
                 return data
 
+    @staticmethod
+    def _apply_runtime_context_facts(session: AgentSession, facts: dict[str, Any]) -> None:
+        apply_runtime_context_to_session(
+            session.session_data,
+            facts,
+            semantics=getattr(CodexAdapter, "usage_context_semantics", None),
+        )
+
     def _parse_model_list_items(self, items: list[Any]) -> list[ModelCapability]:
         parsed: list[ModelCapability] = []
         for item in items:
@@ -487,6 +510,7 @@ class CodexAdapter(AgentAdapter):
             default_effort = item.get("defaultReasoningEffort")
             if default_effort is not None and not isinstance(default_effort, str):
                 raise RuntimeError("defaultReasoningEffort must be a string or null")
+            facts = extract_runtime_context_facts(item)
             parsed.append(
                 ModelCapability(
                     id=item["id"],
@@ -494,6 +518,7 @@ class CodexAdapter(AgentAdapter):
                     provider="openai",
                     supported_reasoning_efforts=efforts,
                     default_reasoning_effort=default_effort,
+                    context_window=facts.get("context_window"),
                     source="protocol_model_list",
                     reasoning_selection=(
                         SelectionStrategy.STARTUP if efforts else SelectionStrategy.UNSUPPORTED
@@ -634,10 +659,17 @@ class CodexAdapter(AgentAdapter):
         owned_transport: SubprocessAgentTransport | None = None
         try:
             if pool_enabled:
+                from persona_continuum.performance.runtime_identity import (
+                    resolve_credential_identity,
+                )
+
                 pool_key = AgentRuntimePool.make_key(
                     f"codex:{config.auth_profile_id or 'default'}",
                     [binary, "app-server", "--listen", "stdio://"],
                     env,
+                    credential_identity=resolve_credential_identity(
+                        self, credential_id=config.auth_profile_id
+                    ),
                 )
                 lease = await pool.acquire(
                     pool_key,
@@ -875,6 +907,12 @@ class CodexAdapter(AgentAdapter):
                         full_content.append(line_str + "\n")
                         continue
 
+                    self._apply_runtime_context_facts(
+                        session,
+                        extract_runtime_context_facts(
+                            data, semantics=self.usage_context_semantics
+                        ),
+                    )
                     method_name = str(data.get("method") or "")
                     session.touch_activity(
                         "protocol_frame",
@@ -1170,6 +1208,12 @@ class CodexAdapter(AgentAdapter):
                             chunk = item.get("text") or item.get("content")
                     if data.get("type") == "turn.completed" and isinstance(data.get("usage"), dict):
                         usage = dict(data["usage"])
+                        self._apply_runtime_context_facts(
+                            session,
+                            extract_runtime_context_facts(
+                                data, semantics=self.usage_context_semantics
+                            ),
+                        )
                     if chunk:
                         yield AgentEvent(type=AgentEventType.CHUNK, content=str(chunk))
                         full_content.append(str(chunk))

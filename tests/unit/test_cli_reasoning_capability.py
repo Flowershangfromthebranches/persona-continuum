@@ -122,8 +122,10 @@ def test_opencode_model_config_is_selectable_but_session_verified() -> None:
     )[0]
 
     assert adapter.require_verified_binding is True
-    assert model.source == "config"
-    assert model.reasoning_capability.mode == ReasoningCapabilityMode.MANUAL_CONFIG
+    # IDs come from `opencode models`, so they are selectable; effort is not.
+    assert model.source == "official_cli"
+    assert model.selectable is True
+    assert model.reasoning_capability.mode == ReasoningCapabilityMode.UNSUPPORTED
     assert model.reasoning_capability.verified is False
 
 

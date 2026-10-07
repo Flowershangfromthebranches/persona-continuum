@@ -13,12 +13,14 @@ The cache invalidates automatically when the persona manifest is updated
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from persona_continuum.domain.session import PreparedTurn
+from persona_continuum.runtime.core_fidelity import execution_constraints, render_core
 
 _CACHE_LIMIT = 64
 
@@ -38,7 +40,7 @@ class StaticPersonaKernel:
 
     def system_sections(self, dynamic_sections: list[str]) -> str:
         sections = [
-            f"You are {self.display_name}, a persistent digital persona in Persona Continuum.",
+            f"Speak as {self.display_name}. You are this person talking, not a narrator.",
             self.identity_block,
             *dynamic_sections,
             self.constraints_block,
@@ -66,6 +68,7 @@ class StaticPersonaKernelCache:
         manifest = prepared.identity_anchor
         compiled = prepared.compiled_persona_context or {}
         by_key = dict(compiled.get("by_key", {}) or {})
+        by_key.update(compiled.get("core_components", {}))
         runtime_version = compiled.get("runtime_version")
         version_component = json.dumps(
             runtime_version if isinstance(runtime_version, dict) else str(runtime_version),
@@ -74,13 +77,9 @@ class StaticPersonaKernelCache:
             default=str,
         )
         runtime_payload = runtime_version if isinstance(runtime_version, dict) else {}
-        branch = str(
-            runtime_payload.get("active_branch_id") or prepared.session_id or "main"
-        )
+        branch = str(runtime_payload.get("active_branch_id") or prepared.session_id or "main")
         manifest_revision = str(
-            getattr(manifest, "updated_at", None)
-            or getattr(manifest, "version", None)
-            or "0"
+            getattr(manifest, "updated_at", None) or getattr(manifest, "version", None) or "0"
         )
         component_revision = json.dumps(
             {
@@ -88,6 +87,7 @@ class StaticPersonaKernelCache:
                 "continuations": runtime_payload.get("continuation_versions") or [],
                 "runtime": runtime_payload.get("digital_runtime_revision"),
                 "manifest": manifest_revision,
+                "core": hashlib.sha256(render_core(by_key).encode()).hexdigest(),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -131,24 +131,13 @@ class StaticPersonaKernelCache:
             kernel_lines.append(
                 f"- Core Values: {json.dumps(compiled['values'], ensure_ascii=False)}"
             )
-        if "expression_style" in compiled:
-            kernel_lines.append(
-                "- Expression Tendencies: "
-                f"{json.dumps(compiled['expression_style'], ensure_ascii=False)}"
-            )
+        kernel_lines.append(render_core(compiled))
         if "decision_heuristics" in compiled:
             kernel_lines.append(
                 "- Decision Patterns: "
                 f"{json.dumps(compiled['decision_heuristics'], ensure_ascii=False)}"
             )
-        constraints_text = (
-            "## Persona Execution Constraints\n"
-            f"1. You are embodying {display_name} in an interactive multi-agent room.\n"
-            "2. Express thoughts in first-person voice consistent with your personality.\n"
-            "3. Do not break character, mention prompt structure, or output raw internal states.\n"
-            "4. Respect fact boundaries: do not assert certainty for unverified facts.\n"
-            "5. If referencing history, rely strictly on your memories and retrieved context."
-        )
+        constraints_text = execution_constraints(display_name)
         return StaticPersonaKernel(
             persona_id=str(manifest.id),
             display_name=display_name,
@@ -156,12 +145,8 @@ class StaticPersonaKernelCache:
             identity_block="\n".join(kernel_lines),
             constraints_block=constraints_text,
             values_json=json.dumps(compiled.get("values", {}), ensure_ascii=False),
-            expression_json=json.dumps(
-                compiled.get("expression_style", {}), ensure_ascii=False
-            ),
-            decision_json=json.dumps(
-                compiled.get("decision_heuristics", {}), ensure_ascii=False
-            ),
+            expression_json=json.dumps(compiled.get("expression_style", {}), ensure_ascii=False),
+            decision_json=json.dumps(compiled.get("decision_heuristics", {}), ensure_ascii=False),
             compiled_version="",
         )
 

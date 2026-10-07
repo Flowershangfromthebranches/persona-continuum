@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import re
+import time
 from collections.abc import AsyncIterator
+from typing import Any
 
 from persona_continuum.agent.adapter import (
     AgentAdapter,
@@ -11,6 +15,8 @@ from persona_continuum.agent.adapter import (
     resolve_binary,
     safe_exec_cmd,
 )
+from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import ContextScope, extract_context_window
 from persona_continuum.agent.models import (
     AgentAttachment,
     AgentCapabilityFlags,
@@ -29,9 +35,10 @@ from persona_continuum.agent.models import (
     StructuredOutputMode,
 )
 from persona_continuum.agent.prompt import AgentPromptRenderer
-from persona_continuum.agent.response_collector import agent_error_event
+from persona_continuum.agent.response_collector import agent_error_event, sanitize_diagnostic
 from persona_continuum.agent.subprocess_transport import SubprocessAgentTransport
 from persona_continuum.auth.credentials import CredentialManager, build_runtime_environment
+from persona_continuum.numeric import safe_int
 
 
 class CommandCodeAdapter(AgentAdapter):
@@ -41,6 +48,15 @@ class CommandCodeAdapter(AgentAdapter):
     # travels as a single argv element, so the transport diagnostics must say
     # argv.  (stdin is opened but immediately closed; nothing is written.)
     prompt_transport_mode = "argv"
+    context_window_mode = ContextWindowMode.DISCOVERABLE
+    context_scope = ContextScope.PER_REQUEST
+    adapter_session_mode = "per_request"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = True
+    max_parallel_independent_sessions = 4
+    upstream_context_is_native_only = True
+    model_discovery_timeout_seconds = 10.0
+    probe_timeout_seconds = 22.0
 
     def __init__(self) -> None:
         self.binary_candidates = [
@@ -63,6 +79,11 @@ class CommandCodeAdapter(AgentAdapter):
         self.structured_output_mode = StructuredOutputMode.PROMPT_ONLY
         self.output_streaming_mode = OutputStreamingMode.BUFFERED_FINAL
         self.protocols = ["plain_cli", "streaming_json_cli"]
+        self._models_cache: tuple[str, float, list[ModelCapability]] | None = None
+        self._model_discovery_error = ""
+
+    def invalidate_model_cache(self) -> None:
+        self._models_cache = None
 
     async def probe(self) -> AgentProbeResult:
         binary = self._find_binary()
@@ -88,18 +109,55 @@ class CommandCodeAdapter(AgentAdapter):
                 status_detail="Command Code CLI binary not found on system",
             )
 
-        code, out, _ = await safe_exec_cmd([binary, "--version"], timeout=5.0)
+        metadata_env = build_runtime_environment(
+            credential_manager=self.credential_manager, overrides={"DO_NOT_TRACK": "1"}
+        )
+        code, out, _ = await safe_exec_cmd(
+            [binary, "--version"], timeout=5.0, env=metadata_env
+        )
         version_str = out.strip().split("\n")[0] if code == 0 and out else "detected"
+        if code != 0:
+            return AgentProbeResult(
+                id=self.adapter_id, name=self.name, status=AgentStatus.BROKEN,
+                binary_path=binary, models=[], status_detail="CLI version probe failed",
+            )
 
         # Check authentication status via command-code status
-        status_code, status_out, _ = await safe_exec_cmd([binary, "status"], timeout=6.0)
-        is_auth = status_code == 0 and (
-            "authentication verified" in status_out.lower()
-            or "authenticated as" in status_out.lower()
+        status_code, status_out, _ = await safe_exec_cmd(
+            [binary, "status", "--json"], timeout=6.0, env=metadata_env
+        )
+        status_facts = self._parse_status_json(status_out) if status_code == 0 else {}
+        is_auth = bool(status_facts.get("authenticated")) or (
+            status_code == 0
+            and (
+                "authentication verified" in status_out.lower()
+                or "authenticated as" in status_out.lower()
+                or '"authenticated":true' in status_out.lower().replace(" ", "")
+            )
         )
 
         status = AgentStatus.READY if is_auth else AgentStatus.AUTH_REQUIRED
         models = await self.list_models()
+        active_model = str(status_facts.get("model") or "")
+        active_window = safe_int(status_facts.get("context_window"), default=None, minimum=1)
+        if active_model and active_window is not None:
+            for model in models:
+                if model.id == active_model:
+                    model.context_window = active_window
+                    model.source = "dynamic"
+                    break
+            else:
+                models.insert(
+                    0,
+                    ModelCapability(
+                        id=active_model,
+                        display_name=active_model,
+                        provider=str(status_facts.get("provider") or "command_code"),
+                        context_window=active_window,
+                        source="dynamic",
+                        reasoning_selection=SelectionStrategy.STARTUP,
+                    ),
+                )
 
         return AgentProbeResult(
             id=self.adapter_id,
@@ -120,22 +178,42 @@ class CommandCodeAdapter(AgentAdapter):
                 structured_output_mode=self.structured_output_mode,
             ),
             models=models,
+            model_discovery_error=self._model_discovery_error or None,
             status_detail=(
                 "Command Code CLI authenticated and ready"
+                + (f"; model discovery failed: {self._model_discovery_error}"
+                   if self._model_discovery_error else "")
                 if is_auth
                 else "Command Code auth required (run `command-code login`)"
             ),
         )
 
     async def list_models(self) -> list[ModelCapability]:
+        from persona_continuum.performance.capability_cache import capability_cache_key
+
         binary = self._find_binary()
         if binary:
-            code, out, _ = await safe_exec_cmd([binary, "--list-models"], timeout=10.0)
+            identity = capability_cache_key(self)[1]
+            cached = self._models_cache
+            if cached and cached[0] == identity and time.monotonic() - cached[1] < 300:
+                return [model.model_copy(deep=True) for model in cached[2]]
+            code, out, err = await safe_exec_cmd(
+                [binary, "--list-models"], timeout=self.model_discovery_timeout_seconds,
+                # Metadata can finish while CLI telemetry keeps the process alive.
+                env=build_runtime_environment(
+                    credential_manager=self.credential_manager, overrides={"DO_NOT_TRACK": "1"}
+                ),
+            )
             if code == 0 and out:
                 parsed = self._parse_models(out)
                 if parsed:
+                    self._model_discovery_error = ""
+                    self._models_cache = (identity, time.monotonic(), parsed)
                     return parsed
-        return self._fallback_models()
+            self._model_discovery_error = sanitize_diagnostic(
+                err or "CLI returned no usable model catalog", limit=250
+            )
+        return []
 
     def _parse_models(self, text: str) -> list[ModelCapability]:
         lines = text.splitlines()
@@ -216,6 +294,9 @@ class CommandCodeAdapter(AgentAdapter):
                     supported_efforts = ["none", "low", "medium", "high"]
                     default_effort = "medium" if has_reasoning else "none"
 
+                window = extract_context_window({"text": desc}) or self._parse_context_phrase(
+                    desc
+                )
                 models.append(
                     ModelCapability(
                         id=model_id,
@@ -223,6 +304,7 @@ class CommandCodeAdapter(AgentAdapter):
                         provider=provider,
                         supported_reasoning_efforts=supported_efforts,
                         default_reasoning_effort=default_effort,
+                        context_window=window,
                         # The CLI exposes --effort and this adapter binds it
                         # directly in build_exec_argv.
                         source="official_cli",
@@ -231,6 +313,24 @@ class CommandCodeAdapter(AgentAdapter):
                 )
 
         return models
+
+    @staticmethod
+    def _parse_status_json(text: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _parse_context_phrase(text: str) -> int | None:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[Mm]\s*context", text or "", re.I)
+        if match:
+            return int(float(match.group(1)) * 1_000_000)
+        match = re.search(r"(\d+)\s*[Kk]\s*context", text or "", re.I)
+        if match:
+            return int(match.group(1)) * 1_000
+        return extract_context_window({"description": text})
 
     def _fallback_models(self) -> list[ModelCapability]:
         known_models = [

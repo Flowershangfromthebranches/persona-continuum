@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 from persona_continuum.agent.adapter import AgentAdapter, AgentSession
 from persona_continuum.agent.runtime_executor import AgentRuntimeExecutor, RuntimeSessionBinding
 from persona_continuum.application._utils import new_id
+from persona_continuum.runtime.turn_normalizer import normalize_turn_for_prompt
 
 
 class HostAgent:
@@ -26,9 +29,8 @@ class HostAgent:
         phase: str,
         runtime_binding: RuntimeSessionBinding | None = None,
     ) -> str:
-        recent = "\n".join(
-            f"{item.get('speaker_name') or item.get('participant_id')}: {item.get('content')}"
-            for item in transcript
+        recent = json.dumps(
+            [normalize_turn_for_prompt(item) for item in transcript], ensure_ascii=False
         )
         instructions = {
             "open": f"提出讨论议题并邀请一位参与者先阐述：{topic}",

@@ -22,6 +22,7 @@ class SessionRecord(BaseModel):
 
 
 class PreparedTurn(BaseModel):
+    current_time: datetime | None = None
     persona_id: str
     session_id: str
     identity_anchor: PersonaManifest
@@ -42,6 +43,8 @@ class PreparedTurn(BaseModel):
     current_mood: dict[str, float]
     current_needs: list[NeedState]
     active_goals: list[str]
+    relationship_stance: str = ""
+    reflection_due: bool = False
     relationship_state: RelationshipState
     mental_models: list[str]
     decision_patterns: list[str]
