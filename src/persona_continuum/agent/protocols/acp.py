@@ -17,6 +17,13 @@ from persona_continuum.agent.adapter import (
     safe_exec_cmd,
 )
 from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import (
+    ACP_USAGE_SEMANTICS,
+    ContextScope,
+    apply_runtime_context_to_session,
+    extract_runtime_context_facts,
+    remaining_is_runtime_verified,
+)
 from persona_continuum.agent.models import (
     AgentCapabilityFlags,
     AgentEvent,
@@ -209,6 +216,15 @@ class ACPProcessExitError(AgentProcessExitError):
 class ACPAdapter(AgentAdapter):
     # An ACP runtime reports the model/window it negotiated for a session.
     context_window_mode = ContextWindowMode.DISCOVERABLE
+    prompt_transport_mode = "stream"
+    # ACP remaining is only trusted from explicit remaining* fields.
+    # Per-turn inputTokens are billing, not occupancy.
+    usage_context_semantics = ACP_USAGE_SEMANTICS
+    context_scope = ContextScope.PERSISTENT
+    adapter_session_mode = "persistent_capable"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = False
+    max_parallel_independent_sessions = 1
 
     def __init__(
         self,
@@ -398,6 +414,9 @@ class ACPAdapter(AgentAdapter):
         reasoning_text = str(reasoning).strip() if reasoning is not None else None
         model_verified = bool(not requested_model or model_text == requested_model)
         reasoning_verified = bool(not requested_reasoning or reasoning_text == requested_reasoning)
+        facts = extract_runtime_context_facts(
+            result, semantics=getattr(self, "usage_context_semantics", None)
+        )
         snapshot = RuntimeBindingSnapshot(
             agent_id=self.adapter_id,
             protocol="acp",
@@ -409,6 +428,15 @@ class ACPAdapter(AgentAdapter):
             reasoning_verified=reasoning_verified,
             binding_status="verified" if model_verified and reasoning_verified else "unverified",
             verification_method="acp_session_new_response",
+            context_window=facts.get("context_window"),
+            context_window_source="runtime_reported" if facts.get("context_window") else None,
+            context_window_mode=str(self.context_window_mode),
+            remaining_context_tokens=facts.get("remaining_context_tokens"),
+            remaining_context_verified=remaining_is_runtime_verified(facts),
+            remaining_context_source=facts.get("remaining_source"),
+            used_context_tokens=facts.get("used_context_tokens"),
+            max_output_tokens=facts.get("max_output_tokens"),
+            auto_compaction_detected=facts.get("compaction"),
             diagnostics={
                 "session_new_result_keys": sorted(str(key) for key in result),
             },
@@ -556,6 +584,15 @@ class ACPAdapter(AgentAdapter):
                 "acp_session_id": acp_session_id,
                 "acp_reader": reader,
                 "runtime_binding": binding.model_dump(mode="json"),
+                "context_window_mode": str(self.context_window_mode),
+                "effective_context_window": binding.context_window,
+                "effective_context_window_source": binding.context_window_source,
+                "remaining_context_tokens": binding.remaining_context_tokens,
+                "remaining_context_verified": binding.remaining_context_verified,
+                "remaining_context_source": binding.remaining_context_source,
+                "used_context_tokens": binding.used_context_tokens,
+                "max_output_tokens": binding.max_output_tokens,
+                "auto_compaction_detected": binding.auto_compaction_detected,
             }
         )
         return session
@@ -855,6 +892,7 @@ class ACPAdapter(AgentAdapter):
 
             if data.get("id") == msg_id:
                 if "result" in data:
+                    self._ingest_runtime_context(session, data)
                     result = data["result"]
                     stop_reason = result.get("stopReason") if isinstance(result, dict) else None
                     content = str(result.get("content", "")) if isinstance(result, dict) else ""
@@ -887,6 +925,7 @@ class ACPAdapter(AgentAdapter):
 
             method = data.get("method")
             params = data.get("params", {})
+            self._ingest_runtime_context(session, data)
             if method == "session/update":
                 update = params.get("update") if isinstance(params, dict) else None
                 if isinstance(update, dict):
@@ -972,6 +1011,18 @@ class ACPAdapter(AgentAdapter):
                     metadata=frame_metadata,
                 )
                 return
+
+    def _ingest_runtime_context(self, session: AgentSession, payload: Any) -> None:
+        """Propagate usage / contextWindow frames into the live session."""
+
+        facts = extract_runtime_context_facts(
+            payload, semantics=getattr(self, "usage_context_semantics", None)
+        )
+        apply_runtime_context_to_session(
+            session.session_data,
+            facts,
+            semantics=getattr(self, "usage_context_semantics", None),
+        )
 
     @staticmethod
     def _frame_metadata(frame: ACPFrame) -> dict[str, Any]:

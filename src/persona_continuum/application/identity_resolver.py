@@ -42,7 +42,8 @@ class ResearchQueryBuilder:
                 spec.subject_kind == SubjectKind.ORIGINAL_CHARACTER
                 or scope == WebResearchScope.BACKGROUND_ONLY
             ):
-                # Strip an OC's personal name to avoid unrelated real-person matches.
+                # OC rule: strip the character's personal name to avoid finding
+                # unrelated real people with the same name.
                 # Transform personal biographical queries into background/context research.
                 name = resolved.canonical_name or spec.display_name
                 background_query = q.replace(name, "").strip()
@@ -110,12 +111,11 @@ class IdentityResolver:
             life_status=spec.life_status,
             confidence=(
                 0.95
-                if work
-                or spec.identity_context
-                or spec.subject_kind == SubjectKind.REAL_PERSON
+                if (work or spec.identity_context or spec.subject_kind == SubjectKind.REAL_PERSON)
                 else 0.75
             ),
             positive_search_terms=positive_terms,
             negative_search_terms=negative_terms,
             summary=spec.identity_context or work or "",
         )
+

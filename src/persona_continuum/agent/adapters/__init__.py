@@ -9,7 +9,7 @@ try:
 except ImportError:  # Cursor adapter module not present yet; register nothing.
     CursorAdapter = None
 from persona_continuum.agent.adapters.fake import FakeAgentAdapter
-from persona_continuum.agent.adapters.gemini import GeminiCliAdapter
+from persona_continuum.agent.adapters.gemini import GeminiCliAdapter, GoogleGeminiCliAdapter
 from persona_continuum.agent.adapters.grok import GrokBuildAdapter
 from persona_continuum.agent.adapters.opencode import OpenCodeAdapter
 from persona_continuum.agent.adapters.other_vendors import (
@@ -32,6 +32,7 @@ __all__ = [
     "DeepSeekHarnessAdapter",
     "FakeAgentAdapter",
     "GeminiCliAdapter",
+    "GoogleGeminiCliAdapter",
     "GrokBuildAdapter",
     "KimiAdapter",
     "OpenCodeAdapter",

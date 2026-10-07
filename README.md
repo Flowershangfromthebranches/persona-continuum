@@ -88,7 +88,7 @@ Web UI 与平行世界共用 `PersonaCreationOrchestrator`。创建任务可暂�
 
 [`examples/taibuge/`](examples/taibuge/) 提供了六位用于房间协作演示的示例 Persona 编译包（玄衡先生、子平先生、紫薇先生、易卦先生、三式先生、西学占测师）。这些包采用 `public_compiled` 模式导出，不包含任何个人隐私资料、本地历史对话、记忆或真实私有凭据。
 
-使用者克隆仓库后，只需将这六个人格包导入系统，在新建房间时选择内置的“太卜阁 · 术数综合会诊”模板，简单配置本机可用的 Agent/模型，即可一键体验多专家协同会诊。新建房间默认完全空白，只有选择模板后才会加载对应角色。
+首次运行 `persona-continuum web`（或 `init`）时会自动导入这六位人格，只导入一次；之后删掉的人格不会被重新装回，本地已有同名人格时也不会覆盖。打开网页后在房间页点击「进入太卜阁」，系统会套用内置的“太卜阁 · 术数综合会诊”模板并按名称绑定六位人格，同时为每个席位预选本机扫描到的可用 Agent 和模型；核对绑定后即可启动房间。普通的「新建房间」仍然默认空白。
 
 > **免责声明与风险提示**：本模板中的术数与推演演算纯属娱乐与传统文化研究，请勿过度迷信；内容均由 AI 模型生成，可能存在事实偏差或幻觉，绝不构成任何投资、理财、医疗或法律建议。投资有风险，决策需理性。
 
@@ -171,7 +171,7 @@ submits structured artifacts to the local MCP server.
 
 [`examples/taibuge/`](examples/taibuge/) provides six sample compiled Persona packages (Xuanheng, Ziping, Ziwei, Yigua, Sanshi, and Western Divination Consultant) for multi-persona consultation demonstration. Exported via `public_compiled` mode, these packages contain only runtime persona components and exclude private materials, local conversation logs, personal memories, or credentials.
 
-After importing these six packages, users can select the built-in "Taibuge Consultation" template when creating a room, bind local Agent hosts/models, and start multi-expert discussions immediately. New rooms open blank by default.
+The first `persona-continuum web` (or `init`) run imports the six personas automatically, exactly once: a persona you delete later is not re-imported, and an existing persona with the same id is never overwritten. In the Rooms page, click "Enter Taibuge" to apply the built-in "Taibuge Consultation" template; every seat is bound to its persona by name and pre-filled with a locally detected READY Agent and model, so you only review the bindings and start the room. A regular "New Room" still opens blank.
 
 > **Disclaimer & Risk Notice**: Divination and astrological simulations in this template are for entertainment and cultural research purposes only. Do not rely on them superstitiously. All outputs are AI-generated and do not constitute financial, investment, medical, or legal advice.
 

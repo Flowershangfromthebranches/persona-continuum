@@ -39,9 +39,16 @@ class StubResearchCli:
     def send(self, session: AgentSession, turn: AgentTurn) -> AsyncIterator[AgentEvent]:
         async def stream() -> AsyncIterator[AgentEvent]:
             self.prompts.append(turn.user_message)
+            payload = self.payload
+            if "PROBE_FETCH" in turn.user_message and self.payload.get("sources"):
+                payload = {
+                    "fetched": True,
+                    "url": self.payload["sources"][0].get("url"),
+                    "content": "A separately fetched public page excerpt.",
+                }
             yield AgentEvent(
                 type=AgentEventType.DONE,
-                content=json.dumps(self.payload, ensure_ascii=False),
+                content=json.dumps(payload, ensure_ascii=False),
             )
 
         return stream()
@@ -93,7 +100,7 @@ async def test_unknown_cli_runs_behavioral_research_probe(app) -> None:
     )
     await _resolve_unknown_cli(app, cli)
     assert cli.prompts
-    assert "native Web Research" in cli.prompts[0]
+    assert "native web search tool" in cli.prompts[0]
     assert "openai.com" in cli.prompts[0]
 
 
@@ -253,6 +260,9 @@ async def test_local_materials_never_checks_web_research(app, monkeypatch) -> No
         raise AssertionError("local_materials must not resolve web research")
 
     monkeypatch.setattr(app.persona_creation, "_resolve_or_verify_research_runtime", forbidden)
+    for adapter in app.agent_registry.list_adapters():
+        if adapter.adapter_id != "fake_agent":
+            app.agent_registry.unregister_adapter(adapter.adapter_id)
     job = await app.persona_creation.create_job(
         display_name="Public Local Materials Subject",
         persona_type=PersonaType.PUBLIC_LIVING_PERSON,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from persona_continuum.agent.adapter import (
     resolve_binary,
     safe_exec_cmd,
 )
+from persona_continuum.agent.context_fields import ContextScope
 from persona_continuum.agent.models import (
     AgentCapabilityFlags,
     AgentEvent,
@@ -41,8 +43,41 @@ from persona_continuum.agent.response_collector import (
 from persona_continuum.agent.subprocess_transport import SubprocessAgentTransport
 from persona_continuum.auth.credentials import CredentialManager, build_runtime_environment
 
+INVALID_CLI_ARGUMENT_SUBTYPE = "cli_invalid_argument"
+# agy-style deterministic argument misuse, e.g.
+# "--json-schema can only be used when --output-format is 'json' or
+# 'stream-json'".  Retrying the same argv can never succeed, so these
+# failures must not auto-retry (unlike transient exits with no output).
+_INVALID_CLI_ARGUMENT_RE = re.compile(
+    r"can only be used when\s+--\S+"
+    r"|invalid (?:argument|option|flag)"
+    r"|(?:unrecognized|unknown) (?:argument|option|flag)"
+    r"|no such option",
+    re.IGNORECASE,
+)
+
+
+def is_invalid_cli_argument_error(stderr_text: str, log_text: str = "") -> bool:
+    """True when CLI output shows a deterministic invalid-argument exit."""
+
+    blob = f"{stderr_text or ''}\n{log_text or ''}"
+    return bool(_INVALID_CLI_ARGUMENT_RE.search(blob))
+
+
+def cli_argument_error_detail(stderr_text: str, log_text: str = "") -> str:
+    for line in f"{stderr_text}\n{log_text}".splitlines():
+        if _INVALID_CLI_ARGUMENT_RE.search(line):
+            return sanitize_diagnostic(line.strip(), limit=500)
+    return "CLI rejected the argument combination."
+
 
 class PlainCliAdapter(AgentAdapter):
+    context_scope = ContextScope.PER_REQUEST
+    adapter_session_mode = "per_request"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = True
+    max_parallel_independent_sessions = 4
+
     def __init__(
         self,
         adapter_id: str,
@@ -85,6 +120,10 @@ class PlainCliAdapter(AgentAdapter):
         del config
         return []
 
+    def build_turn_cli_args(self, session: AgentSession, turn: AgentTurn) -> list[str]:
+        """Optional protocol-native flags for this turn's output contract."""
+        return []
+
     def media_input_mode(self, kind: str) -> str:
         """How this CLI consumes one attachment kind.
 
@@ -98,6 +137,11 @@ class PlainCliAdapter(AgentAdapter):
         if str(kind or "").lower() in {"image", "video", "audio", "file"}:
             return MediaInputMode.LOCAL_PATH.value
         return MediaInputMode.UNSUPPORTED.value
+
+    @property
+    def prompt_transport_mode(self) -> str:
+        """Use the same print-flag decision as send, including mutable exec_args."""
+        return "argv" if any(arg in {"-p", "--print"} for arg in self.exec_args) else "stdin"
 
     def attachment_prompt_block(self, turn: AgentTurn) -> str:
         """Wire-text reference block for this turn's attachments.
@@ -135,13 +179,10 @@ class PlainCliAdapter(AgentAdapter):
                 )
                 continue
             if mode == MediaInputMode.EXTRACTED_CONTENT.value:
-                extracted = (
-                    attachment.extracted_text
-                    or (
-                        extract_attachment_text(attachment, uploads_root)
-                        if uploads_root is not None
-                        else None
-                    )
+                extracted = attachment.extracted_text or (
+                    extract_attachment_text(attachment, uploads_root)
+                    if uploads_root is not None
+                    else None
                 )
                 if extracted:
                     lines.append(
@@ -196,6 +237,19 @@ class PlainCliAdapter(AgentAdapter):
         del config
         return []
 
+    def build_cli_environment(self, session: AgentSession) -> dict[str, str]:
+        """Build credentials and adapter settings for this subprocess only."""
+
+        return build_runtime_environment(
+            credential_manager=self.credential_manager,
+            credential_id=session.config.auth_profile_id,
+            auth_env_var=session.config.auth_env_var,
+            target_name=getattr(self, "credential_env_var", "API_KEY"),
+        )
+
+    def build_model_cli_args(self, session: AgentSession, model_id: str | None) -> list[str]:
+        return [self.model_flag, model_id] if self.model_flag and model_id else []
+
     def classify_process_failure(
         self,
         session: AgentSession,
@@ -208,6 +262,17 @@ class PlainCliAdapter(AgentAdapter):
 
         del session, returncode
         stderr_lower = (stderr_text or "").lower()
+        if is_invalid_cli_argument_error(stderr_lower):
+            # Deterministic argument misuse: report the exact contract
+            # violation and mark it non-retriable for the whole pipeline.
+            return (
+                cli_argument_error_detail(stderr_text),
+                {
+                    **diagnostics,
+                    "failure_subtype": INVALID_CLI_ARGUMENT_SUBTYPE,
+                    "retriable": False,
+                },
+            )
         if "authentication required" in stderr_lower or "use /login" in stderr_lower:
             return (
                 "CLI authentication required. Please log in using the CLI /login command.",
@@ -300,6 +365,10 @@ class PlainCliAdapter(AgentAdapter):
             ),
             research=self._research_capability,
             models=models,
+            model_discovery_error=(
+                str(getattr(self, "_model_discovery_error", ""))
+                or ("CLI returned no usable model catalog" if code == 0 and not models else None)
+            ),
             status_detail=(
                 "CLI binary verified and ready" if code == 0 else "CLI binary execution failed"
             ),
@@ -334,14 +403,10 @@ class PlainCliAdapter(AgentAdapter):
                 "active_proc": None,
                 "protocol": "plain_cli",
                 "effective_model": (
-                    self.resolve_cli_model_and_reasoning(config)[0]
-                    if self.model_flag
-                    else None
+                    self.resolve_cli_model_and_reasoning(config)[0] if self.model_flag else None
                 ),
                 "effective_reasoning": (
-                    self.resolve_cli_model_and_reasoning(config)[1]
-                    if self.reasoning_flag
-                    else None
+                    self.resolve_cli_model_and_reasoning(config)[1] if self.reasoning_flag else None
                 ),
                 "model_selection_applied": not bool(config.model_id) or bool(self.model_flag),
                 "reasoning_selection_applied": not bool(config.reasoning_effort)
@@ -357,9 +422,7 @@ class PlainCliAdapter(AgentAdapter):
             session,
             protocol="plain_cli",
             model_verified=bool(not session.config.model_id or self.model_flag),
-            reasoning_verified=bool(
-                not session.config.reasoning_effort or self.reasoning_flag
-            ),
+            reasoning_verified=bool(not session.config.reasoning_effort or self.reasoning_flag),
         )
 
     async def send(self, session: AgentSession, turn: AgentTurn) -> AsyncIterator[AgentEvent]:
@@ -378,16 +441,12 @@ class PlainCliAdapter(AgentAdapter):
         command_args = [arg for arg in self.exec_args if arg not in {"-p", "--print"}]
         cmd = [binary, *command_args]
         model_id, reasoning = self.resolve_cli_model_and_reasoning(session.config)
-        if self.model_flag and model_id:
-            cmd.extend([self.model_flag, model_id])
-        if (
-            self.reasoning_flag
-            and reasoning
-            and reasoning not in {"none", "default"}
-        ):
+        cmd.extend(self.build_model_cli_args(session, model_id))
+        if self.reasoning_flag and reasoning and reasoning not in {"none", "default"}:
             cmd.extend([self.reasoning_flag, reasoning])
         cmd.extend(self.build_extra_cli_args(session.config))
         cmd.extend(self.build_permission_args(session.config))
+        cmd.extend(self.build_turn_cli_args(session, turn))
 
         prompt = self.prepare_prompt(
             session.config,
@@ -397,7 +456,7 @@ class PlainCliAdapter(AgentAdapter):
         media_block = self.attachment_prompt_block(turn)
         if media_block:
             prompt = f"{prompt}\n\n{media_block}"
-        pass_via_arg = bool(prompt_flags)
+        pass_via_arg = self.prompt_transport_mode == "argv"
         if pass_via_arg:
             # Print-mode flags consume or govern the prompt on several CLIs.
             # Runtime selection flags must come first so they are not parsed
@@ -405,14 +464,9 @@ class PlainCliAdapter(AgentAdapter):
             cmd.extend(prompt_flags)
             cmd.append(prompt)
 
-        env = build_runtime_environment(
-            credential_manager=self.credential_manager,
-            credential_id=session.config.auth_profile_id,
-            auth_env_var=session.config.auth_env_var,
-        )
-
         transport: SubprocessAgentTransport | None = None
         try:
+            env = self.build_cli_environment(session)
             transport = await SubprocessAgentTransport.spawn(
                 session,
                 cmd,
@@ -458,6 +512,24 @@ class PlainCliAdapter(AgentAdapter):
                 stderr_text=stderr_text,
                 diagnostics=diagnostics,
             )
+            # classify_process_failure may downgrade retriable for
+            # deterministic contract violations (e.g. invalid argv flags).
+            failure_retriable = bool(diagnostics.pop("retriable", True))
+            if returncode and diagnostics.get("failure_subtype") == INVALID_CLI_ARGUMENT_SUBTYPE:
+                yield AgentEvent(
+                    type=AgentEventType.ERROR,
+                    error=f"AGENT_CLI_INVALID_ARGUMENT: {classified}",
+                    metadata={
+                        **diagnostics,
+                        "failure_code": "AGENT_CLI_INVALID_ARGUMENT",
+                        "failure": {
+                            "code": "AGENT_CLI_INVALID_ARGUMENT",
+                            "message": classified or "CLI rejected its arguments",
+                            "retriable": False,
+                        },
+                    },
+                )
+                return
             if not full_content and self._headless_permission_denied(stderr_text):
                 yield agent_error_event(
                     AgentPermissionBlockedError(
@@ -478,8 +550,25 @@ class PlainCliAdapter(AgentAdapter):
                         "failure": {
                             "code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
                             "message": detail,
-                            "retriable": True,
+                            "retriable": failure_retriable,
                         },
+                        **diagnostics,
+                    },
+                )
+                return
+            if returncode:
+                # Partial stdout is not a successful final response.
+                yield AgentEvent(
+                    type=AgentEventType.ERROR,
+                    error="AGENT_PROCESS_EXITED_WITH_PARTIAL_OUTPUT",
+                    metadata={
+                        "failure_code": "AGENT_PROCESS_EXITED_WITH_PARTIAL_OUTPUT",
+                        "failure": {
+                            "code": "AGENT_PROCESS_EXITED_WITH_PARTIAL_OUTPUT",
+                            "message": classified or f"CLI exited with status {returncode}",
+                            "retriable": failure_retriable,
+                        },
+                        "partial_output_chars": sum(map(len, full_content)),
                         **diagnostics,
                     },
                 )
@@ -494,7 +583,7 @@ class PlainCliAdapter(AgentAdapter):
                         "failure": {
                             "code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
                             "message": detail,
-                            "retriable": True,
+                            "retriable": failure_retriable,
                         },
                         **diagnostics,
                     },

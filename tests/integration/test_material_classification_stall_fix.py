@@ -41,6 +41,13 @@ def _million_profile(transport: dict[str, object] | None = None) -> ResolvedExec
     snapshot: dict[str, object] = {
         "effective_model": "fake-gpt-5",
         "context_window": ONE_MILLION,
+        "effective_context_window": ONE_MILLION,
+        "remaining_context_tokens": ONE_MILLION,
+        "remaining_context_verified": True,
+        "remaining_context_source": "runtime_reported",
+        "context_verified": True,
+        "context_capability_source": "runtime_reported",
+        "context_window_source": "runtime_reported",
     }
     if transport is not None:
         snapshot["prompt_transport"] = transport
@@ -115,7 +122,7 @@ def _classify_analyzer(requests: list[dict]):
 
 @pytest.mark.anyio
 async def test_1m_model_never_packs_near_full_window(app) -> None:
-    """A 1M context window alone must not create 800K+ single windows."""
+    """Working target may exceed 500K at 0.80, but serialized prompt stays inside hard budget."""
 
     service = app.material_intelligence
     persona = _subject_persona(app)
@@ -123,6 +130,10 @@ async def test_1m_model_never_packs_near_full_window(app) -> None:
     requests: list[dict] = []
     metrics = MaterialPipelineMetrics()
     profile = _million_profile()
+    budget = service.context_budget_manager.budget_for(
+        model=profile.model_dump(mode="json"),
+        phase="material_classification",
+    )
     await service._classify_with_agent(
         _units(60, persona_id=persona.id, source_ids=source_ids),
         _classify_analyzer(requests),
@@ -130,11 +141,18 @@ async def test_1m_model_never_packs_near_full_window(app) -> None:
         metrics=metrics,
     )
     target = metrics.max_batch_target_tokens
-    assert target is not None and 0 < target <= 500_000
+    assert target is not None and target > 0
+    assert budget.usable_context_budget is not None
+    assert target <= budget.usable_context_budget
+    assert target <= ONE_MILLION
+    assert budget.expected_output_reserve_tokens > 0
+    assert budget.reasoning_reserve_tokens > 0
     assert metrics.max_serialized_prompt_tokens is None or (
         metrics.max_serialized_prompt_tokens <= target
     )
-    assert len(requests) > 1
+    assert metrics.rebatched_windows < max(4, len(requests))
+    # 0.80 material ratio on a verified 1M window is allowed to exceed 500K.
+    assert (profile.phase_working_target or 0) > 500_000
 
 
 @pytest.mark.anyio
@@ -329,15 +347,28 @@ async def test_window_progress_reports_dynamic_state(app) -> None:
 
 @pytest.mark.anyio
 async def test_batch_target_helper_respects_all_three_budgets() -> None:
+    from persona_continuum.agent.phase_policy import default_phase_context_policy
+
     profile = _million_profile()
-    no_transport = material_batch_target_tokens(profile, phase_usable_budget=1_000_000)
-    assert no_transport == int(profile.preferred_working_context * 0.92)
+    policy = default_phase_context_policy()
+    no_transport = material_batch_target_tokens(
+        profile, phase_usable_budget=1_000_000, phase_policy=policy
+    )
+    working = profile.phase_working_target
+    assert working is not None
+    assert no_transport <= working
+    assert no_transport <= 1_000_000
+    assert no_transport > 500_000
     argv_capped = material_batch_target_tokens(
         profile.model_copy(update={"prompt_transport": capability_for_mode("argv")}),
         phase_usable_budget=1_000_000,
+        phase_policy=policy,
     )
     assert argv_capped <= capability_for_mode("argv").prompt_token_budget()
-    assert material_batch_target_tokens(profile, phase_usable_budget=5_000) == int(5_000 * 0.92)
+    assert argv_capped < no_transport
+    assert material_batch_target_tokens(
+        profile, phase_usable_budget=5_000, phase_policy=policy
+    ) == int(5_000 * 0.92)
 
 
 @pytest.mark.anyio

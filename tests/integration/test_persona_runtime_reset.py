@@ -105,15 +105,39 @@ def test_soft_reset_restores_initial_state_but_keeps_history(app: PersonaContinu
 def test_full_reset_clears_conversational_footprint(app: PersonaContinuum) -> None:
     persona_id = _persona(app)
     _dirty_runtime(app, persona_id)
+    app.memories.add_memory(
+        MemoryRecord(
+            id=f"mem_{persona_id}_chat_fix",
+            persona_id=persona_id,
+            type=MemoryType.SEMANTIC,
+            source_kind="user_correction",
+            content="A chat correction that full reset must clear.",
+            metadata={"session_id": "sess_chat", "persona_repair": True},
+        )
+    )
+    app.database.conn.execute(
+        "INSERT INTO rooms VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"room_{persona_id}",
+            "ready",
+            '["' + persona_id + '"]',
+            "chat",
+            "{}",
+            "2026-09-18T00:00:00+00:00",
+            "2026-09-18T00:00:00+00:00",
+        ),
+    )
+    app.database.conn.commit()
 
-    result = app.sessions.reset_runtime_state(persona_id, include_memories=True)
+    result = app.reset_runtime_state(persona_id, include_memories=True)
     assert result["removed"]["sessions"] > 0
+    assert result["removed"]["rooms"] == 1
+    assert f"room_{persona_id}" in result["removed"]["room_ids"]
 
     after = _counts(app, persona_id)
     assert after["affect_states"] == 0
     assert after["change_events"] == 0
     assert after["sessions"] == 0
-    # Derived experience memories go; the seed memory stays.
     remaining = [
         str(row["id"])
         for row in app.database.conn.execute(
@@ -121,6 +145,10 @@ def test_full_reset_clears_conversational_footprint(app: PersonaContinuum) -> No
         ).fetchall()
     ]
     assert remaining == [f"mem_{persona_id}_keep"]
+    leftover_rooms = app.database.conn.execute(
+        "SELECT COUNT(*) AS n FROM rooms WHERE id = ?", (f"room_{persona_id}",)
+    ).fetchone()
+    assert int(leftover_rooms["n"]) == 0
 
     # Compiled persona content is never touched by either reset mode.
     assert app.personas.get(persona_id).manifest.display_name == persona_id

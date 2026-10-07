@@ -363,6 +363,7 @@ def classify_persona_failure(exc: BaseException) -> str:
         ("final_audit_failed:", PersonaFailureCode.FINAL_AUDIT_FAILED),
         ("final_evidence_audit_invalid", PersonaFailureCode.FINAL_AUDIT_FAILED),
         ("final_consistency_audit_invalid", PersonaFailureCode.FINAL_AUDIT_FAILED),
+        ("PROMPT_TRANSPORT_LIMIT_EXCEEDED", PersonaFailureCode.TRANSPORT_FAILED),
     ):
         if message.startswith(prefix):
             return code.value
@@ -422,6 +423,27 @@ def is_retryable_failure(failure: Any) -> bool:
         # Older rows were persisted before the response collector assigned
         # this output failure its typed retry policy.  Keep those rows usable
         # without rewriting their historical diagnostics.
+        return True
+    if code == "PROMPT_TRANSPORT_LIMIT_EXCEEDED" or "PROMPT_TRANSPORT_LIMIT_EXCEEDED" in message:
+        # Wrapped as PERSONA_CREATION_ERROR before the transport error was
+        # preserved.  Retrying re-enters extraction, which now packs against
+        # the adapter's real transport budget instead of repeating the same
+        # oversized prompt.
+        return True
+    diagnostic_text = message
+    diagnostics = failure.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        diagnostic_text += " " + str(diagnostics.get("diagnostic") or "")
+        nested_failure = diagnostics.get("failure")
+        if isinstance(nested_failure, Mapping):
+            diagnostic_text += " " + str(nested_failure.get("message") or "")
+            nested_diagnostics = nested_failure.get("diagnostics")
+            if isinstance(nested_diagnostics, Mapping):
+                diagnostic_text += " " + str(nested_diagnostics.get("diagnostic") or "")
+    lowered = diagnostic_text.casefold()
+    if "json_object" in lowered and "must contain" in lowered:
+        # OpenAI-compatible json_object 400: adapter now injects the required
+        # JSON instruction, so retrying the failed phase is safe.
         return True
     if message.startswith(RETRYABLE_LEGACY_MESSAGE_PREFIXES):
         # Rows persisted before the typed taxonomy: an audit/quality-gate

@@ -105,9 +105,13 @@ class StructuredOutputEngine:
         fenced = re.search(r"```(?:json|javascript|js)?\s*(.*?)\s*```", raw, re.I | re.S)
         candidate = fenced.group(1).strip() if fenced else raw
         decoder = json.JSONDecoder()
-        starts = [0]
-        starts.extend(index for index, char in enumerate(candidate) if char in "[{" and index)
-        starts.extend(index for index, char in enumerate(candidate) if char in "ntf" and index)
+        # Never promote a nested fragment of a damaged envelope to its result.
+        stripped = candidate.lstrip()
+        if stripped.startswith(("{", "[")):
+            starts = [len(candidate) - len(stripped)]
+        else:
+            structural = re.search(r"[\[{]", candidate)
+            starts = [structural.start()] if structural else [0]
         seen: set[int] = set()
         for start in starts:
             if start in seen:
@@ -259,7 +263,7 @@ class StructuredOutputEngine:
                 validated = schema.__class__.model_validate(value)
                 return validated.model_dump(mode="json")
             if isinstance(schema, dict):
-                StructuredOutputEngine._validate_json_schema(value, schema, path="$" )
+                StructuredOutputEngine._validate_json_schema(value, schema, path="$")
                 return value
             validated = TypeAdapter(schema).validate_python(value)
             if isinstance(validated, BaseModel):
@@ -334,9 +338,7 @@ class StructuredOutputEngine:
                 if not isinstance(alternative, dict):
                     continue
                 try:
-                    StructuredOutputEngine._validate_json_schema(
-                        value, alternative, path=path
-                    )
+                    StructuredOutputEngine._validate_json_schema(value, alternative, path=path)
                     return
                 except StructuredOutputSchemaError as exc:
                     failures.append(str(exc))

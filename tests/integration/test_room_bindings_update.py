@@ -110,8 +110,9 @@ async def test_updated_binding_is_used_by_the_next_turn(app: PersonaContinuum) -
     assert started.get("reasoning_effort") == "low"
 
     transcripts = app.orchestrator.list_room_transcripts(room_id)
-    assert transcripts[0].model_id == "fake-claude-4"
-    assert transcripts[0].reasoning_effort == "low"
+    agent_record = next(t for t in transcripts if t.participant_id == "slot_alice")
+    assert agent_record.model_id == "fake-claude-4"
+    assert agent_record.reasoning_effort == "low"
 
 
 @pytest.mark.anyio

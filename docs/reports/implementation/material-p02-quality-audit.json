@@ -1,0 +1,69 @@
+{
+  "status": "historical_evidence_retention_only",
+  "fresh_full_balanced_compiler_quality": "not_run_requires_external_transfer_approval",
+  "raw_rows": 10000,
+  "dimensions": {
+    "personality_core": {
+      "historically_extracted_rows": 447,
+      "gate_retained": 279,
+      "gate_excluded": 168,
+      "retention_ratio": 0.6241610738255033
+    },
+    "values_desires": {
+      "historically_extracted_rows": 146,
+      "gate_retained": 102,
+      "gate_excluded": 44,
+      "retention_ratio": 0.6986301369863014
+    },
+    "decisions_behavior": {
+      "historically_extracted_rows": 412,
+      "gate_retained": 256,
+      "gate_excluded": 156,
+      "retention_ratio": 0.6213592233009708
+    },
+    "relationships": {
+      "historically_extracted_rows": 137,
+      "gate_retained": 89,
+      "gate_excluded": 48,
+      "retention_ratio": 0.6496350364963503
+    },
+    "emotional_patterns": {
+      "historically_extracted_rows": 180,
+      "gate_retained": 105,
+      "gate_excluded": 75,
+      "retention_ratio": 0.5833333333333334
+    },
+    "communication_style": {
+      "historically_extracted_rows": 567,
+      "gate_retained": 352,
+      "gate_excluded": 215,
+      "retention_ratio": 0.6208112874779541
+    },
+    "contradictions": {
+      "historically_extracted_rows": 14,
+      "gate_retained": 11,
+      "gate_excluded": 3,
+      "retention_ratio": 0.7857142857142857
+    },
+    "life_facts_temporal": {
+      "historically_extracted_rows": 219,
+      "gate_retained": 131,
+      "gate_excluded": 88,
+      "retention_ratio": 0.5981735159817352
+    }
+  },
+  "time_months": [
+    "2023-02",
+    "2023-04",
+    "2023-05",
+    "2024-07"
+  ],
+  "selected_months": [
+    "2023-02",
+    "2023-04",
+    "2023-05",
+    "2024-07"
+  ],
+  "temporal_coverage_preserved": true,
+  "interpretation": "Excluded historical rows are review candidates, not proven quality loss. Existing V4 completed rows are never gated in production."
+}

@@ -29,6 +29,8 @@ important events, open topics, long-term goals, and known user information.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,12 +38,20 @@ from persona_continuum.room.context_packer import (
     conservative_budget,
     extract_older_user_facts,
 )
+from persona_continuum.runtime.turn_normalizer import normalize_turn, normalize_turn_for_prompt
 
 SUMMARY_PROMPT_INTRO = (
-    "你是 Persona Continuum 的房间上下文管理器。请把以下对话记录压缩成结构化"
-    "长期摘要，必须保留：关键事实、关系变化、承诺、冲突、观点变化、人物立场、"
-    "重要事件、未解决议题、长期目标、已知的用户信息。不要丢弃任何仍然相关的"
-    "约束或未决问题；摘要会作为长期上下文重新注入后续发言。"
+    "You maintain a bounded factual continuity summary for a long-running room "
+    "conversation. This is a data-compression task, not roleplay: never speak as "
+    "any character, never continue the conversation, never copy dialogue "
+    "verbatim, and never invent events.\n"
+    "Preserve only what must survive for continuity: important facts about the "
+    "participants, relationship changes, promises and commitments, important "
+    "shared events, unresolved topics, future plans, durable preferences, "
+    "conflicts and reconciliations, and anything explicitly asked to be "
+    "remembered.\n"
+    "Merge duplicates, drop obsolete low-value detail, and keep it short. "
+    "Output the structured summary only."
 )
 
 SUMMARY_SCHEMA: dict[str, Any] = {
@@ -62,7 +72,54 @@ SUMMARY_SCHEMA: dict[str, Any] = {
 }
 
 
-def render_summary_markdown(summary: dict[str, Any]) -> str:
+#: A scene/style migration once wrote a raw transcript dump into
+#: ``rolling_summary`` under this header.  That is evidence, not a summary, and
+#: must never be treated as the canonical rolling summary.
+LEGACY_SUMMARY_MARKER = "## Scene / relationship evidence"
+#: Canonical rolling summaries carry this version.  Anything missing or lower is
+#: legacy data and is ignored at runtime.
+CANONICAL_SUMMARY_VERSION = 2
+
+
+def is_canonical_summary(text: Any, version: Any = None) -> bool:
+    """Whether a stored ``rolling_summary`` may be used as the canonical one.
+
+    Requires BOTH a recognised version and content that is not the legacy
+    evidence dump.  "The field contains a string" is not sufficient -- treating
+    it as sufficient is exactly how the migration's transcript dump came to be
+    injected into prompts as if it were a summary.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if text.lstrip().startswith(LEGACY_SUMMARY_MARKER):
+        return False
+    try:
+        return int(version) >= CANONICAL_SUMMARY_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def estimate_tokens(text: Any) -> int:
+    """CJK-aware token estimate (CJK per character, ~4 chars elsewhere).
+
+    A flat ``len // 4`` under-counts Chinese by roughly 4x, which is exactly the
+    wrong direction for the budgets that matter here.
+    """
+
+    if not text:
+        return 0
+    value = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False, default=str)
+    cjk = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", value))
+    return cjk + max(0, len(value) - cjk) // 4
+
+
+def render_summary_markdown(
+    summary: dict[str, Any],
+    *,
+    max_chars: int | None = None,
+    max_tokens: int | None = None,
+) -> str:
     labels = {
         "key_facts": "Key facts",
         "relationship_shifts": "Relationship shifts",
@@ -80,7 +137,24 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         values = [str(item) for item in (summary.get(key) or []) if str(item).strip()]
         if values:
             lines.append(f"- {label}: " + "; ".join(values))
-    return "## Room Long-term Summary\n" + "\n".join(lines)
+    header = "## Room Long-term Summary"
+    if max_chars is None and max_tokens is None:
+        return header + "\n" + "\n".join(lines)
+    # A summary is a bounded digest, not a second transcript: keep whole
+    # sections while BOTH the character and token ceilings still hold, then stop.
+    kept: list[str] = []
+    used_chars = len(header)
+    used_tokens = estimate_tokens(header)
+    for line in lines:
+        next_chars = used_chars + len(line) + 1
+        next_tokens = used_tokens + estimate_tokens(line) + 1
+        if max_chars is not None and max_chars > 0 and next_chars > max_chars:
+            break
+        if max_tokens is not None and max_tokens > 0 and next_tokens > max_tokens:
+            break
+        kept.append(line)
+        used_chars, used_tokens = next_chars, next_tokens
+    return header + ("\n" + "\n".join(kept) if kept else "")
 
 
 @dataclass(slots=True)
@@ -173,6 +247,61 @@ def _trim_to_budget(
     return [turn for _, turn in kept]
 
 
+def _turn_token_cost(turn: dict[str, Any]) -> int:
+    """Token cost of one transcript entry as the model will actually read it."""
+
+    if not isinstance(turn, dict):
+        return 0
+    return estimate_tokens(str(turn.get("content") or "")) + estimate_tokens(
+        str(turn.get("speaker_name") or turn.get("participant_id") or "")
+    )
+
+
+def recent_window_start(
+    transcript: list[dict[str, Any]],
+    *,
+    message_window: int,
+    token_budget: int | None,
+) -> int:
+    """Index of the first entry that belongs to the recent raw window.
+
+    The recent window is the PRIMARY working-memory selection, and its unit is
+    a **token budget**, not a message count: "嗯" and a 3000-character essay are
+    both one message, so a count can neither protect a weak model nor describe
+    a strong one.  ``message_window`` remains as a secondary cap and as the
+    only rule when no token budget is configured (the historical behaviour).
+
+    Deterministic and side-effect free, so the same function defines both the
+    turns sent to the model and the eviction boundary handed to the
+    summariser.  If those two disagreed, turns would drop out of the window
+    without ever being folded into a summary -- the orphan-turn hole this
+    exists to close.
+
+    The newest entry is always kept even when it alone exceeds the budget: it
+    is usually the message being answered, and the transport guard is the
+    correct place to refuse an impossible single message.
+    """
+
+    total = len(transcript or [])
+    if total == 0:
+        return 0
+    cap = max(1, int(message_window))
+    if token_budget is None:
+        return max(0, total - cap)
+    budget = max(0, int(token_budget))
+    start = total
+    used = 0
+    for kept, index in enumerate(range(total - 1, -1, -1)):
+        if kept >= cap:
+            break
+        cost = _turn_token_cost(transcript[index])
+        if kept > 0 and used + cost > budget:
+            break
+        start = index
+        used += cost
+    return max(0, start)
+
+
 @dataclass
 class RoomContextManager:
     """Owns per-participant cursors and context-mode decisions."""
@@ -180,6 +309,16 @@ class RoomContextManager:
     cursor_enabled: bool = True
     raw_window: int = 8
     summary_every_turns: int = 10
+    #: Refresh cadence once a summary exists.  Distinct from
+    #: ``summary_every_turns`` (the legacy value) so the legacy default keeps
+    #: working for callers that do not opt in to the new cadence.
+    summary_refresh_every_turns: int = 10
+    #: Hard ceiling on the rendered rolling summary.
+    summary_max_chars: int = 2400
+    #: Token ceiling on the rendered rolling summary (both caps apply).
+    summary_output_max_tokens: int = 800
+    #: Hard ceiling on what the summariser may be asked to read.
+    summary_input_max_tokens: int = 4096
     _cursors: dict[tuple[str, str], int] = field(default_factory=dict)
     _reset_pending: set[tuple[str, str]] = field(default_factory=set)
     delta_sends: int = 0
@@ -214,6 +353,8 @@ class RoomContextManager:
         persistent: bool,
         summary_block: str | None = None,
         transport_budget_bytes: int | None = None,
+        message_window: int | None = None,
+        recent_token_budget: int | None = None,
     ) -> RoomTurnContext:
         """Return the turns + mode that should compose the next prompt.
 
@@ -223,10 +364,28 @@ class RoomContextManager:
         the result is a deterministic truncation -- never a silent fallback
         to the full transcript, which is what used to blow past the ARGV
         ceiling and fail the turn with PROMPT_TRANSPORT_LIMIT_EXCEEDED.
+
+        ``message_window`` / ``recent_token_budget`` come from the turn's
+        resolved :mod:`persona_continuum.room.context_policy` profile.  The
+        token budget is the primary unit; the message count is the cap.  Both
+        default to the manager's own construction-time values, so callers that
+        do not resolve a policy keep the historical behaviour exactly.
         """
 
+        transcript = [
+            {
+                **t,
+                **normalize_turn_for_prompt(t),
+                "content": normalize_turn_for_prompt(t)["spoken_text"],
+            }
+            for t in transcript
+        ]
         key = self._key(room_id, participant_id)
         delivered_through = len(transcript)
+        window_cap = self.raw_window if message_window is None else max(1, int(message_window))
+        window_start = recent_window_start(
+            transcript, message_window=window_cap, token_budget=recent_token_budget
+        )
         budget = (
             int(transport_budget_bytes)
             if transport_budget_bytes is not None
@@ -246,16 +405,14 @@ class RoomContextManager:
                     if transcript:
                         self.rehydrations += 1
                         return RoomTurnContext(
-                            turns=list(transcript[-self.raw_window :]),
+                            turns=list(transcript[window_start:]),
                             mode="rehydrated",
                             cursor_before=0,
                             summary_block=summary_block,
                             cursor_after=delivered_through,
                             track_cursor=True,
                         )
-                    return RoomTurnContext(
-                        turns=[], mode="delta", cursor_before=0, cursor_after=0
-                    )
+                    return RoomTurnContext(turns=[], mode="delta", cursor_before=0, cursor_after=0)
                 if _estimate_transcript_bytes(transcript) > budget:
                     # A brand-new persistent thread must still be delivered
                     # something that fits on the wire; the older turns are
@@ -303,8 +460,17 @@ class RoomContextManager:
                 track_cursor=True,
             )
         # Stateless: bounded layered window instead of unbounded history.
-        if len(transcript) > self.raw_window and summary_block:
-            window = list(transcript[-self.raw_window :])
+        #
+        # HARD RULE: once the transcript no longer fits the recent window (by
+        # token budget or by the message cap), the full transcript is never
+        # sent again.  It used to be sent whenever a rolling summary happened
+        # to be missing (not yet generated, refresh failed, or a refresh was
+        # still in flight), which made the prompt grow without bound until the
+        # provider refused it.  Older content now reaches the model only as the
+        # summary plus retrieved long-term memories; the full transcript stays
+        # in the database as history and provenance.
+        if window_start > 0:
+            window = list(transcript[window_start:])
             if _estimate_transcript_bytes(window) > budget:
                 window = _trim_to_budget(window, budget)
                 return RoomTurnContext(
@@ -322,10 +488,7 @@ class RoomContextManager:
                 summary_block=summary_block,
                 cursor_after=delivered_through,
             )
-        # No rolling summary to lean on: the raw window is the only context
-        # there is.  Falling back to the *entire* transcript here is what
-        # produced oversized ARGV prompts, so it is not allowed any more --
-        # the transcript is truncated deterministically instead.
+        # History fits inside the raw window: it is the whole context anyway.
         if _estimate_transcript_bytes(transcript) > budget:
             return RoomTurnContext(
                 turns=_trim_to_budget(transcript, budget),
@@ -339,6 +502,7 @@ class RoomContextManager:
             turns=list(transcript),
             mode="full",
             cursor_before=len(transcript),
+            summary_block=summary_block,
             cursor_after=delivered_through,
         )
 
@@ -350,10 +514,63 @@ class RoomContextManager:
             self._cursors[self._key(room_id, participant_id)] = ctx.cursor_after
         # Stateless participants keep no cursor; every turn is a fresh window.
 
-    def should_update_summary(self, turn_index: int) -> bool:
-        if turn_index < self.raw_window:
+    def eviction_boundary(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        message_window: int | None = None,
+        recent_token_budget: int | None = None,
+    ) -> int:
+        """Index where the recent window starts, i.e. the summary boundary.
+
+        Exposed so the orchestrator can take the SMALLEST window start across
+        the room's participants: everything that could have left any
+        participant's window must be folded into the shared summary, otherwise
+        it becomes an orphan turn -- gone from the prompt and never summarised.
+        """
+
+        cap = self.raw_window if message_window is None else max(1, int(message_window))
+        return recent_window_start(
+            transcript, message_window=cap, token_budget=recent_token_budget
+        )
+
+    def should_update_summary(
+        self,
+        turn_index: int,
+        *,
+        transcript_len: int | None = None,
+        has_summary: bool | None = None,
+        eviction_boundary: int | None = None,
+    ) -> bool:
+        """Whether to (re)build the rolling summary before the next turn.
+
+        The first summary is built as soon as history leaves the recent window
+        -- it must not wait for ``2 * raw_window`` turns, because during that
+        gap the prompt has no summary to lean on.  After that it refreshes on
+        the ``summary_refresh_every_turns`` cadence.
+
+        ``eviction_boundary`` (see :meth:`eviction_boundary`) replaces the
+        message-count comparison; when omitted the historical modulo behaviour
+        is preserved, so existing callers are unaffected.
+        """
+
+        if eviction_boundary is None:
+            if turn_index < self.raw_window:
+                return False
+            if transcript_len is not None and transcript_len <= self.raw_window:
+                # Everything still fits in the raw window; nothing to summarize.
+                return False
+        elif eviction_boundary <= 0:
+            # Nothing has left the recent window yet: there is no delta to fold.
             return False
-        return turn_index % max(4, self.summary_every_turns) == 0
+        if has_summary is False:
+            # First time history outgrew the window: build one now.
+            return True
+        if has_summary is None:
+            every = max(4, self.summary_every_turns)
+        else:
+            every = max(2, self.summary_refresh_every_turns)
+        return turn_index % every == 0
 
     async def update_summary(
         self,
@@ -361,34 +578,151 @@ class RoomContextManager:
         transcript: list[dict[str, Any]],
         previous_summary: str | None,
         summarize: Any,
-    ) -> str | None:
-        """Regenerate the durable rolling summary via one model call.
+        checkpoint: int | None = None,
+        eviction_boundary: int | None = None,
+        summary_max_chars: int | None = None,
+        summary_output_max_tokens: int | None = None,
+        summary_input_max_tokens: int | None = None,
+    ) -> tuple[str | None, int | None, dict[str, Any]]:
+        """Fold the next slice of evicted dialogue into the rolling summary.
 
-        ``summarize`` is an async callable (prompt, schema) -> dict; injected
-        so the manager never touches adapters directly.
+        Returns ``(summary, new_checkpoint, report)``.
+
+        Delta-based by construction.  The raw window is still carried verbatim
+        in the prompt, so the summariser only ever sees messages that have
+        *already left* it, and only those newer than ``checkpoint`` (the index
+        the previous summary was built through).  The slice is folded oldest
+        first, so the checkpoint advances monotonically and nothing is skipped.
+
+        The assembled payload is held under ``summary_input_max_tokens`` by
+        stopping at a message boundary.  It never falls back to the full
+        transcript and never truncates a string mid-message.
+
+        ``eviction_boundary`` / ``summary_*`` overrides carry the current
+        turn's resolved context profile, so a 1M-context room keeps a far
+        richer long-term summary than the local survival profile does.
         """
 
+        input_budget = (
+            self.summary_input_max_tokens
+            if summary_input_max_tokens is None
+            else max(512, int(summary_input_max_tokens))
+        )
+        output_budget = (
+            self.summary_output_max_tokens
+            if summary_output_max_tokens is None
+            else max(100, int(summary_output_max_tokens))
+        )
+        char_cap = (
+            self.summary_max_chars
+            if summary_max_chars is None
+            else max(400, int(summary_max_chars))
+        )
+        report: dict[str, Any] = {
+            "input_budget_tokens": input_budget,
+            "output_budget_tokens": output_budget,
+        }
         if not transcript:
-            return previous_summary
-        async with self._summary_lock:
-            window = transcript[-(self.summary_every_turns + self.raw_window) :]
-            payload = {
-                "previous_summary": previous_summary or "",
-                "new_turns": [
-                    {
-                        "speaker": t.get("speaker_name") or t.get("persona_id"),
-                        "content": str(t.get("content") or "")[:1200],
-                    }
-                    for t in window
-                ],
+            report["reason"] = "empty_transcript"
+            return previous_summary, checkpoint, report
+
+        if eviction_boundary is None:
+            boundary = max(0, len(transcript) - self.raw_window)
+        else:
+            boundary = max(0, min(int(eviction_boundary), len(transcript)))
+        report["eviction_boundary"] = boundary
+        if boundary <= 0:
+            report["reason"] = "nothing_evicted_yet"
+            return previous_summary, checkpoint, report
+
+        start = 0 if checkpoint is None else max(0, min(int(checkpoint), boundary))
+        report["checkpoint_before"] = start
+        if start >= boundary:
+            report["reason"] = "no_new_delta"
+            return previous_summary, checkpoint, report
+
+        previous_text = normalize_turn(previous_summary or "", actor="summary").spoken_text
+        fixed_tokens = estimate_tokens(SUMMARY_PROMPT_INTRO) + estimate_tokens(previous_text)
+        budget = max(0, input_budget - fixed_tokens)
+        report["previous_summary_tokens"] = estimate_tokens(previous_text)
+        report["fixed_prompt_tokens"] = estimate_tokens(SUMMARY_PROMPT_INTRO)
+
+        admitted: list[dict[str, Any]] = []
+        delta_tokens = 0
+        clipped = 0
+        for index in range(start, boundary):
+            item = normalize_turn_for_prompt(transcript[index])
+            # Only the fields the digester needs; the full normalised envelope
+            # carries scene/action bookkeeping that would only burn budget.
+            compact = {
+                "speaker": item.get("speaker_name") or item.get("participant_id") or "",
+                "text": str(item.get("spoken_text") or "").strip(),
             }
+            if not compact["text"]:
+                continue
+            cost = estimate_tokens(json.dumps(compact, ensure_ascii=False))
+            if admitted and delta_tokens + cost > budget:
+                break
+            if not admitted and cost > budget:
+                # One oversized message must not break the ceiling.  Clip it to
+                # the remaining room (message-level, not payload-tail) and, if
+                # even that cannot fit, defer rather than over-spend -- the
+                # checkpoint then stays put and the next refresh retries it.
+                room = budget - 32  # JSON/envelope headroom
+                if room < 16:
+                    report["reason"] = "delta_exceeds_budget"
+                    return previous_summary, checkpoint, report
+                compact["text"] = compact["text"][:room]
+                cost = estimate_tokens(json.dumps(compact, ensure_ascii=False))
+                if cost > budget:
+                    report["reason"] = "delta_exceeds_budget"
+                    return previous_summary, checkpoint, report
+                clipped += 1
+            admitted.append(compact)
+            delta_tokens += cost
+
+        if not admitted:
+            report["reason"] = "delta_exceeds_budget"
+            return previous_summary, checkpoint, report
+
+        new_checkpoint = start + len(admitted)
+        payload = {
+            "previous_summary": previous_text,
+            "new_dialogue_since_last_summary": admitted,
+        }
+        report.update(
+            {
+                "delta_messages": len(admitted),
+                "delta_tokens": delta_tokens,
+                "delta_messages_clipped": clipped,
+                "delta_messages_deferred": boundary - new_checkpoint,
+                "estimated_input_tokens": fixed_tokens + delta_tokens,
+                "checkpoint_after": new_checkpoint,
+            }
+        )
+
+        async with self._summary_lock:
             try:
                 result = await summarize(payload, SUMMARY_SCHEMA)
-            except Exception:
-                return previous_summary
-            if isinstance(result, dict):
-                return render_summary_markdown(result)
-            return previous_summary
+            except Exception as exc:  # noqa: BLE001
+                report["reason"] = f"summarize_failed:{type(exc).__name__}"
+                return previous_summary, checkpoint, report
+        if not isinstance(result, dict):
+            report["reason"] = "summarizer_returned_no_object"
+            return previous_summary, checkpoint, report
+
+        rendered = normalize_turn(
+            render_summary_markdown(
+                result,
+                max_chars=char_cap,
+                max_tokens=output_budget,
+            ),
+            actor="summary",
+        ).spoken_text
+        report["output_tokens"] = estimate_tokens(rendered)
+        report["output_chars"] = len(rendered)
+        report["reason"] = "ok"
+        return rendered, new_checkpoint, report
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -405,5 +739,9 @@ __all__ = [
     "RoomTurnContext",
     "SUMMARY_PROMPT_INTRO",
     "SUMMARY_SCHEMA",
+    "CANONICAL_SUMMARY_VERSION",
+    "LEGACY_SUMMARY_MARKER",
+    "is_canonical_summary",
+    "recent_window_start",
     "render_summary_markdown",
 ]

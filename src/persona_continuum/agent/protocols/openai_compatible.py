@@ -75,6 +75,57 @@ def _provider_rejected_reasoning(error_text: str) -> bool:
     )
 
 
+_JSON_OBJECT_INSTRUCTION = (
+    "Return a single JSON object only. Do not wrap the JSON in markdown."
+)
+
+
+def _provider_requires_json_word(error_text: str) -> bool:
+    """DashScope-style gateways reject json_object unless messages mention JSON."""
+
+    normalized = str(error_text or "").casefold()
+    if "json_object" not in normalized and "response_format" not in normalized:
+        return False
+    return "must contain" in normalized and "json" in normalized
+
+
+def _message_text_mentions_json(content: Any) -> bool:
+    if isinstance(content, str):
+        return "json" in content.casefold()
+    if isinstance(content, list):
+        return any(_message_text_mentions_json(part) for part in content)
+    if isinstance(content, dict):
+        return "json" in str(content.get("text") or content.get("content") or "").casefold()
+    return False
+
+
+def _messages_mention_json(messages: list[dict[str, Any]]) -> bool:
+    return any(_message_text_mentions_json(message.get("content")) for message in messages)
+
+
+def _ensure_json_object_instruction(messages: list[dict[str, Any]]) -> None:
+    """Satisfy the json_object contract without changing an already-valid prompt."""
+
+    if _messages_mention_json(messages):
+        return
+    _append_system_instruction(messages, _JSON_OBJECT_INSTRUCTION)
+
+
+def _append_system_instruction(messages: list[dict[str, Any]], instruction: str) -> None:
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"{content}\n\n{instruction}"
+            return
+        if isinstance(content, list):
+            # Native-role rendering shallow-copies messages from the turn.
+            message["content"] = [*content, {"type": "text", "text": instruction}]
+            return
+    messages.insert(0, {"role": "system", "content": instruction})
+
+
 def _choice_text(choice: dict[str, Any]) -> tuple[str, str]:
     """Return (content, thinking) from a streaming or completed chat choice."""
     raw_delta = choice.get("delta")
@@ -144,6 +195,10 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
     # The /models listing reports each model's window; the window itself is
     # fixed by the provider and no context parameter is sent.
     context_window_mode = ContextWindowMode.DISCOVERABLE
+    # HTTP request body, not a shell argument.  Without this declaration the
+    # transport guard infers UNKNOWN (64KB) and rejects a prompt the API can
+    # carry.
+    prompt_transport_mode = "rpc"
 
     def __init__(
         self,
@@ -420,6 +475,20 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
                 turn
             )
             self._apply_provider_image_parts(wire_messages, turn)
+            if (
+                turn.expected_output is not None
+                and self.structured_output_mode == StructuredOutputMode.JSON_MODE
+            ):
+                # json_object guarantees JSON syntax only; native-role rendering
+                # does not carry expected_output, so send the schema explicitly.
+                schema = turn.expected_output
+                if hasattr(schema, "model_json_schema"):
+                    schema = schema.model_json_schema()
+                _append_system_instruction(
+                    wire_messages,
+                    "Return a single JSON object conforming to this JSON Schema:\n"
+                    + json.dumps(schema, ensure_ascii=False, sort_keys=True),
+                )
             wire_bytes = len(
                 json.dumps(wire_messages, ensure_ascii=False, default=str).encode("utf-8")
             )
@@ -427,8 +496,7 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
             yield agent_error_event(exc, protocol="openai_compatible_http")
             return
         turn.metadata["estimated_wire_bytes"] = wire_bytes
-        messages: list[dict[str, Any]] = AgentPromptRenderer.render_for_native_roles(turn)
-        self._apply_provider_image_parts(messages, turn)
+        messages = wire_messages
 
         model = session.config.model_id or self.default_model
         payload: dict[str, Any] = {
@@ -451,6 +519,8 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
             payload["tools"] = turn.tools
             payload["tool_choice"] = "auto"
         self._add_structured_output_request(payload, turn)
+        if str((payload.get("response_format") or {}).get("type") or "") == "json_object":
+            _ensure_json_object_instruction(messages)
 
         url = f"{base_url}/chat/completions"
         full_content: list[str] = []
@@ -498,6 +568,9 @@ class OpenAICompatibleAPIAdapter(AgentAdapter):
                                     protocol="openai_compatible_http",
                                 )
                                 return
+                            if _provider_requires_json_word(err_text):
+                                _ensure_json_object_instruction(messages)
+                                payload["messages"] = list(messages)
                             payload.pop("stream_options", None)
                             payload.pop("tools", None)
                             payload.pop("tool_choice", None)

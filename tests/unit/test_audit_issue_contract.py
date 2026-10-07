@@ -158,6 +158,39 @@ def test_legacy_failed_row_without_code_stays_retryable() -> None:
     assert is_retryable_failure(legacy) is True
 
 
+def test_wrapped_prompt_transport_limit_row_is_retryable() -> None:
+    legacy = {
+        "code": "PERSONA_CREATION_ERROR",
+        "message": "PROMPT_TRANSPORT_LIMIT_EXCEEDED",
+        "retriable": False,
+    }
+    assert is_retryable_failure(legacy) is True
+    assert classify_persona_failure(Exception("PROMPT_TRANSPORT_LIMIT_EXCEEDED")) == (
+        PersonaFailureCode.TRANSPORT_FAILED.value
+    )
+
+
+def test_json_object_http_400_row_is_retryable() -> None:
+    failure = {
+        "code": "AGENT_TRANSPORT_ERROR",
+        "message": "Agent HTTP request failed",
+        "retriable": False,
+        "diagnostics": {
+            "failure": {
+                "diagnostics": {
+                    "status_code": 400,
+                    "diagnostic": (
+                        "{\"error\":{\"message\":\"'messages' must contain the word "
+                        "'json' in some form, to use 'response_format' of type "
+                        "'json_object'.\"}}"
+                    ),
+                }
+            }
+        },
+    }
+    assert is_retryable_failure(failure) is True
+
+
 def test_typed_failure_row_is_retryable_even_if_retriable_false() -> None:
     failure = {
         "code": "AUDIT_REPAIR_FAILED",

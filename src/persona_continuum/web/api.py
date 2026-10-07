@@ -29,6 +29,8 @@ from persona_continuum.application.world.entity_classification_service import (
 from persona_continuum.domain.narrative import ProductionAsset
 from persona_continuum.domain.persona import PersonaType
 from persona_continuum.domain.profile import ProfileType
+from persona_continuum.domain.scene import RoomSceneState
+from persona_continuum.ingestion.errors import MaterialTooLargeError
 from persona_continuum.narrative.runtime import (
     NARRATIVE_PRODUCTION_CANON_REQUIRED,
     SHOOTING_SOURCE_PREVIEW_NOT_ALLOWED,
@@ -53,7 +55,7 @@ from persona_continuum.room.models import (
 )
 from persona_continuum.room.orchestrator import RoomBusyError, RoomProtocolConversionError
 from persona_continuum.room.random_resolver import ResolverError
-from persona_continuum.security.validation import ConflictError
+from persona_continuum.security.validation import ConflictError, SecurityError
 
 
 def json_ok(data: Any = None, status_code: int = 200) -> JSONResponse:
@@ -504,11 +506,46 @@ class WebAPIHandler:
                     ],
                     "episodes": [item.model_dump(mode="json") for item in index.episodes()],
                     "fused_count": len(index.fused()),
-                    "unit_count": len(index.units()),
+                    "unit_count": index.unit_count(),
                 }
             )
         except Exception as exc:
             return json_err(str(exc), status_code=404)
+
+    async def upload_persona_material(self, request: Request) -> Response:
+        """Stream a private material file to staging. Never buffers the full body."""
+
+        from urllib.parse import unquote
+
+        from starlette.requests import ClientDisconnect
+
+        filename = str(
+            request.query_params.get("filename") or request.headers.get("x-filename") or ""
+        )
+        if "%" in filename:
+            filename = unquote(filename)
+        length_header = request.headers.get("content-length")
+        content_length = None
+        if length_header:
+            parsed_length = safe_int(length_header, default=None, minimum=0)
+            content_length = int(parsed_length) if parsed_length is not None else None
+        try:
+            upload = await self.continuum.material_uploads.astream_chunks(
+                filename=filename,
+                chunks=request.stream(),
+                content_length=content_length,
+            )
+        except MaterialTooLargeError as exc:
+            return json_err(
+                str(exc),
+                status_code=413,
+                details={"size": exc.size, "limit": exc.limit},
+            )
+        except (SecurityError, ClientDisconnect) as exc:
+            return json_err(str(exc), status_code=400)
+        except Exception as exc:
+            return json_err(str(exc), status_code=400)
+        return json_ok(self.continuum.material_uploads.public_record(upload), status_code=201)
 
     async def list_persona_material_jobs(self, request: Request) -> Response:
         persona_id = request.query_params.get("persona_id")
@@ -557,9 +594,7 @@ class WebAPIHandler:
             body = await request.json()
         except Exception:
             return json_err("persona_name_required", status_code=400)
-        display_name = str(
-            body.get("display_name") or body.get("name") or ""
-        )
+        display_name = str(body.get("display_name") or body.get("name") or "")
         if not display_name.strip():
             return json_err("persona_name_required", status_code=400)
         try:
@@ -592,9 +627,15 @@ class WebAPIHandler:
                 "research_tools",
                 "research_tool_policy",
                 "cli_flags",
+                # P1-C: per-task Semantic Gate strategy (auto/full/balanced/fast).
+                "material_semantic_gate_mode",
             ):
                 if runtime.get(key) is not None and key not in job_config:
                     job_config[key] = runtime[key]
+            if body.get("material_semantic_gate_mode") and (
+                "material_semantic_gate_mode" not in job_config
+            ):
+                job_config["material_semantic_gate_mode"] = body.get("material_semantic_gate_mode")
             job = await self.continuum.persona_creation.create_job(
                 display_name=str(body.get("display_name") or body.get("name") or ""),
                 aliases=list(body.get("aliases") or []),
@@ -630,6 +671,7 @@ class WebAPIHandler:
                 life_status=body.get("life_status"),
                 privacy_scope=body.get("privacy_scope"),
                 identity_context=body.get("identity_context"),
+                persona_notes=body.get("persona_notes"),
                 user_defined_facts=body.get("user_defined_facts"),
                 research_mode=body.get("research_mode"),
                 web_scope=body.get("web_scope"),
@@ -804,9 +846,7 @@ class WebAPIHandler:
                 if isinstance(parsed, dict):
                     body = parsed
             runtime = (
-                body.get("runtime")
-                or body.get("execution_runtime")
-                or body.get("agent_runtime")
+                body.get("runtime") or body.get("execution_runtime") or body.get("agent_runtime")
             )
             job = await self.continuum.persona_creation.resume_job(
                 request.path_params.get("job_id", ""),
@@ -832,9 +872,7 @@ class WebAPIHandler:
                     )
                     if isinstance(candidate, dict) and candidate:
                         runtime = candidate
-            job = await self.continuum.persona_creation.retry_job(
-                requested_id, runtime=runtime
-            )
+            job = await self.continuum.persona_creation.retry_job(requested_id, runtime=runtime)
             if job.id == requested_id and job.status in {"failed", "failed_quality_gate"}:
                 return json_err(
                     "job_not_retriable",
@@ -967,9 +1005,7 @@ class WebAPIHandler:
                 default_model=body.get("default_model")
                 if "default_model" in body
                 else existing.default_model,
-                headers=body.get("headers")
-                if "headers" in body
-                else existing.headers,
+                headers=body.get("headers") if "headers" in body else existing.headers,
                 metadata=dict(body.get("metadata") or {})
                 if "metadata" in body
                 else existing.metadata,
@@ -1151,6 +1187,9 @@ class WebAPIHandler:
                     or (template.shared_context.model_dump(mode="json") if template else {})
                 ),
                 template_id=str(template_id) if template_id else None,
+                scene_state=RoomSceneState.model_validate(body["scene_state"])
+                if body.get("scene_state")
+                else None,
             )
             if body.get("initialize_async", True) and room.participants:
                 self.orchestrator.initialize_room_background(room.id)
@@ -1175,9 +1214,7 @@ class WebAPIHandler:
     async def patch_room(self, request: Request) -> Response:
         try:
             body = await request.json()
-            room = self.orchestrator.update_room(
-                request.path_params.get("room_id", ""), dict(body)
-            )
+            room = self.orchestrator.update_room(request.path_params.get("room_id", ""), dict(body))
             return json_ok(room.model_dump(mode="json"))
         except RoomProtocolConversionError as exc:
             # protocol_change_requires_convert -> 400 with a coded hint;
@@ -1252,9 +1289,7 @@ class WebAPIHandler:
 
     async def finalize_room_protocol(self, request: Request) -> Response:
         try:
-            room = await self.orchestrator.finalize_protocol(
-                request.path_params.get("room_id", "")
-            )
+            room = await self.orchestrator.finalize_protocol(request.path_params.get("room_id", ""))
             return json_ok(room.model_dump(mode="json"))
         except RoomBusyError as exc:
             return json_err(exc.message, status_code=409, details={"code": exc.code})
@@ -1274,8 +1309,11 @@ class WebAPIHandler:
             )
             return json_ok(room.model_dump(mode="json"))
         except RoomProtocolConversionError as exc:
-            status = {"room_not_found": 404, "protocol_run_active": 409,
-                      "room_status_not_convertible": 409}.get(exc.code, 400)
+            status = {
+                "room_not_found": 404,
+                "protocol_run_active": 409,
+                "room_status_not_convertible": 409,
+            }.get(exc.code, 400)
             return json_err(exc.message, status_code=status, details={"code": exc.code})
         except Exception as exc:
             return json_err(str(exc), status_code=400)
@@ -1289,9 +1327,7 @@ class WebAPIHandler:
         return json_ok(runs)
 
     async def get_room_run(self, request: Request) -> Response:
-        run = self.orchestrator.protocol_repository.get_run(
-            request.path_params.get("run_id", "")
-        )
+        run = self.orchestrator.protocol_repository.get_run(request.path_params.get("run_id", ""))
         if run is None:
             return json_err("Room run not found", status_code=404)
         return json_ok(run)
@@ -1433,9 +1469,7 @@ class WebAPIHandler:
             body = await request.json()
             raw_attachments = body.get("attachments") or body.get("attachment_ids") or []
             attachment_ids = (
-                [str(item) for item in raw_attachments]
-                if isinstance(raw_attachments, list)
-                else []
+                [str(item) for item in raw_attachments] if isinstance(raw_attachments, list) else []
             )
             event = await self.orchestrator.inject_message(
                 room_id,
@@ -1445,6 +1479,7 @@ class WebAPIHandler:
                     body.get("client_message_id") or body.get("request_id") or ""
                 ),
                 attachment_ids=attachment_ids,
+                input_mode=str(body.get("input_mode") or "speech"),
             )
             return json_ok(event)
         except Exception as exc:
@@ -1485,9 +1520,7 @@ class WebAPIHandler:
             )
             if not candidate.is_file():
                 return json_err("Attachment not found", status_code=404)
-            record = self.orchestrator.get_room_attachment_by_stored_name(
-                room_id, candidate.name
-            )
+            record = self.orchestrator.get_room_attachment_by_stored_name(room_id, candidate.name)
             filename = str((record or {}).get("filename") or candidate.name)
             media_type = str((record or {}).get("mime") or "application/octet-stream")
             return FileResponse(
@@ -1626,9 +1659,7 @@ class WebAPIHandler:
             for item in [*classification.classified_agents, *classification.non_agent_entities]
         }
         for entity in entities:
-            entity_id = str(
-                entity.get("id") or entity.get("actor_id") or entity.get("name") or ""
-            )
+            entity_id = str(entity.get("id") or entity.get("actor_id") or entity.get("name") or "")
             row = by_id.get(entity_id)
             if row is None:
                 continue
@@ -1650,9 +1681,7 @@ class WebAPIHandler:
         """Carry a user correction into the next deterministic/LLM pass."""
         values = dict(overrides or {})
         for entity in entities:
-            entity_id = str(
-                entity.get("id") or entity.get("actor_id") or entity.get("name") or ""
-            )
+            entity_id = str(entity.get("id") or entity.get("actor_id") or entity.get("name") or "")
             override = values.get(entity_id) or values.get(str(entity.get("name") or ""))
             if override:
                 entity["classification_override"] = override
@@ -1745,9 +1774,7 @@ class WebAPIHandler:
                                 entity
                                 for entity in entities
                                 if str(
-                                    entity.get("id")
-                                    or entity.get("actor_id")
-                                    or entity.get("name")
+                                    entity.get("id") or entity.get("actor_id") or entity.get("name")
                                 )
                                 == item.id
                             ),
@@ -1761,10 +1788,7 @@ class WebAPIHandler:
                     materials_by_actor=dict(body.get("materials_by_actor") or {}),
                     remote_material_consent=bool(body.get("remote_material_consent")),
                 )
-                jobs.extend(
-                    self._public_persona_creation_job(job)
-                    for job in persona_result.jobs
-                )
+                jobs.extend(self._public_persona_creation_job(job) for job in persona_result.jobs)
             for entity in classification.missing_profiles:
                 if (
                     entity.subtype == "person"
@@ -1790,9 +1814,7 @@ class WebAPIHandler:
                     requested_scope="full_refresh",
                     runtime=runtime,
                     research_policy=body.get("research_policy"),
-                    materials=list(
-                        (body.get("materials_by_actor") or {}).get(entity.id, [])
-                    ),
+                    materials=list((body.get("materials_by_actor") or {}).get(entity.id, [])),
                     remote_material_consent=bool(body.get("remote_material_consent")),
                     enrichment_input_mode=body.get("enrichment_input_mode"),
                 )
@@ -1850,10 +1872,7 @@ class WebAPIHandler:
                 remote_material_consent=bool(body.get("remote_material_consent")),
             )
             payload = result.model_dump(mode="json")
-            payload["jobs"] = [
-                self._public_persona_creation_job(job)
-                for job in result.jobs
-            ]
+            payload["jobs"] = [self._public_persona_creation_job(job) for job in result.jobs]
             return json_ok(payload, status_code=202)
         except (
             ResearchCapabilityError,
@@ -2015,9 +2034,7 @@ class WebAPIHandler:
                     require_llm=bool(builder_runtime.get("agent_id"))
                     and not bool(body.get("allow_deterministic_classification", False)),
                 )
-                raw_actors = self._apply_classification_bindings(
-                    raw_actors, classification_result
-                )
+                raw_actors = self._apply_classification_bindings(raw_actors, classification_result)
                 raw_actors = self._ensure_agent_roster(raw_actors, classification_result)
                 unresolved_profiles = [
                     item
@@ -2075,11 +2092,7 @@ class WebAPIHandler:
                         },
                     )
 
-                bindings = dict(
-                    body.get("profile_bindings")
-                    or body.get("persona_bindings")
-                    or {}
-                )
+                bindings = dict(body.get("profile_bindings") or body.get("persona_bindings") or {})
                 if bindings:
                     for item in raw_actors:
                         actor_id = str(item.get("id") or item.get("actor_id") or "")
@@ -2156,9 +2169,7 @@ class WebAPIHandler:
                 )
                 classification_entities = list(meta.get("entity_candidates") or raw_actors)
                 classification_entities = [
-                    item
-                    if isinstance(item, dict)
-                    else {"id": str(item), "name": str(item)}
+                    item if isinstance(item, dict) else {"id": str(item), "name": str(item)}
                     for item in classification_entities
                 ]
                 classification_entities = self._apply_classification_overrides(
@@ -2175,9 +2186,7 @@ class WebAPIHandler:
                     runtime=classification_runtime,
                     require_llm=meta.get("builder_source") == "llm",
                 )
-                raw_actors = self._apply_classification_bindings(
-                    raw_actors, classification_result
-                )
+                raw_actors = self._apply_classification_bindings(raw_actors, classification_result)
                 raw_actors = self._ensure_agent_roster(raw_actors, classification_result)
                 built_matches = self.continuum.persona_creation.match_world_actors(
                     [
@@ -2250,9 +2259,7 @@ class WebAPIHandler:
                     or body.get("actor_completion_confirmed")
                 ) and (body.get("persona_bindings") or body.get("profile_bindings")):
                     bindings = dict(
-                        body.get("profile_bindings")
-                        or body.get("persona_bindings")
-                        or {}
+                        body.get("profile_bindings") or body.get("persona_bindings") or {}
                     )
                     for item in seed.metadata["initial_actors"]:
                         if isinstance(item, dict) and str(item.get("id")) in bindings:
@@ -2493,9 +2500,9 @@ class WebAPIHandler:
                 "question",
                 "Which simulated branch outcome leads relative to the others?",
             )
-            branch_count = safe_int(
-                body.get("branch_count", 3), default=3, minimum=1, maximum=100
-            ) or 3
+            branch_count = (
+                safe_int(body.get("branch_count", 3), default=3, minimum=1, maximum=100) or 3
+            )
             metrics = body.get("metrics")
 
             evaluation = await self.continuum.worlds.evaluate_question(
@@ -2770,19 +2777,13 @@ class WebAPIHandler:
             ]
             row["scenes"] = [
                 scene.model_dump(mode="json")
-                for scene in self.continuum.narratives.list_scenes(
-                    project_id, plan.episode_number
-                )
+                for scene in self.continuum.narratives.list_scenes(project_id, plan.episode_number)
             ]
             synthesis = self.continuum.narratives.get_writer_room_synthesis(
                 project_id, plan.episode_number
             )
-            row["writer_room_synthesis"] = (
-                synthesis.model_dump(mode="json") if synthesis else None
-            )
-            audits = self.continuum.narratives.list_audits(
-                project_id, plan.episode_number
-            )
+            row["writer_room_synthesis"] = synthesis.model_dump(mode="json") if synthesis else None
+            audits = self.continuum.narratives.list_audits(project_id, plan.episode_number)
             row["latest_audit"] = audits[0].model_dump(mode="json") if audits else None
             data.append(row)
         return json_ok(data)
@@ -3043,10 +3044,7 @@ class WebAPIHandler:
         project_id = request.path_params.get("project_id", "")
         try:
             body = await request.json()
-            number = int(
-                request.path_params.get("episode_number")
-                or body.get("episode_number", 0)
-            )
+            number = int(request.path_params.get("episode_number") or body.get("episode_number", 0))
             result = await self.continuum.narratives.run_writer_room(
                 project_id,
                 number,
@@ -3061,9 +3059,7 @@ class WebAPIHandler:
         project_id = request.path_params.get("project_id", "")
         try:
             number = int(request.path_params.get("episode_number", "0"))
-            synthesis = self.continuum.narratives.get_writer_room_synthesis(
-                project_id, number
-            )
+            synthesis = self.continuum.narratives.get_writer_room_synthesis(project_id, number)
             return json_ok(synthesis.model_dump(mode="json") if synthesis else None)
         except Exception as exc:
             return narrative_json_err(exc)
@@ -3284,9 +3280,7 @@ class WebAPIHandler:
             repo = self.continuum.narratives.repo
             production = repo.get_production_package(package_id)
             if production is None:
-                return json_err(
-                    f"Production package not found: {package_id}", status_code=404
-                )
+                return json_err(f"Production package not found: {package_id}", status_code=404)
             # repo rows are newest-first; export folders read best in
             # creation order (oldest plan first).
             packages = list(
@@ -3299,16 +3293,11 @@ class WebAPIHandler:
                 )
             )
             if not packages:
-                return json_err(
-                    "No clips to export for this production package", status_code=404
-                )
+                return json_err("No clips to export for this production package", status_code=404)
             assets_by_id = {
-                asset.id: asset
-                for asset in repo.list_production_assets(project_id, package_id)
+                asset.id: asset for asset in repo.list_production_assets(project_id, package_id)
             }
-            archive, filename = build_clip_export_zip(
-                production, packages, assets_by_id
-            )
+            archive, filename = build_clip_export_zip(production, packages, assets_by_id)
             return Response(
                 content=archive,
                 media_type="application/zip",
@@ -3357,9 +3346,7 @@ class WebAPIHandler:
             # instead of letting the background job fail later.
             get_profile(profile_id)
             self._validated_prompt_package_source(package_id)
-            job = self.continuum.narratives.create_job(
-                "model_prompt_package", project_id, payload
-            )
+            job = self.continuum.narratives.create_job("model_prompt_package", project_id, payload)
             return json_ok(job, status_code=202)
         except Exception as exc:
             return shooting_json_err(exc)
@@ -3381,9 +3368,7 @@ class WebAPIHandler:
             get_profile(profile_id)
             self._validated_prompt_package_source(package_id)
             payload["stop_after_plan"] = True
-            job = self.continuum.narratives.create_job(
-                "model_prompt_package", project_id, payload
-            )
+            job = self.continuum.narratives.create_job("model_prompt_package", project_id, payload)
             return json_ok(job, status_code=202)
         except Exception as exc:
             return shooting_json_err(exc)
@@ -3421,9 +3406,7 @@ class WebAPIHandler:
         try:
             package = self.continuum.narratives.repo.get_model_prompt_package(package_id)
             if package is None or package.project_id != project_id:
-                return json_err(
-                    f"Model prompt package not found: {package_id}", status_code=404
-                )
+                return json_err(f"Model prompt package not found: {package_id}", status_code=404)
             try:
                 body = await request.json()
             except Exception:
@@ -3433,9 +3416,7 @@ class WebAPIHandler:
                 "production_package_id": package.production_package_id,
                 "profile_id": str(body.get("profile_id") or package.target_profile_id),
                 "aspect_ratio": str(body.get("aspect_ratio") or package.aspect_ratio),
-                "quality_priority": str(
-                    body.get("quality_priority") or package.quality_priority
-                ),
+                "quality_priority": str(body.get("quality_priority") or package.quality_priority),
                 "generation_strategy": str(
                     body.get("generation_strategy") or package.generation_strategy
                 ),
@@ -3447,9 +3428,7 @@ class WebAPIHandler:
             }
             get_profile(str(payload["profile_id"]))
             self._validated_prompt_package_source(str(package.production_package_id))
-            job = self.continuum.narratives.create_job(
-                "model_prompt_package", project_id, payload
-            )
+            job = self.continuum.narratives.create_job("model_prompt_package", project_id, payload)
             return json_ok(job, status_code=202)
         except Exception as exc:
             return shooting_json_err(exc)
@@ -3460,9 +3439,7 @@ class WebAPIHandler:
         try:
             package = self.continuum.narratives.repo.get_model_prompt_package(package_id)
             if package is None or package.project_id != project_id:
-                return json_err(
-                    f"Model prompt package not found: {package_id}", status_code=404
-                )
+                return json_err(f"Model prompt package not found: {package_id}", status_code=404)
             return json_ok(prompt_package_payload(package))
         except Exception as exc:
             return shooting_json_err(exc)
@@ -3498,9 +3475,7 @@ class WebAPIHandler:
         project_id = request.path_params.get("project_id", "")
         package_id = request.query_params.get("production_package_id") or None
         try:
-            assets = self.continuum.narratives.repo.list_production_assets(
-                project_id, package_id
-            )
+            assets = self.continuum.narratives.repo.list_production_assets(project_id, package_id)
             return json_ok([a.model_dump(mode="json") for a in assets])
         except Exception as exc:
             return shooting_json_err(exc)
@@ -3565,9 +3540,7 @@ class WebAPIHandler:
     async def get_shooting_session(self, request: Request) -> Response:
         session_id = request.path_params.get("session_id", "")
         try:
-            return json_ok(
-                self.continuum.narrative_shooting.session_snapshot(session_id)
-            )
+            return json_ok(self.continuum.narrative_shooting.session_snapshot(session_id))
         except Exception as exc:
             return shooting_json_err(exc)
 
@@ -3650,9 +3623,7 @@ class WebAPIHandler:
                 project_id, package_id
             )
             # Rows come back ordered by created_at DESC: first ready wins.
-            source = next(
-                (p for p in packages if p.status == "ready" and not p.stale), None
-            )
+            source = next((p for p in packages if p.status == "ready" and not p.stale), None)
             if source is None:
                 raise NarrativeAgentError(
                     VIDEO_GUIDE_SOURCE_NOT_READY,
@@ -3689,9 +3660,7 @@ class WebAPIHandler:
             except Exception:
                 body = {}
             body = body or {}
-            target_profile_id = str(
-                body.get("target_profile_id") or body.get("profile_id") or ""
-            )
+            target_profile_id = str(body.get("target_profile_id") or body.get("profile_id") or "")
             if not target_profile_id:
                 return json_err("target_profile_id is required")
             get_profile(target_profile_id)
@@ -3731,9 +3700,7 @@ class WebAPIHandler:
                     f"Production guide not found for production package: {package_id}",
                     status_code=404,
                 )
-            return json_ok(
-                production_guide_payload(guides[0], self.continuum.narratives.repo)
-            )
+            return json_ok(production_guide_payload(guides[0], self.continuum.narratives.repo))
         except Exception as exc:
             return shooting_json_err(exc)
 
@@ -3743,12 +3710,8 @@ class WebAPIHandler:
         try:
             guide = self.continuum.narratives.repo.get_video_production_guide(guide_id)
             if guide is None or guide.project_id != project_id:
-                return json_err(
-                    f"Production guide not found: {guide_id}", status_code=404
-                )
-            return json_ok(
-                production_guide_payload(guide, self.continuum.narratives.repo)
-            )
+                return json_err(f"Production guide not found: {guide_id}", status_code=404)
+            return json_ok(production_guide_payload(guide, self.continuum.narratives.repo))
         except Exception as exc:
             return shooting_json_err(exc)
 
@@ -3759,9 +3722,7 @@ class WebAPIHandler:
         try:
             guide = self.continuum.narratives.repo.get_video_production_guide(guide_id)
             if guide is None or guide.project_id != project_id:
-                return json_err(
-                    f"Production guide not found: {guide_id}", status_code=404
-                )
+                return json_err(f"Production guide not found: {guide_id}", status_code=404)
             filename = (
                 f"guide-ep{guide.episode_number:02d}-"
                 f"{_safe_zip_name(guide.id or guide.production_package_id)}.md"
@@ -3866,9 +3827,7 @@ def _clip_export_text(package: Any, clip: Any, assets_by_id: dict[str, Any]) -> 
     ]
     if clip.purpose:
         rows.append(f"用途：{clip.purpose}")
-    rows.append(
-        f"参考素材：{'、'.join(asset_label(a) for a in clip.reference_asset_ids) or '无'}"
-    )
+    rows.append(f"参考素材：{'、'.join(asset_label(a) for a in clip.reference_asset_ids) or '无'}")
     if clip.continuity_constraints:
         rows.append(f"连续性约束：{'；'.join(clip.continuity_constraints)}")
     rows.append(
@@ -3923,9 +3882,7 @@ def build_clip_export_zip(
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for plan_index, package in enumerate(packages, start=1):
             folder = f"{plan_index:02d}-{_safe_zip_name(package.target_profile_id)}"
-            display = (
-                package.target_video_model_display_name or package.target_profile_id
-            )
+            display = package.target_video_model_display_name or package.target_profile_id
             manifest["packages"].append(
                 {
                     "id": package.id,
@@ -3940,17 +3897,14 @@ def build_clip_export_zip(
                 }
             )
             readme.append(
-                f"## {display}（{folder}/，{len(package.clips)} 个 Clip，"
-                f"状态 {package.status}）"
+                f"## {display}（{folder}/，{len(package.clips)} 个 Clip，状态 {package.status}）"
             )
             for clip in package.clips:
                 name = f"{folder}/clip-{clip.clip_number:02d}.txt"
                 zf.writestr(name, _clip_export_text(package, clip, assets_by_id))
                 readme.append(f"- Clip {clip.clip_number} → {name}")
             readme.append("")
-        zf.writestr(
-            "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)
-        )
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr("README.md", "\n".join(readme))
     episode = int(production.episode_number or 0)
     filename = f"clips-ep{episode:02d}-{_safe_zip_name(production.id)}.zip"

@@ -90,11 +90,7 @@ async def test_safe_exec_cancellation_reaps_process() -> None:
 @pytest.mark.anyio
 async def test_plain_cli_places_runtime_options_before_print_prompt(tmp_path) -> None:
     script = tmp_path / "capture_args.py"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        "print(json.dumps(sys.argv[1:]))\n"
-    )
+    script.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
     script.chmod(0o755)
     adapter = PlainCliAdapter(
         adapter_id="print-cli",
@@ -125,3 +121,33 @@ async def test_plain_cli_places_runtime_options_before_print_prompt(tmp_path) ->
         "-p",
         "[SYSTEM INSTRUCTIONS]\n\n[USER INPUT]\nprobe",
     ]
+
+
+@pytest.mark.anyio
+async def test_partial_stdout_with_nonzero_exit_is_never_success(tmp_path) -> None:
+    script = tmp_path / "partial.py"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        'sys.stdout.write(\'{"units":[{"id":"one"},\')\n'
+        "sys.exit(1)\n"
+    )
+    script.chmod(0o755)
+    adapter = PlainCliAdapter(
+        adapter_id="partial-cli",
+        name="Partial CLI",
+        binary_candidates=[str(script)],
+        exec_args=["-p"],
+    )
+    session = await adapter.create_session(
+        AgentSessionConfig(
+            room_id="room",
+            participant_id="participant",
+            persona_id="persona",
+        )
+    )
+    events = [event async for event in adapter.send(session, AgentTurn(user_message="synthetic"))]
+    assert events[-1].type == AgentEventType.ERROR
+    assert events[-1].metadata["returncode"] == 1
+    assert events[-1].metadata["partial_output_chars"] > 0
+    assert all(event.type != AgentEventType.DONE for event in events)
+    assert "units" not in str(events[-1].metadata)

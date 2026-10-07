@@ -11,6 +11,7 @@ from persona_continuum.agent.adapter import (
     build_runtime_binding_snapshot,
 )
 from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import ContextScope
 from persona_continuum.agent.models import (
     AgentCapabilityFlags,
     AgentEvent,
@@ -43,6 +44,11 @@ class FakeAgentAdapter(AgentAdapter):
     # pressure or trimming must subclass and declare
     # prompt_transport_mode="argv" instead of relying on this base class.
     prompt_transport_mode = "rpc"
+    context_scope = ContextScope.PER_REQUEST
+    adapter_session_mode = "per_request"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = True
+    max_parallel_independent_sessions = 4
 
     def __init__(
         self,
@@ -351,7 +357,6 @@ class FakeAgentAdapter(AgentAdapter):
                         "conflicts": [],
                         "final_judgment": "Adopt the synthesized recommendation now.",
                         "uncertainties": ["Synthetic integration response."],
-                        "recommendations": ["Validate with an explicitly configured real Agent."],
                     },
                     ensure_ascii=False,
                 )
@@ -365,6 +370,57 @@ class FakeAgentAdapter(AgentAdapter):
                 },
                 ensure_ascii=False,
             )
+
+        if (
+            "回忆检查任务" in system_prompt
+            or "raw_recall_ab" in system_prompt
+            or "phase8_ab_answer" in system_prompt
+        ):
+            haystack = f"{system_prompt}\n{prompt}"
+            q_match = re.search(r'"question"\s*:\s*"([^"]+)"', turn.user_message)
+            q_text = q_match.group(1) if q_match else turn.user_message
+
+            needles_map = [
+                (["车厢", "铺位"], ["7号车厢", "12号下铺"]),
+                (["老板娘"], ["阿蜜"]),
+                (["WiFi", "wifi", "密码"], ["ami_chongqing_888"]),
+                (["景点", "游览顺序"], ["磁器口"]),
+                (["落在", "遗落", "藤椅"], ["伞", "藤椅旁"]),
+                (["晚点", "多长时间", "多久"], ["40分钟"]),
+                (["光圈", "焦段", "定焦镜头", "镜头规格"], ["50mm", "f/1.4"]),
+                (["跑鞋", "跑步鞋", "缓震跑鞋"], ["Asics Nimbus 25"]),
+                (
+                    ["相机品牌", "相机型号", "复古相机", "经典复古胶片机", "胶片机是什么品牌"],
+                    ["Olympus", "OM-1"],
+                ),
+                (["宠物医院", "什么路", "几号", "安福路"], ["安福路302号", "瑞欣宠物医院"]),
+                (["原话", "摔门", "吵架"], ["这次就到这吧"]),
+                (["书店", "茶室", "和解"], ["三联书店"]),
+                (["错误码"], ["ERR_0x2F31"]),
+                (["端口"], ["8443"]),
+                (["分支", "代码分支"], ["feature/auth-v2-token-refresh"]),
+                (["跑鞋", "跑步鞋"], ["Asics Nimbus 25"]),
+                (["剂量", "频次", "维生素"], ["每日两次，每次两粒"]),
+                (["错题本", "颜色"], ["蓝色"]),
+                (["现在平时", "现在最喜欢", "平时最喜欢"], ["茉莉奶绿微糖"]),
+                (["大学", "以前最喜欢", "以前喜欢"], ["热拿铁咖啡"]),
+                (
+                    ["流浪猫", "猫咪名字", "猫起名", "猫的名字", "起名叫什么", "起名", "猫"],
+                    ["小灰"],
+                ),
+            ]
+            found_answer = None
+            for key_terms, candidates in needles_map:
+                if any(term in q_text for term in key_terms) and any(
+                    cand in haystack for cand in candidates
+                ):
+                    found_answer = f"根据记录，相关细节为：{' '.join(candidates)}。"
+                    break
+
+            if not found_answer:
+                found_answer = "记忆材料中未记录该具体细节信息。"
+
+            return json.dumps({"answer": found_answer}, ensure_ascii=False)
 
         if "严格最终质量门禁" in system_prompt:
             from persona_continuum.application.compilation_service import REQUIRED_DIMENSIONS

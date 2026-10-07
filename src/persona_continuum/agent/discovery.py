@@ -30,6 +30,9 @@ _STATUS_ORDER = {
     AgentStatus.BROKEN: 5,
     AgentStatus.DISABLED: 6,
 }
+# A live CLI turn can make `agy --version` / `agy models` time out or exit
+# non-zero.  Those results are not proof the runtime disappeared.
+_TRANSIENT_PROBE_STATUSES = {AgentStatus.DETECTED, AgentStatus.BROKEN}
 
 
 class AgentDiscoveryService:
@@ -47,7 +50,7 @@ class AgentDiscoveryService:
         self._probe_sema = asyncio.Semaphore(PROBE_CONCURRENCY)
 
     async def scan(self, force_refresh: bool = True) -> list[AgentProbeResult]:
-        if not force_refresh and self._cached_probes:
+        if not force_refresh and self._cached_probes and not self._scan_lock.locked():
             return self.get_cached_probes()
         async with self._scan_lock:
             if not force_refresh and self._cached_probes:
@@ -91,10 +94,11 @@ class AgentDiscoveryService:
             )
 
             cache = default_model_capability_cache()
-            api_adapters = [
-                adapter for adapter in adapters if isinstance(adapter, OpenAICompatibleAPIAdapter)
-            ]
-            await asyncio.gather(*(cache.invalidate(adapter) for adapter in api_adapters))
+            for adapter in adapters:
+                invalidate = getattr(adapter, "invalidate_model_cache", None)
+                if callable(invalidate):
+                    invalidate()
+            await asyncio.gather(*(cache.invalidate(adapter) for adapter in adapters))
         results = await asyncio.gather(
             *(self._probe_one(a.adapter_id) for a in adapters),
             return_exceptions=True,
@@ -106,6 +110,19 @@ class AgentDiscoveryService:
                 probes.append(r)
                 self._cached_probes[r.id] = r
 
+        # agy's remote catalog can stall while other CLIs are being probed.
+        # Retry once after that contention ends, before caching an empty UI.
+        for index, probe in enumerate(probes):
+            retry_adapter = self.registry.get_adapter(probe.id)
+            if (
+                retry_adapter is not None
+                and getattr(retry_adapter, "retry_catalog_after_scan", False)
+                and not probe.models
+                and probe.model_discovery_error
+            ):
+                retried = await self._probe_one(probe.id)
+                if retried is not None:
+                    probes[index] = retried
         probes.sort(key=lambda p: (_STATUS_ORDER.get(p.status, 99), p.name))
         return probes
 
@@ -121,6 +138,24 @@ class AgentDiscoveryService:
 
     def get_cached_probes(self) -> list[AgentProbeResult]:
         return list(self._cached_probes.values())
+
+    def _retain_ready_probe(
+        self, adapter_id: str, incoming: AgentProbeResult
+    ) -> AgentProbeResult:
+        """Keep a prior READY result across a busy-CLI timeout or version blip."""
+
+        previous = self._cached_probes.get(adapter_id)
+        if (
+            previous is not None
+            and previous.status == AgentStatus.READY
+            and incoming.status in _TRANSIENT_PROBE_STATUSES
+            and (not incoming.binary_path or incoming.binary_path == previous.binary_path)
+            and (not incoming.version or incoming.version == previous.version)
+        ):
+            return previous.model_copy(
+                update={"status_detail": incoming.status_detail or previous.status_detail}
+            )
+        return incoming
 
     async def _probe_one(self, adapter_id: str) -> AgentProbeResult | None:
         adapter = self.registry.get_adapter(adapter_id)
@@ -156,8 +191,9 @@ class AgentDiscoveryService:
             async with self._probe_sema:
                 probe_res = await asyncio.wait_for(
                     adapter.probe(),
-                    timeout=SLOW_PROBE_TIMEOUT_SECONDS.get(
-                        adapter_id, PROBE_TIMEOUT_SECONDS
+                    timeout=getattr(
+                        adapter, "probe_timeout_seconds",
+                        SLOW_PROBE_TIMEOUT_SECONDS.get(adapter_id, PROBE_TIMEOUT_SECONDS),
                     ),
                 )
             if probe_res:
@@ -165,6 +201,7 @@ class AgentDiscoveryService:
                 probe_res.definition_source = definition_source
                 probe_res.research = self._normalise_research_capability(probe_res)
                 self._apply_context_capability_declaration(adapter, probe_res)
+                probe_res = self._retain_ready_probe(adapter_id, probe_res)
             self._cached_probes[adapter_id] = probe_res
             return probe_res
         except TimeoutError:
@@ -180,8 +217,9 @@ class AgentDiscoveryService:
                     "Probe timed out; runtime may still be usable after a targeted rescan"
                 ),
             )
-            self._cached_probes[adapter_id] = timed_out
-            return timed_out
+            retained = self._retain_ready_probe(adapter_id, timed_out)
+            self._cached_probes[adapter_id] = retained
+            return retained
         except Exception as exc:
             err_probe = AgentProbeResult(
                 id=adapter_id,
@@ -193,8 +231,9 @@ class AgentDiscoveryService:
                 models=[],
                 status_detail=f"Probe error: {exc}",
             )
-            self._cached_probes[adapter_id] = err_probe
-            return err_probe
+            retained = self._retain_ready_probe(adapter_id, err_probe)
+            self._cached_probes[adapter_id] = retained
+            return retained
 
     @staticmethod
     def _apply_context_capability_declaration(
@@ -211,6 +250,9 @@ class AgentDiscoveryService:
         if declared_mode is not None:
             probe.context_window_mode = str(declared_mode)
             probe.capabilities.context_window_mode = str(declared_mode)
+        native_only = getattr(adapter, "upstream_context_is_native_only", None)
+        if native_only is not None:
+            probe.capabilities.upstream_context_is_native_only = bool(native_only)
         declared_limit = getattr(adapter, "adapter_context_limit", None)
         if declared_limit is not None:
             from persona_continuum.numeric import safe_int
@@ -219,6 +261,26 @@ class AgentDiscoveryService:
             if limit is not None:
                 probe.adapter_context_limit = limit
                 probe.capabilities.adapter_context_limit = limit
+        # Session lifecycle and concurrency are adapter declarations too.  They
+        # describe what the adapter can host, never what the current workload
+        # does with model context, so they travel separately from
+        # ``persistent_session``.
+        session_mode = getattr(adapter, "adapter_session_mode", None)
+        if session_mode is not None:
+            probe.capabilities.adapter_session_mode = str(session_mode)
+        parallel_turns = getattr(adapter, "parallel_turns_same_session", None)
+        if parallel_turns is not None:
+            probe.capabilities.parallel_turns_same_session = bool(parallel_turns)
+        parallel_independent = getattr(adapter, "parallel_independent_sessions", None)
+        if parallel_independent is not None:
+            probe.capabilities.parallel_independent_sessions = bool(parallel_independent)
+        max_independent = getattr(adapter, "max_parallel_independent_sessions", None)
+        if max_independent is not None:
+            from persona_continuum.numeric import safe_int
+
+            parsed = safe_int(max_independent, default=None, minimum=1)
+            if parsed is not None:
+                probe.capabilities.max_parallel_independent_sessions = parsed
 
     def _normalise_research_capability(self, probe: AgentProbeResult) -> ResearchCapability:
         """Keep unreported local-CLI research capability explicitly unknown.
@@ -241,6 +303,7 @@ class AgentDiscoveryService:
                 runtime_source=probe.runtime_source,
             )
             if cached is not None:
+                probe.research_model_id = cached.model_id
                 return cached.capability
         if probe.runtime_source != "local_cli":
             return research

@@ -37,6 +37,7 @@ class SubprocessAgentTransport:
         self.session = session
         self.stream_limit = safe_acp_stream_limit(stream_limit)
         self._stderr_tail = bytearray()
+        self._stderr_head = bytearray()
         self._stderr_tail_bytes = max(1024, int(stderr_tail_bytes))
         self._stderr_task: asyncio.Task[None] | None = None
         if process.stderr is not None:
@@ -86,14 +87,24 @@ class SubprocessAgentTransport:
             if not chunk:
                 return
             self.session.touch_activity("stderr", byte_count=len(chunk))
+            remaining = 4096 - len(self._stderr_head)
+            if remaining > 0:
+                self._stderr_head.extend(chunk[:remaining])
             self._stderr_tail.extend(chunk)
             if len(self._stderr_tail) > self._stderr_tail_bytes:
                 del self._stderr_tail[: len(self._stderr_tail) - self._stderr_tail_bytes]
 
     @property
     def stderr_tail(self) -> str:
-        return sanitize_diagnostic(
-            bytes(self._stderr_tail).decode("utf-8", errors="replace"), limit=4000
+        raw = bytes(self._stderr_tail).decode("utf-8", errors="replace")
+        if len(raw) <= 4000:
+            return sanitize_diagnostic(raw, limit=4000)
+        # Argument parsers print the error first, followed by a long help page.
+        head = bytes(self._stderr_head).decode("utf-8", errors="replace")
+        return (
+            sanitize_diagnostic(head[:1800], limit=1800)
+            + "\n[…]\n"
+            + sanitize_diagnostic(raw, limit=1800)
         )
 
     @property

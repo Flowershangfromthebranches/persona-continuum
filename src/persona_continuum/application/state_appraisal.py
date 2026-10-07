@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from persona_continuum.domain.affect import EMOTION_NAMES, NEED_NAMES
+from persona_continuum.runtime.bond_dynamics import BondAppraisal
 from persona_continuum.runtime.relationship_engine import RELATIONSHIP_FIELDS
 
 AppraisalMode = Literal["heuristic", "hybrid", "model"]
@@ -253,7 +254,7 @@ class AppraisalRequest:
     # Current values, required to cap movement rather than absolute position.
     current_affect: dict[str, float] = field(default_factory=dict)
     current_needs: dict[str, float] = field(default_factory=dict)
-    current_relationship: dict[str, float] = field(default_factory=dict)
+    current_relationship: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -348,7 +349,15 @@ EVENT_FAMILIES: tuple[
 #: path may produce before the per-turn appraisal cap is applied, so a lethal
 #: threat can be clearly visible while a status update stays quiet.
 ROUTINE_EVENT_TOKENS: tuple[str, ...] = (
-    "status", "update", "meeting", "reminder", "日常", "例行", "通知", "会议", "汇报",
+    "status",
+    "update",
+    "meeting",
+    "reminder",
+    "日常",
+    "例行",
+    "通知",
+    "会议",
+    "汇报",
 )
 
 
@@ -368,6 +377,31 @@ def _event_family(
             scaled_needs = {name: value * intensity for name, value in needs.items()}
             scaled_rel = {name: value * intensity for name, value in relationship.items()}
             return scaled_affect, scaled_needs, scaled_rel
+    # ActionEvent appraisals (e.g. hug accepted, hold hands, physical contact)
+    if "action_event" in kind or event.get("action_type") or event.get("action"):
+        action_name = str(event.get("action_type") or event.get("action") or "").lower()
+        status = str(event.get("status") or "").lower()
+        # Established partner / accepted hug
+        if action_name in {"hug", "拥抱"} and status in {"completed", "accepted"}:
+            return (
+                {"affection": 0.12, "joy": 0.08},
+                {"safety": 0.10, "touch_closeness": 0.15},
+                {"affection": 0.08, "trust": 0.05},
+            )
+        if action_name in {"hold_hands", "牵手"} and status in {"completed", "accepted"}:
+            return (
+                {"affection": 0.08, "joy": 0.05},
+                {"safety": 0.08, "touch_closeness": 0.10},
+                {"affection": 0.05, "trust": 0.05},
+            )
+        if action_name in {"kiss", "亲吻"} and status in {"completed", "accepted"}:
+            return (
+                {"affection": 0.15, "joy": 0.10},
+                {"safety": 0.10, "touch_closeness": 0.20},
+                {"affection": 0.10, "trust": 0.08},
+            )
+        if action_name in {"step_back", "avoid", "decline"}:
+            return {"anxiety": 0.05}, {"safety": 0.05}, {"resentment": 0.02}
     if any(token in haystack for token in ROUTINE_EVENT_TOKENS):
         # Explicitly quiet: a routine message is not an emotional event.
         return {"surprise": 0.02}, {}, {}
@@ -406,6 +440,26 @@ class PersonaStateAppraisalService:
             result.summary = f"{result.summary} (model appraiser unavailable)".strip()
         return result
 
+    def appraise_interaction(self, request: AppraisalRequest) -> BondAppraisal:
+        """Relationship-aware local semantics; no additional model request."""
+        from persona_continuum.domain.relationship import RelationshipState
+        from persona_continuum.runtime.bond_dynamics import appraise_bond
+
+        state = RelationshipState.model_validate(
+            {
+                "persona_id": "appraisal",
+                "counterpart": request.counterpart_id,
+                **request.current_relationship,
+            }
+        )
+        return appraise_bond(
+            state,
+            request.user_message,
+            request.external_events,
+            request.current_needs,
+            request.current_affect,
+        )
+
     def affect_observations(self, request: AppraisalRequest) -> dict[str, float]:
         """Backwards-compatible view: affect targets only (never needs)."""
 
@@ -416,11 +470,13 @@ class PersonaStateAppraisalService:
         user_text = (request.user_message or "").strip()
         persona_text = (request.persona_response or "").strip()
         feedback_text = (request.user_feedback or "").strip()
-        combined = f"{user_text} {persona_text} {feedback_text}".strip()
-        if not combined and not request.external_events and not request.goal_completed:
+        counterpart_text = f"{user_text} {feedback_text}".strip()
+        affect_text = f"{counterpart_text} {persona_text}".strip()
+        if not affect_text and not request.external_events and not request.goal_completed:
             return AppraisalResult(mode=self.mode)
 
-        lowered = combined.lower()
+        lowered = affect_text.lower()
+        counterpart_lowered = counterpart_text.lower()
         # Explicit feedback is the strongest signal a turn can carry: the user
         # is literally telling us how that exchange landed.
         feedback_weight = 1.6 if feedback_text else 1.0
@@ -492,7 +548,7 @@ class PersonaStateAppraisalService:
             affect_delta["hope"] = affect_delta.get("hope", 0.0) + 0.04
             signals.append("goal_completed")
 
-        relationship = self._relationship_changes(request, lowered, factor, signals)
+        relationship = self._relationship_changes(request, counterpart_lowered, factor, signals)
         for name, value in event_relationship.items():
             base = float((request.current_relationship or {}).get(name, 0.0))
             # Relationship values are written absolutely, so express the event
@@ -651,9 +707,7 @@ class PersonaStateAppraisalService:
         return ", ".join(parts)
 
     # -- model modes --------------------------------------------------------
-    def _merge_model(
-        self, result: AppraisalResult, request: AppraisalRequest
-    ) -> AppraisalResult:
+    def _merge_model(self, result: AppraisalResult, request: AppraisalRequest) -> AppraisalResult:
         assert self.model_appraiser is not None
         try:
             proposed = self.model_appraiser.appraise(

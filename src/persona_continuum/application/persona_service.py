@@ -4,6 +4,7 @@ import builtins
 import contextlib
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -20,6 +21,7 @@ from persona_continuum.config import Config
 from persona_continuum.domain.evidence import EvidenceSource
 from persona_continuum.domain.persona import PersonaManifest, PersonaRecord, PersonaType, RunMode
 from persona_continuum.ingestion.loader import SourceLoader
+from persona_continuum.ingestion.streaming import StreamingMaterialReader, infer_source_type
 from persona_continuum.security.paths import ensure_child_path, safe_slug, validate_zip_members
 from persona_continuum.security.validation import (
     CodedError,
@@ -344,44 +346,162 @@ class PersonaService:
 
     def add_sources(self, persona_id: str, paths: Sequence[Path]) -> Sequence[EvidenceSource]:
         self.get(persona_id)
-        added = []
-        for doc in self.loader.load_many(paths):
-            hash_value = (
-                sha256_file(doc.path) if doc.path.exists() else self._hash_text(doc.content)
-            )
-            source = EvidenceSource(
-                id=new_id("src"),
-                persona_id=persona_id,
-                source_type=doc.source_type,
-                path=str(doc.path),
-                title=doc.title,
-                hash=hash_value,
-                content=doc.content,
-                metadata=doc.metadata,
-            )
-            try:
-                self.database.conn.execute(
-                    "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        source.id,
-                        source.persona_id,
-                        source.source_type,
-                        source.path,
-                        source.title,
-                        source.hash,
-                        source.content,
-                        dumps(source.metadata),
-                        source.created_at.isoformat(),
-                    ),
+        added: list[EvidenceSource] = []
+        for raw_path in paths:
+            path = Path(raw_path)
+            if not path.exists() or not path.is_file():
+                raise SecurityError(f"source_not_found:{path}")
+            size = path.stat().st_size
+            if size > int(self.config.max_private_material_bytes):
+                raise SecurityError(f"file_too_large:{path.name}")
+            if size > int(self.config.max_source_bytes):
+                if path.suffix.lower() == ".zip":
+                    raise SecurityError(f"file_too_large:{path.name}")
+                added.append(self.add_external_file_source(persona_id, path))
+                continue
+            for doc in self.loader.load(path):
+                hash_value = (
+                    sha256_file(doc.path) if doc.path.exists() else self._hash_text(doc.content)
                 )
-            except sqlite3.IntegrityError as exc:
-                raise ConflictError(f"duplicate_source:{doc.path}") from exc
-            added.append(source)
+                source = EvidenceSource(
+                    id=new_id("src"),
+                    persona_id=persona_id,
+                    source_type=doc.source_type,
+                    path=str(doc.path),
+                    title=doc.title,
+                    hash=hash_value,
+                    content=doc.content,
+                    metadata=doc.metadata,
+                )
+                added.append(self._insert_source(source, duplicate_path=str(doc.path)))
         if added:
             manifest = self.get(persona_id).manifest
             manifest.source_count = self.source_count(persona_id)
             self.update_manifest(manifest)
         return added
+
+    def add_external_file_source(
+        self,
+        persona_id: str,
+        path: Path,
+        *,
+        filename: str | None = None,
+        sha256: str | None = None,
+        source_type: str | None = None,
+        move: bool = False,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> EvidenceSource:
+        """Register an immutable local file without loading it into sources.content."""
+
+        persona = self.get(persona_id)
+        if not path.exists() or not path.is_file():
+            raise SecurityError(f"source_not_found:{path}")
+        size = path.stat().st_size
+        if size > int(self.config.max_private_material_bytes):
+            raise SecurityError(f"file_too_large:{path.name}")
+        stored_name = Path(filename or path.name).name
+        if not stored_name or stored_name in {".", ".."}:
+            raise SecurityError("invalid_upload_filename")
+        digest = sha256 or sha256_file(path)
+        existing = self.get_source_by_hash(persona_id, digest)
+        if existing is not None:
+            return existing
+        source_id = new_id("src")
+        package = ensure_child_path(self.config.personas_dir, Path(persona.package_path))
+        raw_dir = ensure_child_path(package, package / "evidence" / "raw" / source_id)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        dest = ensure_child_path(raw_dir, raw_dir / stored_name)
+        if move:
+            os.replace(path, dest)
+        else:
+            shutil.copy2(path, dest)
+        inferred_type = source_type or infer_source_type(stored_name)
+        inline_content = ""
+        storage_mode = "external_file"
+        if size <= int(self.config.max_source_bytes):
+            loaded = self.loader.load(dest)
+            if loaded:
+                inline_content = loaded[0].content
+                inferred_type = loaded[0].source_type or inferred_type
+                storage_mode = "inline"
+        metadata: dict[str, Any] = {
+            "storage_mode": storage_mode,
+            "path": str(dest),
+            "size": size,
+            "sha256": digest,
+            "filename": stored_name,
+            "source_type": inferred_type,
+            "provenance": "user_provided",
+            "privacy": "private_material",
+            **dict(extra_metadata or {}),
+        }
+        if inferred_type in {"json", "jsonl", "csv"}:
+            normalized = ensure_child_path(raw_dir, raw_dir / "normalized.jsonl")
+            reader = StreamingMaterialReader(legacy_json_max_bytes=self.config.max_source_bytes)
+            reader.normalize_path_to_jsonl(
+                dest,
+                normalized,
+                source_id=source_id,
+                source_type=inferred_type,
+                filename=stored_name,
+            )
+            metadata["normalized_path"] = str(normalized)
+        source = EvidenceSource(
+            id=source_id,
+            persona_id=persona_id,
+            source_type=inferred_type,
+            path=str(dest),
+            title=stored_name,
+            hash=digest,
+            content=inline_content if storage_mode == "inline" else "",
+            metadata=metadata,
+        )
+        inserted = self._insert_source(source, duplicate_path=str(dest))
+        manifest = self.get(persona_id).manifest
+        manifest.source_count = self.source_count(persona_id)
+        self.update_manifest(manifest)
+        return inserted
+
+    def get_source_by_hash(self, persona_id: str, digest: str) -> EvidenceSource | None:
+        row = self.database.conn.execute(
+            "SELECT * FROM sources WHERE persona_id = ? AND hash = ?",
+            (persona_id, digest),
+        ).fetchone()
+        return self._source_from_row(row) if row is not None else None
+
+    def _insert_source(self, source: EvidenceSource, *, duplicate_path: str) -> EvidenceSource:
+        try:
+            self.database.conn.execute(
+                "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source.id,
+                    source.persona_id,
+                    source.source_type,
+                    source.path,
+                    source.title,
+                    source.hash,
+                    source.content,
+                    dumps(source.metadata),
+                    source.created_at.isoformat(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(f"duplicate_source:{duplicate_path}") from exc
+        self.database.conn.commit()
+        return source
+
+    def _source_from_row(self, row: Any) -> EvidenceSource:
+        return EvidenceSource(
+            id=str(row["id"]),
+            persona_id=str(row["persona_id"]),
+            source_type=str(row["source_type"]),
+            path=str(row["path"]),
+            title=str(row["title"]),
+            hash=str(row["hash"]),
+            content=str(row["content"]),
+            metadata=dict(loads(row["metadata_json"])),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
     def add_source_text(
         self,
@@ -514,20 +634,7 @@ class PersonaService:
         rows = self.database.conn.execute(
             "SELECT * FROM sources WHERE persona_id = ? ORDER BY created_at", (persona_id,)
         ).fetchall()
-        return [
-            EvidenceSource(
-                id=str(row["id"]),
-                persona_id=str(row["persona_id"]),
-                source_type=str(row["source_type"]),
-                path=str(row["path"]),
-                title=str(row["title"]),
-                hash=str(row["hash"]),
-                content=str(row["content"]),
-                metadata=dict(loads(row["metadata_json"])),
-                created_at=datetime.fromisoformat(row["created_at"]),
-            )
-            for row in rows
-        ]
+        return [self._source_from_row(row) for row in rows]
 
     def delete_source(
         self, persona_id: str, source_id: str, strategy: str = "invalidate_and_recompile"
@@ -1293,6 +1400,7 @@ class PersonaService:
             "expression/vocabulary.json": [],
             "expression/dialogue_examples.jsonl": "",
             "expression/anti_patterns.json": [],
+            "identity/erotic_profile.json": {},
             "relationships/relationships.json": [],
             "continuation/branch_provenance.json": {},
             "runtime/compile_report.json": {"compile_state": "needs_recompile"},
@@ -1747,6 +1855,7 @@ class PersonaService:
             "expression/vocabulary.json": [],
             "expression/dialogue_examples.jsonl": "",
             "expression/anti_patterns.json": [],
+            "identity/erotic_profile.json": {},
             "evidence/sources.jsonl": "",
             "evidence/claims.jsonl": "",
             "evidence/conflicts.jsonl": "",

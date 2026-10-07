@@ -124,9 +124,9 @@ def test_adapter_context_limit_caps_effective() -> None:
 def test_registry_resolves_unknown_to_adapter_model() -> None:
     resolved = resolve(requested_model="glm-5.3")
     assert resolved.effective_context_window == MILLION
-    assert resolved.context_capability_source == "model_registry"
+    assert resolved.context_capability_source == "provider_official_registry"
     assert resolved.canonical_model_id == "glm-5.3"
-    # Verified-ness follows the registry record's own verified flag.
+    # Official documented windows are verified; project guesses are not.
     assert resolved.context_verified is True
 
 
@@ -136,6 +136,7 @@ def test_registry_unverified_record_stays_unverified() -> None:
         ModelCapabilityRecord(
             canonical_model_id="rumored-model",
             native_context_window=128_000,
+            source="builtin_model_registry",
             verified=False,
         )
     )
@@ -143,7 +144,7 @@ def test_registry_unverified_record_stays_unverified() -> None:
         ContextCapabilityInput(requested_model="rumored-model")
     )
     assert resolved.effective_context_window == 128_000
-    assert resolved.context_capability_source == "model_registry"
+    assert resolved.context_capability_source == "project_static_registry"
     assert resolved.context_verified is False
 
 
@@ -218,7 +219,7 @@ def test_user_override_applies_when_nothing_else_known() -> None:
     )
     assert resolved.effective_context_window == 200_000
     assert resolved.context_capability_source == "user_override"
-    assert resolved.context_verified is True
+    assert resolved.context_verified is False
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +293,7 @@ def test_effective_model_capabilities_context_window_alias() -> None:
     )
     # A dynamically probed window is verified and sourced as a probe.
     assert caps.effective_context_window == 262_144
-    assert caps.context_capability_source == "adapter_dynamic_probe"
+    assert caps.context_capability_source == "runtime_dynamic_probe"
     assert caps.context_verified is True
     assert caps.context_window == 262_144  # deprecated alias still works
 
@@ -315,7 +316,7 @@ def test_budget_manager_consumes_effective_capability() -> None:
     assert manager.context_window(unknown_caps) is None
     window, source, verified = manager.planning_window(unknown_caps)
     assert window == PLANNING_CONTEXT_WINDOW_TOKENS
-    assert source == "fallback_policy"
+    assert source == "planning_fallback"
     assert verified is False
 
 
@@ -326,7 +327,7 @@ def test_budget_for_flags_unverified_planning_fallback() -> None:
         phase="dimension_extraction",
     )
     assert budget.context_window_tokens == PLANNING_CONTEXT_WINDOW_TOKENS
-    assert budget.context_window_source == "fallback_policy"
+    assert budget.context_window_source == "planning_fallback"
     assert budget.context_verified is False
 
 

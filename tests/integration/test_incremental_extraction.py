@@ -751,6 +751,115 @@ def test_global_audit_payload_compacts_to_transport_budget(app) -> None:
     assert roomy == unbounded
 
 
+def test_global_audit_bounds_fused_references_and_backfills_visible_claim(app, monkeypatch) -> None:
+    from persona_continuum.application.material_intelligence import EvidenceUnit
+
+    job = _make_job(app, "fake")
+    source_id = _add_sources(app, job.persona_id or "", 0, 1)[0]
+    job.source_ids = [source_id]
+    references = [f"evu_{index:016x}" for index in range(3509)]
+    unit = EvidenceUnit(
+        id=references[-1], persona_id=job.persona_id or "", source_id=source_id,
+        text="visible claim evidence", normalized_text="visible claim evidence",
+    )
+    app.material_intelligence._persist_units([unit])
+    index = app.material_intelligence.get_index(job.persona_id)
+    retrieved = [{
+        "id": "evf_0123456789abcdef", "text": "fused claim",
+        "source_ids": [source_id], "evidence_ids": references,
+    }]
+    monkeypatch.setattr(index, "retrieve", lambda **kwargs: retrieved)
+    monkeypatch.setattr(app.material_intelligence, "get_index", lambda persona_id: index)
+    artifacts = _oversized_audit_artifacts()
+    artifacts[REQUIRED_DIMENSIONS[0]]["claims"][0]["evidence_ids"] = [unit.id]
+
+    payload = app.persona_creation._global_audit_payload(job, artifacts)
+
+    fused = payload["evidence_ledger"][0]
+    assert fused["id"] == retrieved[0]["id"]
+    assert fused["source_ids"] == [source_id]
+    assert len(fused["evidence_ids"]) <= 8
+    assert fused["evidence_id_count"] == 3509
+    assert fused["omitted_evidence_id_count"] == 3509 - len(fused["evidence_ids"])
+    # A reference used by a visible claim remains verifiable even outside the sample.
+    backfilled = next(item for item in payload["evidence_ledger"] if item["id"] == unit.id)
+    assert backfilled["text"] == unit.text
+    assert len(retrieved[0]["evidence_ids"]) == 3509
+
+
+@pytest.mark.anyio
+async def test_global_audits_compact_chinese_payload_for_unknown_context(app, monkeypatch) -> None:
+    from persona_continuum.agent.context_budget import AgentContextBudgetManager
+    from persona_continuum.agent.models import EffectiveModelCapabilities
+
+    runtime = RecordingRuntime()
+    app.agent_registry.register_adapter(runtime)
+    await app.agent_discovery.scan(force_refresh=True)
+    job = _make_job(app, runtime.adapter_id)
+    job.source_ids = ["s1"]
+    artifacts = _oversized_audit_artifacts()
+    for artifact in artifacts.values():
+        for claim in artifact["claims"]:
+            claim["content"] = "中文事实与来源" * 50
+        artifact["uncertainty"] = {
+            "level": 0.4, "documented_gap": True,
+            "notes": ["资料缺口不能编造" * 1000 for _ in range(100)],
+        }
+    manager = AgentContextBudgetManager()
+    unknown = EffectiveModelCapabilities.resolve({}, requested_model="unknown-test-model")
+    original = app.persona_creation._build_audit_payload(
+        job, artifacts, ledger_limit=32, claims_limit=8, text_scale=1.0
+    )
+    assert not manager.plan(
+        app.persona_creation._final_audit_turn("consistency", original),
+        model=unknown, phase="final_consistency_audit", enforce=False,
+    ).within_budget
+    monkeypatch.setattr(app.persona_creation, "_latest_dimension_artifacts", lambda job: artifacts)
+    monkeypatch.setattr(app.persona_creation, "_effective_model_capabilities", lambda job: unknown)
+
+    await app.persona_creation._run_global_audits(job)
+
+    assert job.job_config["final_global_audit"]["status"] == "pass"
+    assert len(runtime.prompts) == 2
+    for prompt in runtime.prompts:
+        payload = json.loads(prompt)
+        assert set(payload["dimension_artifacts"]) == set(REQUIRED_DIMENSIONS)
+        for artifact in payload["dimension_artifacts"].values():
+            assert artifact["claims"]
+            assert artifact["uncertainty"]["documented_gap"] is True
+            assert artifact["uncertainty"]["level"] == 0.4
+            assert len(artifact["uncertainty"]["notes"]) < 100
+        kind = payload.pop("audit_type")
+        payload.pop("instruction")
+        assert manager.plan(
+            app.persona_creation._final_audit_turn(kind, payload),
+            model=unknown, phase=f"final_{kind}_audit",
+        ).within_budget
+
+
+@pytest.mark.parametrize("limit_kind", ["context", "transport"])
+def test_global_audit_rejects_exhausted_compaction(app, limit_kind) -> None:
+    from persona_continuum.agent.context_budget import AgentContextBudgetManager
+    from persona_continuum.agent.response_collector import (
+        ContextBudgetExceededError,
+        PromptTransportLimitExceededError,
+    )
+
+    kwargs = {}
+    error = PromptTransportLimitExceededError
+    if limit_kind == "context":
+        app.persona_creation.runtime_executor.context_budget_manager = AgentContextBudgetManager(
+            planning_context_window_tokens=6500
+        )
+        error = ContextBudgetExceededError
+    else:
+        kwargs["transport_safe_bytes"] = 100
+    with pytest.raises(error):
+        app.persona_creation._global_audit_payload(
+            _make_job(app, "fake"), _oversized_audit_artifacts(), **kwargs
+        )
+
+
 def test_global_audit_payload_does_not_backfill_compacted_away_references(app) -> None:
     """Only evidence links visible in the compact artifact need ledger rows."""
 

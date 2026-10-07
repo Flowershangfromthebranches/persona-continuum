@@ -304,6 +304,19 @@ class AgentCapabilityFlags(BaseModel):
     context_window_mode: str = ContextWindowMode.UNKNOWN.value
     # Hard ceiling the adapter/runtime imposes regardless of model capability.
     adapter_context_limit: int | None = None
+    # Wrapper CLIs (Codex, Copilot, Command Code) must not treat an upstream
+    # API native window as the runtime effective window.
+    upstream_context_is_native_only: bool = False
+    # Three independent concurrency/session dimensions.  "Adapter can host a
+    # persistent session" and "this workload reuses one model context" are not
+    # the same fact, so they are declared separately and never collapsed into
+    # a single boolean.  The workload layer maps them onto an execution
+    # profile; a persistent-capable adapter under a PER_WINDOW workload may
+    # still run independent sessions in parallel.
+    adapter_session_mode: str = "unknown"
+    parallel_turns_same_session: bool = False
+    parallel_independent_sessions: bool = False
+    max_parallel_independent_sessions: int = 1
 
     @model_validator(mode="before")
     @classmethod
@@ -320,6 +333,16 @@ class AgentCapabilityFlags(BaseModel):
                 default=None,
                 minimum=1,
                 field="adapter_context_limit",
+            )
+        if data.get("max_parallel_independent_sessions") is not None:
+            data["max_parallel_independent_sessions"] = (
+                safe_int(
+                    data.get("max_parallel_independent_sessions"),
+                    default=1,
+                    minimum=1,
+                    field="max_parallel_independent_sessions",
+                )
+                or 1
             )
         return data
 
@@ -396,6 +419,7 @@ class AgentProbeResult(BaseModel):
     definition_source: str = "builtin"  # builtin, manifest, plugin, dynamic_api
     capabilities: AgentCapabilityFlags = Field(default_factory=AgentCapabilityFlags)
     research: ResearchCapability = Field(default_factory=ResearchCapability)
+    research_model_id: str | None = None
     models: list[ModelCapability] = Field(default_factory=list)
     status_detail: str | None = None
     model_discovery_error: str | None = None
@@ -486,6 +510,22 @@ class RuntimeBindingSnapshot(BaseModel):
     context_window: int | None = None
     context_window_source: str | None = None
     context_window_mode: str | None = None
+    remaining_context_tokens: int | None = None
+    remaining_context_verified: bool = False
+    remaining_context_source: str | None = None
+    used_context_tokens: int | None = None
+    native_context_window: int | None = None
+    max_output_tokens: int | None = None
+    auto_compaction_detected: str | None = None
+    context_usage_revision: int = 0
+    context_capability_revision: int = 0
+    context_remaining_revision: int = 0
+    context_usage_updated_at: str | None = None
+    remaining_updated_at: str | None = None
+    context_scope: str | None = None
+    workload_context_scope: str | None = None
+    adapter_session_mode: str | None = None
+    remaining_is_fresh: bool = False
     diagnostics: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -497,6 +537,20 @@ class RuntimeBindingSnapshot(BaseModel):
         if data.get("context_window") is not None:
             data["context_window"] = safe_int(
                 data.get("context_window"), default=None, minimum=1, field="context_window"
+            )
+        for field in ("remaining_context_tokens", "used_context_tokens"):
+            if data.get(field) is not None:
+                data[field] = safe_int(data.get(field), default=None, minimum=0, field=field)
+        if data.get("native_context_window") is not None:
+            data["native_context_window"] = safe_int(
+                data.get("native_context_window"),
+                default=None,
+                minimum=1,
+                field="native_context_window",
+            )
+        if data.get("max_output_tokens") is not None:
+            data["max_output_tokens"] = safe_int(
+                data.get("max_output_tokens"), default=None, minimum=1, field="max_output_tokens"
             )
         return data
 
@@ -610,9 +664,9 @@ def _reasoning_mode(selected: dict[str, Any] | None) -> str:
     return "unknown"
 
 
-def _first_int(*values: Any) -> int | None:
+def _first_int(*values: Any, minimum: int = 1) -> int | None:
     for value in values:
-        normalized = safe_int(value, default=None, minimum=1)
+        normalized = safe_int(value, default=None, minimum=minimum)
         if normalized is not None:
             return normalized
     return None
@@ -649,11 +703,17 @@ class EffectiveModelCapabilities(BaseModel):
     adapter_context_limit: int | None = None
     requested_context_window: int | None = None
     effective_context_window: int | None = None
+    remaining_context_tokens: int | None = None
+    remaining_context_verified: bool = False
+    remaining_context_source: str | None = None
+    max_output_tokens: int | None = None
     usable_context_budget: int | None = None
     preferred_working_context: int | None = None
+    phase_working_target: int | None = None
     planning_context_window: int | None = None
     context_window_mode: str = ContextWindowMode.UNKNOWN.value
     context_capability_source: str = ContextCapabilitySource.UNKNOWN.value
+    context_capability_source_detail: str | None = None
     context_verified: bool = False
     context_notes: dict[str, Any] = Field(default_factory=dict)
     # -- other capabilities -------------------------------------------------
@@ -721,6 +781,8 @@ class EffectiveModelCapabilities(BaseModel):
         reasoning_level: str | None = None,
         requested_context_window: int | None = None,
         runtime_reported_context_window: int | None = None,
+        runtime_reported_remaining_context: int | None = None,
+        estimated_remaining_context: int | None = None,
         adapter_context_limit: int | None = None,
         user_override_context_window: int | None = None,
         # Kept for call-site compatibility.  It is a PLANNING fallback only:
@@ -760,6 +822,42 @@ class EffectiveModelCapabilities(BaseModel):
         )
         binding = raw.get("runtime_binding_snapshot")
         binding_ctx = binding.get("context_window") if isinstance(binding, dict) else None
+        binding_remaining_verified = bool(
+            isinstance(binding, dict) and binding.get("remaining_context_verified")
+        )
+        binding_remaining_source = (
+            str(binding.get("remaining_context_source") or "")
+            if isinstance(binding, dict)
+            else ""
+        )
+        binding_remaining = (
+            binding.get("remaining_context_tokens") if isinstance(binding, dict) else None
+        )
+        raw_remaining_verified = bool(raw.get("remaining_context_verified"))
+        raw_remaining_source = str(raw.get("remaining_context_source") or "")
+        raw_remaining = raw.get("remaining_context_tokens")
+        runtime_remaining = _first_int(
+            runtime_reported_remaining_context,
+            binding_remaining
+            if binding_remaining_verified and binding_remaining_source in {"", "runtime_reported"}
+            else None,
+            raw_remaining
+            if raw_remaining_verified and raw_remaining_source in {"", "runtime_reported"}
+            else None,
+            minimum=0,
+        )
+        estimated_remaining = _first_int(
+            estimated_remaining_context,
+            binding_remaining
+            if not (
+                binding_remaining_verified and binding_remaining_source in {"", "runtime_reported"}
+            )
+            else None,
+            raw_remaining
+            if not (raw_remaining_verified and raw_remaining_source in {"", "runtime_reported"})
+            else None,
+            minimum=0,
+        )
         resolved = ContextCapabilityResolver(registry).resolve(
             ContextCapabilityInput(
                 agent_id=agent_id,
@@ -768,8 +866,10 @@ class EffectiveModelCapabilities(BaseModel):
                 effective_model=selected_id,
                 requested_context_window=requested_context_window,
                 runtime_reported_context_window=_first_int(
-                    runtime_reported_context_window, binding_ctx
+                    runtime_reported_context_window, binding_ctx, raw.get("context_window")
                 ),
+                runtime_reported_remaining_context=runtime_remaining,
+                estimated_remaining_context=estimated_remaining,
                 adapter_context_limit=_first_int(
                     adapter_context_limit,
                     raw.get("adapter_context_limit"),
@@ -778,11 +878,27 @@ class EffectiveModelCapabilities(BaseModel):
                 context_window_mode=str(
                     context_window_mode
                     or capabilities.get("context_window_mode")
+                    or raw.get("context_window_mode")
                     or ContextWindowMode.UNKNOWN.value
                 ),
                 model_capability=selected,
                 provider_metadata=raw,
                 user_override_context_window=user_override_context_window,
+                persistent_session=bool(capabilities.get("persistent_session")),
+                upstream_context_is_native_only=bool(
+                    capabilities.get("upstream_context_is_native_only")
+                    or raw.get("upstream_context_is_native_only")
+                ),
+                session_used_tokens=_first_int(
+                    raw.get("session_used_tokens"),
+                    binding.get("used_context_tokens") if isinstance(binding, dict) else None,
+                    minimum=0,
+                ),
+                runtime_session_id=(
+                    str(binding.get("runtime_session_id") or "") or None
+                    if isinstance(binding, dict)
+                    else None
+                ),
                 planning_context_window=int(
                     planning_context_window
                     or default_context_window
@@ -803,11 +919,17 @@ class EffectiveModelCapabilities(BaseModel):
             adapter_context_limit=resolved.adapter_context_limit,
             requested_context_window=resolved.requested_context_window,
             effective_context_window=resolved.effective_context_window,
+            remaining_context_tokens=resolved.remaining_context_tokens,
+            remaining_context_verified=resolved.remaining_context_verified,
+            remaining_context_source=resolved.remaining_context_source,
+            max_output_tokens=resolved.max_output_tokens,
             usable_context_budget=resolved.usable_context_budget,
             preferred_working_context=resolved.preferred_working_context,
+            phase_working_target=resolved.phase_working_target,
             planning_context_window=resolved.planning_context_window,
             context_window_mode=resolved.context_window_mode,
             context_capability_source=resolved.context_capability_source,
+            context_capability_source_detail=resolved.context_capability_source_detail,
             context_verified=resolved.context_verified,
             context_notes=resolved.notes,
             reasoning_mode=_reasoning_mode(selected),

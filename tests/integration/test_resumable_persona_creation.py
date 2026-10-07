@@ -20,6 +20,8 @@ from persona_continuum.agent.context_budget import AgentContextBudgetManager
 from persona_continuum.agent.models import (
     AgentEvent,
     AgentEventType,
+    AgentProbeResult,
+    AgentStatus,
     EffectiveModelCapabilities,
     ModelCapability,
     ReasoningCapability,
@@ -29,6 +31,7 @@ from persona_continuum.agent.structured_output import StructuredOutputEngine
 from persona_continuum.application.persona_creation_service import (
     REQUIRED_DIMENSIONS,
     PersonaCreationJob,
+    RuntimeBindingError,
     _PauseRequested,
 )
 from persona_continuum.domain.persona import PersonaType
@@ -170,8 +173,8 @@ def test_effective_model_capabilities_resolve_selected_model() -> None:
         snapshot, requested_model="big-model", effective_model="big-model"
     )
     assert caps.effective_context_window == 262144
-    # A declaratively declared window is provider metadata, not a runtime probe.
-    assert caps.context_capability_source == "provider_metadata"
+    # An official capability table is a verified registry source, not a probe.
+    assert caps.context_capability_source == "provider_official_registry"
     assert caps.context_verified is True
     assert caps.effective_model == "big-model"
 
@@ -333,6 +336,79 @@ async def test_batch_checkpoint_reuses_finished_batches(app) -> None:
     store = job.job_config["dimension_batch_checkpoints"]
     assert store["prompt_version"]
     assert PROBE_DIM in store["dimensions"]
+
+
+class ArgvTransportRuntime(ResumableRuntime):
+    """1M-context fake that can only carry an ARGV-sized prompt."""
+
+    prompt_transport_mode = "argv"
+
+
+@pytest.mark.anyio
+async def test_dimension_extraction_batches_to_argv_transport(app) -> None:
+    """A 1M model behind ARGV must not pack one 360KB dimension prompt."""
+
+    model = ModelCapability(
+        id="fake-gpt-5",
+        display_name="Big Fake",
+        provider="argv_fake",
+        context_window=1_048_576,
+        source="official_capability_table",
+        reasoning_capability=ReasoningCapability(
+            mode=ReasoningCapabilityMode.NATIVE_EFFORT,
+            supported_efforts=["high"],
+            default_effort="high",
+            verified=True,
+            source="test_adapter",
+        ),
+    )
+    runtime = ArgvTransportRuntime(adapter_id="argv_fake", context_window=1_048_576)
+    runtime._models = [model]
+    _register(app, runtime)
+    await app.agent_discovery.scan(force_refresh=True)
+    job = _make_job(app, runtime.adapter_id)
+    job.source_ids = _add_sources(app, job.persona_id or "", 1)
+    job.source_count = 1
+    probe = await runtime.probe()
+    job.capability_snapshot = probe.model_dump(mode="json")
+    job.job_config["runtime_binding_snapshot"] = {
+        "effective_model": "fake-gpt-5",
+        "context_window": 1_048_576,
+        "context_window_source": "model_registry",
+    }
+    app.persona_creation._save(job)
+
+    source = app.personas.get_sources(job.persona_id or "")[0]
+    items = [
+        {
+            "evidence_id": f"u{index}",
+            "source_ids": [source.id],
+            "evidence_type": "source",
+            "verbatim_samples": [],
+            "intelligence": {},
+            "content": "沈清的童年经历与家庭关系。" * 400,
+        }
+        for index in range(16)
+    ]
+    context_manager = AgentContextBudgetManager()
+    await app.persona_creation._run_dimension_extraction(
+        job,
+        dimension=PROBE_DIM,
+        evidence_items=items,
+        participant_id=PROBE_DIM,
+        mode="full",
+        source_by_id={source.id: source},
+        context_manager=context_manager,
+        phase="dimension_extraction",
+    )
+
+    from persona_continuum.agent.prompt_transport import resolve_prompt_transport_capability
+
+    safe_bytes = resolve_prompt_transport_capability(runtime).safe_prompt_bytes
+    prompt_sizes = [len(prompt.encode("utf-8")) for _, prompt in runtime.participant_prompts]
+    assert prompt_sizes
+    assert max(prompt_sizes) <= safe_bytes
+    assert len(prompt_sizes) > 1
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +623,71 @@ async def test_legacy_audit_repair_failure_retries_into_final_audit(app) -> None
 
 
 @pytest.mark.anyio
+async def test_discovery_keeps_ready_across_busy_cli_timeout(monkeypatch) -> None:
+    from persona_continuum.agent import discovery as discovery_mod
+    from persona_continuum.agent.discovery import AgentDiscoveryService
+    from persona_continuum.agent.registry import AgentRegistry
+
+    monkeypatch.setattr(discovery_mod, "PROBE_TIMEOUT_SECONDS", 0.05)
+    calls = {"n": 0}
+
+    class FlakyAdapter:
+        adapter_id = "flaky"
+        name = "Flaky"
+
+        async def probe(self) -> AgentProbeResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return AgentProbeResult(
+                    id="flaky",
+                    name="Flaky",
+                    status=AgentStatus.READY,
+                    version="1.0",
+                    models=[],
+                )
+            await asyncio.sleep(2)
+            return AgentProbeResult(id="flaky", name="Flaky", status=AgentStatus.BROKEN)
+
+    registry = AgentRegistry(include_builtins=False, include_fake=False)
+    registry.register_adapter(FlakyAdapter())  # type: ignore[arg-type]
+    discovery = AgentDiscoveryService(registry)
+    first = await discovery.scan(force_refresh=True)
+    assert first[0].status == AgentStatus.READY
+    second = await discovery.scan(force_refresh=True)
+    assert second[0].status == AgentStatus.READY
+    assert second[0].version == "1.0"
+
+
+@pytest.mark.anyio
+async def test_bound_job_survives_transient_runtime_probe_failure(app) -> None:
+    runtime = ResumableRuntime()
+    _register(app, runtime)
+    await app.agent_discovery.scan(force_refresh=True)
+    job = _make_job(app, runtime.adapter_id)
+    job.agent_version = "1.0"
+    job.job_config["runtime_binding_snapshot"] = {
+        "agent_id": runtime.adapter_id,
+        "binding_status": "verified",
+        "verification_method": "adapter_session_config",
+    }
+    app.persona_creation._save(job)
+    app.agent_discovery._cached_probes[runtime.adapter_id] = AgentProbeResult(
+        id=runtime.adapter_id,
+        name=runtime.name,
+        status=AgentStatus.BROKEN,
+        status_detail="CLI binary execution failed",
+    )
+    await app.persona_creation._assert_snapshot_available(job)
+
+    unbound = _make_job(app, runtime.adapter_id)
+    unbound.id = "pcjob_unbound"
+    unbound.agent_version = None
+    unbound.job_config = {}
+    with pytest.raises(RuntimeBindingError, match="runtime_not_ready"):
+        await app.persona_creation._assert_snapshot_available(unbound)
+
+
+@pytest.mark.anyio
 async def test_resume_rejects_web_incompatible_runtime_before_research(app) -> None:
     runtime = ResumableRuntime()
     offline = FakeAgentAdapter(adapter_id="offline_fake")
@@ -560,8 +701,6 @@ async def test_resume_rejects_web_incompatible_runtime_before_research(app) -> N
     job.source_ids = []
     job.source_count = 0
     app.persona_creation._save(job)
-
-    from persona_continuum.application.persona_creation_service import RuntimeBindingError
 
     with pytest.raises(RuntimeBindingError):
         await app.persona_creation.resume_job(

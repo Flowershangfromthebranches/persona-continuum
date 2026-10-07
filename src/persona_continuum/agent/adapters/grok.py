@@ -10,6 +10,7 @@ from typing import Any
 
 from persona_continuum.agent.adapter import AgentSession, resolve_binary, safe_exec_cmd
 from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import GROK_ACP_USAGE_SEMANTICS
 from persona_continuum.agent.models import (
     AgentCapabilityFlags,
     AgentEvent,
@@ -36,11 +37,16 @@ from persona_continuum.auth.credentials import build_runtime_environment
 class GrokBuildAdapter(ACPAdapter):
     adapter_id = "grok"
     name = "Grok Build"
-    # Grok exposes a fixed per-model window; no context parameter is sent.
-    context_window_mode = ContextWindowMode.FIXED
+    # Runtime origin distinguishes this credential/runtime family for
+    # capability binding (adapter, CLI binary, model, credential, origin).
+    runtime_origin = "xai"
+    # Runtime-reported modelUsage.*.contextWindow is authoritative.  The table
+    # below is only a fallback and never overlays a live value.
+    context_window_mode = ContextWindowMode.DISCOVERABLE
+    usage_context_semantics = GROK_ACP_USAGE_SEMANTICS
     _OFFICIAL_CAPABILITIES: dict[str, tuple[list[str], str, int]] = {
-        "grok-4.6": (["low", "medium", "high", "xhigh"], "high", 131_072),
-        "grok-4.5": (["low", "medium", "high"], "high", 131_072),
+        "grok-4.6": (["low", "medium", "high", "xhigh"], "high", 500_000),
+        "grok-4.5": (["low", "medium", "high"], "high", 500_000),
     }
 
     def __init__(self) -> None:
@@ -348,7 +354,7 @@ class GrokBuildAdapter(ACPAdapter):
         entry = self._OFFICIAL_CAPABILITIES[model_id]
         efforts = entry[0]
         default_effort = entry[1]
-        context_window = entry[2] if len(entry) > 2 else 131_072
+        context_window = entry[2] if len(entry) > 2 else 500_000
         return ModelCapability(
             id=model_id,
             display_name=model_id.replace("grok-", "Grok "),

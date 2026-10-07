@@ -11,6 +11,14 @@ from typing import TYPE_CHECKING, Any
 
 from persona_continuum.agent.adapter import AgentAdapter, AgentSession
 from persona_continuum.agent.context_budget import AgentContextBudgetManager, ContextBudget
+from persona_continuum.agent.context_fields import (
+    ContextScope,
+    consume_pending_runtime_context,
+    invalidate_runtime_context,
+    remaining_usage_is_fresh,
+    resolve_context_scope,
+    workload_context_scope_for_phase,
+)
 from persona_continuum.agent.contracts import (
     adapter_output_streaming_mode,
     adapter_prompt_mode,
@@ -22,6 +30,7 @@ from persona_continuum.agent.models import (
     AgentEventType,
     AgentSessionConfig,
     AgentTurn,
+    EffectiveModelCapabilities,
     ModelCapability,
     RuntimeBindingSnapshot,
 )
@@ -115,6 +124,16 @@ class AgentExecutionResult:
     binding: RuntimeBindingSnapshot
     timeout_budget: TimeoutBudget
     context_budget: ContextBudget
+
+
+@dataclass(slots=True)
+class TurnContextAccounting:
+    remaining_revision_start: int
+    capability_revision_start: int
+    context_scope: ContextScope
+    pre_turn_remaining: int | None
+    model_id: str
+    session_id: str | None
 
 
 class AgentRuntimeExecutor:
@@ -286,7 +305,11 @@ class AgentRuntimeExecutor:
             # locally repaired value still passes full schema validation.
             from persona_continuum.performance.tracing import default_tracer
 
-            local_text = self.structured_output_engine.local_repair(first.text)
+            local_text = (
+                first.text
+                if (metadata or {}).get("require_complete_json")
+                else self.structured_output_engine.local_repair(first.text)
+            )
             if local_text != first.text:
                 try:
                     parsed = self.structured_output_engine.parse_and_validate(
@@ -485,6 +508,7 @@ class AgentRuntimeExecutor:
         )
         adapter = session_binding.adapter
         session = session_binding.session
+        accounting = self._begin_context_accounting(session_binding, phase=phase)
         started = time.monotonic()
         self._mark_turn_started(session)
         stream = adapter.send(session, turn)
@@ -494,6 +518,7 @@ class AgentRuntimeExecutor:
             with contextlib.suppress(Exception):
                 state_callback("MODEL_RUNNING")
         model_started_at = time.monotonic()
+        accounted = False
         try:
             await self._collect_with_timeouts(
                 stream,
@@ -510,12 +535,10 @@ class AgentRuntimeExecutor:
             tracer = default_tracer()
             generation_ms = (time.monotonic() - model_started_at) * 1000.0
             tracer.observe_value(trace_task_id, "generation_ms", generation_ms)
-            collector.response.raw_diagnostics["model_started_at"] = (
-                session.session_data.get("agent_turn_started_at")
+            collector.response.raw_diagnostics["model_started_at"] = session.session_data.get(
+                "agent_turn_started_at"
             )
-            collector.response.raw_diagnostics["model_completed_at"] = (
-                time.time()
-            )
+            collector.response.raw_diagnostics["model_completed_at"] = time.time()
             collector.response.raw_diagnostics["generation_ms"] = generation_ms
             tracer.observe_value(
                 trace_task_id,
@@ -537,13 +560,30 @@ class AgentRuntimeExecutor:
                             trace_task_id, "reported_output_tokens", float(usage[key])
                         )
                     break
-            collector.response.raw_diagnostics["last_activity_at"] = (
-                session.session_data.get("last_agent_activity_at")
+            collector.response.raw_diagnostics["last_activity_at"] = session.session_data.get(
+                "last_agent_activity_at"
             )
             collector.response.raw_diagnostics["activity_tracker"] = (
                 session.activity_tracker.as_diagnostics()
             )
             collector.response.raw_diagnostics["process_alive"] = self._process_alive(session)
+            output_tokens = 0
+            usage = dict(collector.response.usage or {})
+            for key in ("output_tokens", "completion_tokens"):
+                if usage.get(key) is not None:
+                    with contextlib.suppress(TypeError, ValueError):
+                        output_tokens = max(0, int(usage[key]))
+                        break
+            if output_tokens <= 0 and text:
+                output_tokens = self.context_budget_manager.estimate_tokens(text)
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=output_tokens,
+                consumed=True,
+            )
+            accounted = True
             return AgentExecutionResult(
                 text=text,
                 response=collector.response,
@@ -552,10 +592,18 @@ class AgentRuntimeExecutor:
                 context_budget=context_budget,
             )
         except AgentRuntimeError as exc:
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=self._output_tokens_from_collector(collector),
+                consumed=self._session_still_holds_context(session),
+            )
+            accounted = True
             exc.response = collector.response
             collector.response.raw_diagnostics.update(dict(exc.diagnostics or {}))
-            collector.response.raw_diagnostics["last_activity_at"] = (
-                session.session_data.get("last_agent_activity_at")
+            collector.response.raw_diagnostics["last_activity_at"] = session.session_data.get(
+                "last_agent_activity_at"
             )
             collector.response.raw_diagnostics["activity_tracker"] = (
                 session.activity_tracker.as_diagnostics()
@@ -563,6 +611,14 @@ class AgentRuntimeExecutor:
             collector.response.raw_diagnostics["process_alive"] = self._process_alive(session)
             raise
         except Exception as exc:
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=self._output_tokens_from_collector(collector),
+                consumed=self._session_still_holds_context(session),
+            )
+            accounted = True
             wrapped = AgentTransportError(
                 "Agent transport failed",
                 phase=phase,
@@ -574,8 +630,8 @@ class AgentRuntimeExecutor:
                 },
             )
             wrapped.response = collector.response
-            collector.response.raw_diagnostics["last_activity_at"] = (
-                session.session_data.get("last_agent_activity_at")
+            collector.response.raw_diagnostics["last_activity_at"] = session.session_data.get(
+                "last_agent_activity_at"
             )
             collector.response.raw_diagnostics["activity_tracker"] = (
                 session.activity_tracker.as_diagnostics()
@@ -583,6 +639,14 @@ class AgentRuntimeExecutor:
             collector.response.raw_diagnostics["process_alive"] = self._process_alive(session)
             raise wrapped from exc
         finally:
+            if not accounted:
+                self._finalize_context_accounting(
+                    session_binding,
+                    accounting,
+                    context_budget=context_budget,
+                    output_tokens=self._output_tokens_from_collector(collector),
+                    consumed=self._session_still_holds_context(session),
+                )
             close_stream = getattr(stream, "aclose", None)
             if callable(close_stream):
                 with contextlib.suppress(Exception):
@@ -630,10 +694,15 @@ class AgentRuntimeExecutor:
             metadata={"phase": phase, **dict(metadata or {})},
         )
         async with self._model_slot(session_binding.adapter, phase):
-            async for event in self._stream_events_locked(
-                session_binding, turn, phase=phase
-            ):
-                yield event
+            agen = self._stream_events_locked(session_binding, turn, phase=phase)
+            try:
+                async for event in agen:
+                    yield event
+            finally:
+                close = getattr(agen, "aclose", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        await close()
 
     async def _stream_events_locked(
         self,
@@ -648,9 +717,12 @@ class AgentRuntimeExecutor:
         context_budget, timeout_budget, collector = self._prepare_turn(
             session_binding, turn, phase=phase
         )
+        accounting = self._begin_context_accounting(session_binding, phase=phase)
         self._mark_turn_started(session_binding.session)
         stream = session_binding.adapter.send(session_binding.session, turn)
         started = time.monotonic()
+        consumed = False
+        accounted = False
         try:
             async for event in self._iter_events_with_timeouts(
                 stream,
@@ -659,6 +731,7 @@ class AgentRuntimeExecutor:
                 started=started,
                 phase=phase,
             ):
+                consumed = True
                 collector.add(event)
                 yield event
             collector.require_text(
@@ -673,7 +746,24 @@ class AgentRuntimeExecutor:
             collector.response.raw_diagnostics["process_alive"] = self._process_alive(
                 session_binding.session
             )
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=self._output_tokens_from_collector(collector),
+                consumed=True,
+            )
+            accounted = True
         except AgentRuntimeError as exc:
+            session = session_binding.session
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=self._output_tokens_from_collector(collector),
+                consumed=consumed and self._session_still_holds_context(session),
+            )
+            accounted = True
             exc.response = collector.response
             collector.response.raw_diagnostics.update(dict(exc.diagnostics or {}))
             collector.response.raw_diagnostics["last_activity_at"] = (
@@ -687,6 +777,15 @@ class AgentRuntimeExecutor:
             )
             raise
         except Exception as exc:
+            session = session_binding.session
+            self._finalize_context_accounting(
+                session_binding,
+                accounting,
+                context_budget=context_budget,
+                output_tokens=self._output_tokens_from_collector(collector),
+                consumed=consumed and self._session_still_holds_context(session),
+            )
+            accounted = True
             wrapped = AgentTransportError(
                 "Agent transport failed",
                 phase=phase,
@@ -709,6 +808,15 @@ class AgentRuntimeExecutor:
             )
             raise wrapped from exc
         finally:
+            if not accounted:
+                session = session_binding.session
+                self._finalize_context_accounting(
+                    session_binding,
+                    accounting,
+                    context_budget=context_budget,
+                    output_tokens=self._output_tokens_from_collector(collector),
+                    consumed=consumed and self._session_still_holds_context(session),
+                )
             close_stream = getattr(stream, "aclose", None)
             if callable(close_stream):
                 with contextlib.suppress(Exception):
@@ -730,7 +838,7 @@ class AgentRuntimeExecutor:
         # transport source unless FULL_PROMPT was explicitly requested.
         if turn.full_prompt is None:
             turn.full_prompt = turn.user_message
-        model = self._model_capability(session)
+        model = self._planning_capability(session_binding, phase=phase)
         prepare_started = time.monotonic()
         context_budget = self.context_budget_manager.plan(
             turn,
@@ -924,13 +1032,10 @@ class AgentRuntimeExecutor:
                 )
                 if not done:
                     current = time.monotonic()
-                    hard_expired = (
-                        current - started >= timeout_budget.hard_timeout_seconds
-                    )
+                    hard_expired = current - started >= timeout_budget.hard_timeout_seconds
                     first_expired = (
                         tracker.first_response_at is None
-                        and current - started
-                        >= timeout_budget.first_response_timeout_seconds
+                        and current - started >= timeout_budget.first_response_timeout_seconds
                     )
                     idle_expired = (
                         tracker.first_response_at is not None
@@ -953,11 +1058,7 @@ class AgentRuntimeExecutor:
                         timeout_budget,
                         phase,
                         tracker.last_transport_monotonic or started,
-                        timeout_reason=(
-                            "first_response"
-                            if first_expired
-                            else None
-                        ),
+                        timeout_reason=("first_response" if first_expired else None),
                     )
 
                 completed_task = next_event_task
@@ -1038,11 +1139,15 @@ class AgentRuntimeExecutor:
         # separate short human-readable summary is safe to retain, but a large
         # content field is removed together with the raw tool value.
         content = event.content
-        if event.tool_result is None or compact_tool_result(
-            event.content,
-            tool_name=event.tool_name,
-            artifact_ref=(metadata.get("artifact_ref") or None),
-        ) is not event.content:
+        if (
+            event.tool_result is None
+            or compact_tool_result(
+                event.content,
+                tool_name=event.tool_name,
+                artifact_ref=(metadata.get("artifact_ref") or None),
+            )
+            is not event.content
+        ):
             content = ""
         return event.model_copy(
             update={"content": content, "tool_result": compacted, "metadata": metadata}
@@ -1071,12 +1176,8 @@ class AgentRuntimeExecutor:
             "idle_timeout_seconds": budget.idle_timeout_seconds,
             "hard_timeout_seconds": budget.hard_timeout_seconds,
             "last_activity_age_seconds": max(0.0, time.monotonic() - last_activity),
-            "last_activity_at": session_binding.session.session_data.get(
-                "last_agent_activity_at"
-            ),
-            "output_streaming_mode": adapter_output_streaming_mode(
-                session_binding.adapter
-            ).value,
+            "last_activity_at": session_binding.session.session_data.get("last_agent_activity_at"),
+            "output_streaming_mode": adapter_output_streaming_mode(session_binding.adapter).value,
             "first_response_timeout_seconds": budget.first_response_timeout_seconds,
             "runtime_binding_snapshot": session_binding.snapshot.model_dump(mode="json"),
             "activity_tracker": session_binding.session.activity_tracker.as_diagnostics(),
@@ -1098,6 +1199,21 @@ class AgentRuntimeExecutor:
         if process is None:
             return None
         return getattr(process, "returncode", None) is None
+
+    def _session_still_holds_context(self, session: AgentSession) -> bool:
+        """True when this logical session can still carry occupancy.
+
+        In-process adapters have no OS child (``_process_alive`` is None);
+        occupancy then follows ``session.is_active``.  A dead process means
+        the next request is a fresh context and must not inherit estimates.
+        """
+
+        if not session.is_active:
+            return False
+        alive = self._process_alive(session)
+        if alive is None:
+            return True
+        return bool(alive)
 
     async def _resolve_binding(
         self, adapter: AgentAdapter, session: AgentSession
@@ -1184,9 +1300,216 @@ class AgentRuntimeExecutor:
     @staticmethod
     def _protocol(session: AgentSession) -> str:
         return str(
-            session.session_data.get("protocol")
-            or session.session_data.get("mode")
-            or "unknown"
+            session.session_data.get("protocol") or session.session_data.get("mode") or "unknown"
+        )
+
+    def _planning_capability(
+        self, session_binding: RuntimeSessionBinding, *, phase: str
+    ) -> EffectiveModelCapabilities:
+        session = session_binding.session
+        adapter = session_binding.adapter
+        selected = self._model_capability(session)
+        extra = session.config.extra if session.config is not None else {}
+        if isinstance(extra, dict):
+            if extra.get("workload_context_scope") and not session.session_data.get(
+                "workload_context_scope"
+            ):
+                session.session_data["workload_context_scope"] = extra["workload_context_scope"]
+            if extra.get("context_scope") and not session.session_data.get("context_scope"):
+                session.session_data["context_scope"] = extra["context_scope"]
+        if not session.session_data.get("workload_context_scope"):
+            inferred = workload_context_scope_for_phase(phase)
+            if inferred.value != "unknown":
+                session.session_data["workload_context_scope"] = inferred.value
+        scope = resolve_context_scope(adapter, session)
+        persistent = scope == ContextScope.PERSISTENT
+        session.session_data["context_scope"] = scope.value
+        model_id = str(
+            session.session_data.get("effective_model")
+            or session_binding.snapshot.effective_model
+            or session.config.model_id
+            or ""
+        )
+        previous_model = str(session.session_data.get("context_usage_model_id") or "")
+        if previous_model and model_id and previous_model != model_id:
+            invalidate_runtime_context(session.session_data, reason="model_change")
+        if model_id:
+            session.session_data["context_usage_model_id"] = model_id
+        remaining_source = str(session.session_data.get("remaining_context_source") or "")
+        remaining_verified = bool(session.session_data.get("remaining_context_verified"))
+        remaining_reported = session.session_data.get("remaining_context_tokens")
+        fresh = remaining_usage_is_fresh(session.session_data)
+        if (
+            remaining_verified
+            and remaining_source in {"", "runtime_reported"}
+            and session.session_data.get("remaining_updated_at") is not None
+            and not fresh
+        ):
+            remaining_verified = False
+            remaining_source = "estimated_remaining"
+        if scope == ContextScope.PER_REQUEST:
+            remaining_reported = None
+            remaining_verified = False
+            remaining_source = "inferred_fresh_session"
+        runtime_remaining = (
+            remaining_reported
+            if remaining_verified and remaining_source in {"", "runtime_reported"}
+            else None
+        )
+        estimated_remaining = remaining_reported if runtime_remaining is None else None
+        return EffectiveModelCapabilities.resolve(
+            {
+                "id": adapter.adapter_id,
+                "capabilities": {
+                    "persistent_session": persistent,
+                    "context_window_mode": str(
+                        getattr(adapter, "context_window_mode", "") or "unknown"
+                    ),
+                    "upstream_context_is_native_only": bool(
+                        getattr(adapter, "upstream_context_is_native_only", False)
+                    ),
+                },
+                "runtime_binding_snapshot": session.session_data.get("runtime_binding") or {},
+                "models": [selected.model_dump(mode="json")] if selected is not None else [],
+                "session_used_tokens": (
+                    session.session_data.get("session_used_tokens") if persistent else None
+                ),
+                "persistent_session": persistent,
+            },
+            requested_model=session.config.model_id,
+            effective_model=model_id or None,
+            adapter_id=adapter.adapter_id,
+            runtime_reported_context_window=session.session_data.get("effective_context_window"),
+            runtime_reported_remaining_context=runtime_remaining,
+            estimated_remaining_context=estimated_remaining,
+        )
+
+    def _begin_context_accounting(
+        self, session_binding: RuntimeSessionBinding, *, phase: str
+    ) -> TurnContextAccounting:
+        session = session_binding.session
+        extra = session.config.extra if session.config is not None else {}
+        if isinstance(extra, dict) and extra.get("workload_context_scope"):
+            session.session_data.setdefault(
+                "workload_context_scope", extra["workload_context_scope"]
+            )
+            session.session_data.setdefault(
+                "context_scope", extra.get("context_scope") or extra["workload_context_scope"]
+            )
+        if not session.session_data.get("workload_context_scope"):
+            inferred = workload_context_scope_for_phase(phase)
+            if inferred.value != "unknown":
+                session.session_data["workload_context_scope"] = inferred.value
+        scope = resolve_context_scope(session_binding.adapter, session)
+        session.session_data["context_scope"] = scope.value
+        session_id = str(session.config.session_id or "") or None
+        previous_session = str(session.session_data.get("context_usage_session_id") or "")
+        if previous_session and session_id and previous_session != session_id:
+            invalidate_runtime_context(session.session_data, reason="session_change")
+        if session_id:
+            session.session_data["context_usage_session_id"] = session_id
+        remaining_rev = int(session.session_data.get("context_remaining_revision") or 0)
+        session.session_data["turn_remaining_revision_start"] = remaining_rev
+        return TurnContextAccounting(
+            remaining_revision_start=remaining_rev,
+            capability_revision_start=int(
+                session.session_data.get("context_capability_revision") or 0
+            ),
+            context_scope=scope,
+            pre_turn_remaining=session.session_data.get("remaining_context_tokens"),
+            model_id=str(
+                session.session_data.get("effective_model")
+                or session_binding.snapshot.effective_model
+                or session.config.model_id
+                or ""
+            ),
+            session_id=str(session.config.session_id or "") or None,
+        )
+
+    def _finalize_context_accounting(
+        self,
+        session_binding: RuntimeSessionBinding,
+        accounting: TurnContextAccounting,
+        *,
+        context_budget: ContextBudget,
+        output_tokens: int = 0,
+        consumed: bool = True,
+    ) -> None:
+        session = session_binding.session
+        if not consumed:
+            return
+        consume_pending_runtime_context(
+            session.session_data,
+            semantics=getattr(session_binding.adapter, "usage_context_semantics", None),
+        )
+        used = max(0, int(context_budget.estimated_prompt_tokens or 0)) + max(
+            0, int(output_tokens or 0)
+        )
+        scope = accounting.context_scope
+        if scope == ContextScope.PER_REQUEST:
+            session.session_data["session_used_tokens"] = 0
+            return
+        session.session_data["session_used_tokens"] = (
+            int(session.session_data.get("session_used_tokens") or 0) + used
+        )
+        current_remaining_rev = int(session.session_data.get("context_remaining_revision") or 0)
+        if current_remaining_rev > int(accounting.remaining_revision_start or 0):
+            return
+        previous = session.session_data.get("remaining_context_tokens")
+        if previous is None:
+            return
+        session.session_data["remaining_context_tokens"] = max(0, int(previous) - used)
+        session.session_data["remaining_context_verified"] = False
+        session.session_data["remaining_context_source"] = "estimated_remaining"
+
+    def _output_tokens_from_collector(self, collector: AgentResponseCollector) -> int:
+        usage = dict(collector.response.usage or {})
+        for key in ("output_tokens", "completion_tokens"):
+            if usage.get(key) is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    value = int(usage[key])
+                    if value > 0:
+                        return value
+        text = str(collector.response.text or "")
+        if not text:
+            return 0
+        return self.context_budget_manager.estimate_tokens(text)
+
+    def _note_session_usage(
+        self,
+        session_binding: RuntimeSessionBinding,
+        context_budget: ContextBudget,
+        *,
+        revision_start: int = 0,
+        remaining_revision_start: int | None = None,
+        output_tokens: int = 0,
+    ) -> None:
+        """Test/compat wrapper around :meth:`_finalize_context_accounting`."""
+
+        start = (
+            remaining_revision_start
+            if remaining_revision_start is not None
+            else int(revision_start or 0)
+        )
+        scope = resolve_context_scope(session_binding.adapter, session_binding.session)
+        accounting = TurnContextAccounting(
+            remaining_revision_start=start,
+            capability_revision_start=int(
+                session_binding.session.session_data.get("context_capability_revision") or 0
+            ),
+            context_scope=scope,
+            pre_turn_remaining=session_binding.session.session_data.get(
+                "remaining_context_tokens"
+            ),
+            model_id="",
+            session_id=None,
+        )
+        self._finalize_context_accounting(
+            session_binding,
+            accounting,
+            context_budget=context_budget,
+            output_tokens=output_tokens,
+            consumed=True,
         )
 
     @staticmethod

@@ -12,7 +12,6 @@ from typing import Any
 from persona_continuum.agent.context_capability import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     PLANNING_CONTEXT_WINDOW_TOKENS,
-    compute_preferred_working_context,
     compute_usable_budget,
     default_model_capability_registry,
 )
@@ -21,6 +20,10 @@ from persona_continuum.agent.models import (
     EffectiveModelCapabilities,
     ModelCapability,
     PromptEnvelope,
+)
+from persona_continuum.agent.phase_policy import (
+    PhaseContextPolicy,
+    default_phase_context_policy,
 )
 from persona_continuum.agent.prompt import AgentPromptRenderer
 from persona_continuum.agent.response_collector import ContextBudgetExceededError
@@ -76,6 +79,11 @@ class ContextBudget:
     context_verified: bool = False
     usable_context_budget: int | None = None
     preferred_working_context: int | None = None
+    remaining_context_tokens: int | None = None
+    remaining_context_verified: bool = False
+    remaining_context_source: str = "unknown"
+    phase_working_target: int | None = None
+    transport_token_budget: int | None = None
 
     @property
     def within_budget(self) -> bool:
@@ -96,6 +104,11 @@ class ContextBudget:
             "context_verified": self.context_verified,
             "usable_context_budget": self.usable_context_budget,
             "preferred_working_context": self.preferred_working_context,
+            "remaining_context_tokens": self.remaining_context_tokens,
+            "remaining_context_verified": self.remaining_context_verified,
+            "remaining_context_source": self.remaining_context_source,
+            "phase_working_target": self.phase_working_target,
+            "transport_token_budget": self.transport_token_budget,
         }
 
 
@@ -139,6 +152,7 @@ class AgentContextBudgetManager:
         default_context_window_tokens: int | None = None,
         planning_context_window_tokens: int | None = None,
         token_estimator: TokenEstimator | None = None,
+        phase_policy: PhaseContextPolicy | None = None,
     ) -> None:
         # ``default_context_window_tokens`` is a PLANNING fallback.  It is only
         # consulted when the execution chain reported no context capability at
@@ -155,6 +169,7 @@ class AgentContextBudgetManager:
         )
         self.default_context_window_tokens = self.planning_context_window_tokens
         self.token_estimator = token_estimator or TokenEstimator()
+        self.phase_policy: PhaseContextPolicy = phase_policy or default_phase_context_policy()
 
     def estimate_tokens(self, value: Any) -> int:
         if value is None:
@@ -182,23 +197,31 @@ class AgentContextBudgetManager:
         if isinstance(model, EffectiveModelCapabilities):
             source = str(model.context_capability_source or "unknown")
             verified = bool(model.context_verified)
-            window = safe_int(model.effective_context_window, default=None, minimum=1)
+            remaining = safe_int(model.remaining_context_tokens, default=None, minimum=0)
+            window = safe_int(remaining, default=None, minimum=1) if remaining is not None else None
+            if window is None:
+                window = safe_int(model.effective_context_window, default=None, minimum=1)
             if window is None:
                 window = safe_int(model.native_context_window, default=None, minimum=1)
                 if window is not None:
-                    source = source if source != "unknown" else "provider_metadata"
+                    source = source if source != "unknown" else "agent_model_metadata"
+                    verified = False
             return window, source, verified and window is not None
         if isinstance(model, ModelCapability):
             window = safe_int(model.context_window, default=None, minimum=1)
             if window is None:
                 window = default_model_capability_registry().native_context_window(model.id)
                 if window is not None:
-                    return window, "model_registry", True
+                    return window, "provider_official_registry", True
                 return None, "unknown", False
-            source = "adapter_dynamic_probe"
+            from persona_continuum.agent.context_capability import canonical_context_source
+
+            source = "runtime_dynamic_probe"
             if str(model.source or "").casefold() not in _PROBE_SOURCE_VALUES:
-                source = "provider_metadata"
-            return window, source, True
+                source = canonical_context_source(model.source or "agent_model_metadata").value
+            from persona_continuum.agent.context_capability import source_is_verified
+
+            return window, source, source_is_verified(source)
         if isinstance(model, dict):
             return self._dict_capability(model)
         return None, "unknown", False
@@ -222,28 +245,31 @@ class AgentContextBudgetManager:
             )
         if isinstance(selected, dict) and selected.get("context_window") is not None:
             raw = selected.get("context_window")
-            source = selected.get("context_window_source") or "provider_metadata"
+            source = selected.get("context_window_source") or "agent_model_metadata"
         if raw is None and model.get("effective_context_window") is not None:
             raw = model.get("effective_context_window")
             source = (
                 model.get("context_capability_source")
                 or model.get("context_window_source")
-                or "provider_metadata"
+                or "agent_model_metadata"
             )
         if raw is None:
             raw = model.get("context_window")
             source = (
                 model.get("context_capability_source")
                 or model.get("context_window_source")
-                or ("adapter_declared" if raw is not None else None)
+                or ("agent_model_metadata" if raw is not None else None)
             )
         window = safe_int(raw, default=None, minimum=1)
         if window is not None:
-            return window, str(source or "provider_metadata"), True
+            from persona_continuum.agent.context_capability import source_is_verified
+
+            src = str(source or "agent_model_metadata")
+            return window, src, source_is_verified(src)
         model_id = model.get("effective_model") or model.get("model_id") or model.get("id")
         registry_window = default_model_capability_registry().native_context_window(model_id)
         if registry_window is not None:
-            return registry_window, "model_registry", True
+            return registry_window, "provider_official_registry", True
         return None, "unknown", False
 
     def context_window_resolution(
@@ -273,7 +299,7 @@ class AgentContextBudgetManager:
         window, source, verified = self.context_capability(model)
         if window is not None:
             return int(window), source, bool(verified)
-        return int(self.planning_context_window_tokens), "fallback_policy", False
+        return int(self.planning_context_window_tokens), "planning_fallback", False
 
     @staticmethod
     def _phase_key(phase: str) -> str:
@@ -319,19 +345,60 @@ class AgentContextBudgetManager:
         # Keep a separate fixed reserve for system/schema scaffolding.  Actual
         # prompt estimation is performed in ``plan`` below.
         system_schema = schema_reserve
-        if effective is None:
+        remaining = None
+        remaining_verified = False
+        remaining_source = "unknown"
+        persistent = False
+        if isinstance(model, EffectiveModelCapabilities):
+            remaining = safe_int(model.remaining_context_tokens, default=None, minimum=0)
+            remaining_source = str(model.remaining_context_source or "")
+            remaining_verified = bool(model.remaining_context_verified)
+            persistent = bool(model.persistent_session)
+        elif isinstance(model, dict):
+            remaining = safe_int(model.get("remaining_context_tokens"), default=None, minimum=0)
+            remaining_source = str(model.get("remaining_context_source") or "")
+            remaining_verified = bool(model.get("remaining_context_verified"))
+            persistent = bool(model.get("persistent_session"))
+        if remaining_source in {
+            "inferred_fresh_session",
+            "estimated_remaining",
+            "planning_fallback",
+        }:
+            remaining_verified = False
+        elif remaining_source in {"", "unknown"}:
+            remaining_source = "runtime_reported" if remaining_verified else "unknown"
+        hard_limit = remaining if remaining is not None else effective
+        if remaining is None and persistent:
+            remaining_source = "unknown"
+        if hard_limit is None:
             max_prompt = max(0, window - output_reserve - reasoning_reserve)
             usable: int | None = None
             preferred: int | None = None
+            working: int | None = None
         else:
             usable = compute_usable_budget(
-                effective,
+                hard_limit,
                 output_reserve=output_reserve,
                 reasoning_reserve=reasoning_reserve,
             )
             max_prompt = max(0, usable)
-            preferred = compute_preferred_working_context(effective, usable - system_schema)
+            working_verified = (
+                remaining_verified
+                if remaining is not None
+                else (False if persistent else bool(verified and effective is not None))
+            )
+            working = self.phase_policy.working_target(
+                hard_limit,
+                phase=normalized,
+                usable_budget=max(0, usable - system_schema),
+                verified=working_verified,
+                persistent_session=persistent,
+                fresh_stateless=not persistent,
+            )
+            preferred = working
         evidence_budget = max(0, max_prompt - system_schema)
+        if working is not None:
+            evidence_budget = min(evidence_budget, max(0, int(working) - system_schema))
         return ContextBudget(
             context_window_tokens=window,
             max_prompt_tokens=max_prompt,
@@ -344,6 +411,10 @@ class AgentContextBudgetManager:
             context_verified=verified if effective is not None else planning_verified,
             usable_context_budget=usable,
             preferred_working_context=preferred,
+            remaining_context_tokens=remaining if remaining is not None else effective,
+            remaining_context_verified=remaining_verified if remaining is not None else False,
+            remaining_context_source=remaining_source,
+            phase_working_target=working,
         )
 
     def plan(
@@ -377,6 +448,11 @@ class AgentContextBudgetManager:
             context_verified=base.context_verified,
             usable_context_budget=base.usable_context_budget,
             preferred_working_context=base.preferred_working_context,
+            remaining_context_tokens=base.remaining_context_tokens,
+            remaining_context_verified=base.remaining_context_verified,
+            remaining_context_source=base.remaining_context_source,
+            phase_working_target=base.phase_working_target,
+            transport_token_budget=base.transport_token_budget,
         )
         if enforce and not budget.within_budget:
             raise ContextBudgetExceededError(

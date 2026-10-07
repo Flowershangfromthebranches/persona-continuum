@@ -162,7 +162,7 @@ class OpenCodeAdapter(ACPAdapter):
             code, out, _ = await safe_exec_cmd([binary, "models"], timeout=6.0)
             if code == 0 and out:
                 parsed = self._parse_models(out)
-                if parsed and any(model.selectable for model in parsed):
+                if parsed:
                     return parsed
         return self._fallback_models()
 
@@ -192,29 +192,15 @@ class OpenCodeAdapter(ACPAdapter):
                 if "/" in m_id:
                     provider = m_id.split("/")[0]
 
-                has_reasoning = any(
-                    k in m_id.lower() for k in ("reasoning", "r1", "sol", "terra", "grok-4.6")
-                )
-                efforts = (
-                    ["low", "medium", "high", "xhigh"]
-                    if has_reasoning
-                    else ["none", "low", "medium", "high"]
-                )
-
                 models.append(
                     ModelCapability(
                         id=m_id,
                         display_name=m_id,
                         provider=provider,
-                        supported_reasoning_efforts=efforts,
-                        default_reasoning_effort="high" if has_reasoning else "medium",
-                        # OpenCode reports model IDs, while effort values are
-                        # this adapter's conservative configuration. ACP
-                        # session/new must still echo the selected effort
-                        # because require_verified_binding is enabled.
-                        source="config",
-                        selectable=False,
-                        reasoning_selection=SelectionStrategy.STARTUP,
+                        # IDs are selectable; a name alone cannot prove effort support.
+                        source="official_cli",
+                        selectable=True,
+                        reasoning_selection=SelectionStrategy.UNSUPPORTED,
                     )
                 )
 

@@ -33,3 +33,9 @@ skills/cli-research-probe-diagnosis/
 /narrative-shooting-pipeline-report.canvas.*
 .agents/
 docs/superpowers/
+
+# Local tool output
+.pytest-tmp/
+.playwright-cli/
+.workbuddy/
+/output/

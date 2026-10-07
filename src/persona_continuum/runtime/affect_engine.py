@@ -56,7 +56,7 @@ class AffectEngine:
                 continue
             state = states[name]
             state.intensity = clamp(max(state.intensity, amount))
-            state.updated_at = now
+            state.updated_at = max(state.updated_at, now)
             state.triggers.append(reason)
             state.confidence = clamp(max(state.confidence, 0.65))
             self._save(persona_id, branch_id, state)
@@ -91,7 +91,7 @@ class AffectEngine:
                 continue
             state = states[name]
             state.intensity = clamp(state.intensity + delta)
-            state.updated_at = now
+            state.updated_at = max(state.updated_at, now)
             state.triggers.append(reason)
             state.confidence = clamp(max(state.confidence, 0.65))
             self._save(persona_id, branch_id, state)

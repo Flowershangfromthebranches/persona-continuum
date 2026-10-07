@@ -21,12 +21,13 @@ from persona_continuum.compiler.contract import (
 )
 
 
-def test_contract_declares_eighteen_components() -> None:
-    assert len(COMPILE_CONTRACT) == 18
+def test_contract_declares_canonical_component_count() -> None:
+    assert "erotic_profile" in COMPILE_CONTRACT
+    assert len(COMPILE_CONTRACT) >= 21
 
 
 def test_contract_is_versioned() -> None:
-    assert CONTRACT_VERSION == "1.0"
+    assert CONTRACT_VERSION == "1.1"
     assert CompileCoverage().contract_version == CONTRACT_VERSION
 
 
@@ -103,7 +104,7 @@ def test_coverage_counts_mapped_and_unused_fields() -> None:
     assert coverage.artifact_fields_total == 3
     assert coverage.artifact_fields_mapped == 2
     assert coverage.unused_artifact_fields == ["identity_and_timeline.mystery"]
-    assert coverage.compiled_component_coverage == round(2 / 18, 4)
+    assert coverage.compiled_component_coverage == round(2 / len(COMPILE_CONTRACT), 4)
 
 
 def test_coverage_flags_missing_core_components() -> None:
@@ -140,7 +141,7 @@ def test_gap_is_a_legal_outcome() -> None:
     coverage = build_coverage([], merged)
     assert coverage.ok
     assert "temperament" in coverage.missing_optional_components
-    assert coverage.compiled_component_coverage == round(8 / 18, 4)
+    assert coverage.compiled_component_coverage == round(8 / len(COMPILE_CONTRACT), 4)
 
 
 def test_render_table_lists_every_component() -> None:

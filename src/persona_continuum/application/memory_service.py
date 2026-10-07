@@ -137,6 +137,10 @@ class MemoryService:
         exclude_visibility: set[str] | None,
     ) -> bool:
         metadata = dict(loads(row["metadata_json"]))
+        if metadata.get("retrieval_role") == "raw_archive" or (
+            row["type"] == "digital_experience" and not metadata.get("semantic_experience_version")
+        ):
+            return False
         row_visibility = str(metadata.get("visibility", "persona_private"))
         if visibility is not None and row_visibility not in visibility:
             return False
@@ -201,9 +205,11 @@ class MemoryService:
         original = self.get_memory(memory_id)
         if original is None:
             raise KeyError(memory_id)
+        metadata = dict(original.metadata)
+        metadata["superseded_reason"] = reason
         self.database.conn.execute(
             "UPDATE memories SET validity = 'superseded', metadata_json = ? WHERE id = ?",
-            (dumps({"superseded_reason": reason}), memory_id),
+            (dumps(metadata), memory_id),
         )
         self.database.conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
         corrected = self.add_memory(
@@ -222,6 +228,54 @@ class MemoryService:
         )
         self.database.conn.commit()
         return corrected
+
+    def mark_superseded(self, memory_id: str, reason: str) -> None:
+        original = self.get_memory(memory_id)
+        if original is None:
+            raise KeyError(memory_id)
+        metadata = dict(original.metadata)
+        metadata["superseded_reason"] = reason
+        self.database.conn.execute(
+            "UPDATE memories SET validity='superseded', metadata_json=? WHERE id=?",
+            (dumps(metadata), memory_id),
+        )
+        self.database.conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (memory_id,))
+        self.database.conn.commit()
+
+    def attach_supersession(
+        self,
+        original_id: str,
+        replacement_id: str,
+        reason: str,
+    ) -> None:
+        """Keep the original row, mark it superseded, and point a correction at it."""
+        original = self.get_memory(original_id)
+        replacement = self.get_memory(replacement_id)
+        if original is None:
+            raise KeyError(original_id)
+        if replacement is None:
+            raise KeyError(replacement_id)
+        original_metadata = dict(original.metadata)
+        original_metadata["superseded_reason"] = reason
+        original_metadata["superseded_by"] = replacement_id
+        self.database.conn.execute(
+            "UPDATE memories SET validity='superseded', metadata_json=? WHERE id=?",
+            (dumps(original_metadata), original_id),
+        )
+        self.database.conn.execute("DELETE FROM memories_fts WHERE memory_id=?", (original_id,))
+        replacement_metadata = dict(replacement.metadata)
+        replacement_metadata["corrected_from"] = original_id
+        replacement_metadata["correction_reason"] = reason
+        self.database.conn.execute(
+            """
+            UPDATE memories
+            SET supersedes_id=?, user_corrected=1, source_kind='user_correction',
+                metadata_json=?
+            WHERE id=?
+            """,
+            (original_id, dumps(replacement_metadata), replacement_id),
+        )
+        self.database.conn.commit()
 
     def forget_memory(self, persona_id: str, memory_id: str, reason: str = "user_request") -> bool:
         self.database.conn.execute(
@@ -251,7 +305,8 @@ class MemoryService:
         if persona_id is None:
             self.database.conn.execute("DELETE FROM memories_fts")
             rows = self.database.conn.execute(
-                "SELECT id, persona_id, content FROM memories WHERE validity = 'valid'"
+                "SELECT id, persona_id, content, type, metadata_json FROM memories "
+                "WHERE validity = 'valid'"
             ).fetchall()
         else:
             self.database.conn.execute(
@@ -259,12 +314,17 @@ class MemoryService:
             )
             rows = self.database.conn.execute(
                 """
-                SELECT id, persona_id, content FROM memories
+                SELECT id, persona_id, content, type, metadata_json FROM memories
                 WHERE persona_id = ? AND validity = 'valid'
                 """,
                 (persona_id,),
             ).fetchall()
         for row in rows:
+            meta = loads(row["metadata_json"])
+            if meta.get("retrieval_role") == "raw_archive" or (
+                row["type"] == "digital_experience" and not meta.get("semantic_experience_version")
+            ):
+                continue
             self.database.conn.execute(
                 "INSERT INTO memories_fts(memory_id, persona_id, content) VALUES (?, ?, ?)",
                 (row["id"], row["persona_id"], row["content"]),
@@ -294,6 +354,10 @@ class MemoryService:
                 SELECT *, NULL AS fts_score, 0 AS fts_matched
                 FROM memories
                 WHERE persona_id = ? AND validity = 'valid'
+                  AND COALESCE(json_extract(metadata_json, '$.retrieval_role'), 'fact')
+                      != 'raw_archive'
+                  AND (type != 'digital_experience' OR
+                       json_extract(metadata_json, '$.semantic_experience_version') = 1)
                 ORDER BY importance DESC, written_at DESC
                 LIMIT ?
                 """,
@@ -312,6 +376,10 @@ class MemoryService:
                     JOIN memories m ON m.id = memories_fts.memory_id
                     WHERE memories_fts MATCH ? AND memories_fts.persona_id = ?
                       AND m.validity = 'valid'
+                      AND COALESCE(json_extract(m.metadata_json, '$.retrieval_role'), 'fact')
+                          != 'raw_archive'
+                      AND (m.type != 'digital_experience' OR
+                           json_extract(m.metadata_json, '$.semantic_experience_version') = 1)
                     ORDER BY fts_score ASC, m.importance DESC, m.written_at DESC
                     LIMIT ?
                     """,
@@ -326,6 +394,10 @@ class MemoryService:
                 SELECT *, NULL AS fts_score, 0 AS fts_matched
                 FROM memories
                 WHERE persona_id = ? AND validity = 'valid'
+                  AND COALESCE(json_extract(metadata_json, '$.retrieval_role'), 'fact')
+                      != 'raw_archive'
+                  AND (type != 'digital_experience' OR
+                       json_extract(metadata_json, '$.semantic_experience_version') = 1)
                 ORDER BY importance DESC, written_at DESC
                 LIMIT ?
                 """,
@@ -433,6 +505,7 @@ class MemoryService:
         return exp(-age_days / 90)
 
     def _insert(self, record: MemoryRecord, *, commit: bool = True) -> None:
+        record.metadata["retrieval_role"] = record.retrieval_role
         self.database.conn.execute(
             """
             INSERT INTO memories VALUES (
@@ -463,10 +536,11 @@ class MemoryService:
                 dumps(record.metadata),
             ),
         )
-        self.database.conn.execute(
-            "INSERT INTO memories_fts(memory_id, persona_id, content) VALUES (?, ?, ?)",
-            (record.id, record.persona_id, record.content),
-        )
+        if record.retrieval_role != "raw_archive":
+            self.database.conn.execute(
+                "INSERT INTO memories_fts(memory_id, persona_id, content) VALUES (?, ?, ?)",
+                (record.id, record.persona_id, record.content),
+            )
         if commit:
             self.database.conn.commit()
 

@@ -109,7 +109,44 @@ def build_runtime_binding_snapshot(
         # Leaving it None keeps "Unknown == Unknown" instead of inventing 32K.
         context_window=session.session_data.get("effective_context_window"),
         context_window_source=session.session_data.get("effective_context_window_source"),
-        context_window_mode=session.session_data.get("context_window_mode"),
+        context_window_mode=session.session_data.get("context_window_mode")
+        or str(getattr(adapter, "context_window_mode", "") or "")
+        or None,
+        remaining_context_tokens=session.session_data.get("remaining_context_tokens"),
+        remaining_context_verified=bool(
+            session.session_data.get("remaining_context_verified")
+        ),
+        remaining_context_source=session.session_data.get("remaining_context_source"),
+        used_context_tokens=session.session_data.get("used_context_tokens"),
+        native_context_window=session.session_data.get("native_context_window"),
+        max_output_tokens=session.session_data.get("max_output_tokens"),
+        auto_compaction_detected=session.session_data.get("auto_compaction_detected"),
+        context_usage_revision=int(session.session_data.get("context_usage_revision") or 0),
+        context_capability_revision=int(
+            session.session_data.get("context_capability_revision") or 0
+        ),
+        context_remaining_revision=int(
+            session.session_data.get("context_remaining_revision") or 0
+        ),
+        context_usage_updated_at=session.session_data.get("context_usage_updated_at"),
+        remaining_updated_at=session.session_data.get("remaining_updated_at"),
+        context_scope=str(
+            session.session_data.get("workload_context_scope")
+            or session.session_data.get("context_scope")
+            or getattr(adapter, "context_scope", None)
+            or ""
+        )
+        or None,
+        workload_context_scope=str(
+            session.session_data.get("workload_context_scope") or ""
+        )
+        or None,
+        adapter_session_mode=str(getattr(adapter, "adapter_session_mode", None) or "") or None,
+        remaining_is_fresh=bool(
+            session.session_data.get("remaining_context_verified")
+        )
+        and str(session.session_data.get("remaining_context_source") or "")
+        == "runtime_reported",
     )
 
 

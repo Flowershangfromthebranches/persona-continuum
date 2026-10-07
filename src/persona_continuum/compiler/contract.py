@@ -17,7 +17,7 @@ with no error anywhere.
 
 The contract
 ------------
-1. :data:`COMPILE_CONTRACT` declares the 18 canonical components, their value
+1. :data:`COMPILE_CONTRACT` declares the canonical components, their value
    shape, and whether they are core or optional.
 2. :data:`KEY_MAP` declares a **generic semantic bridge** from evidence-shaped
    keys to schema slots.  It is generic in the sense that matters: it encodes
@@ -38,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 
 ValueShape = Literal["list", "dict"]
 
@@ -83,12 +83,20 @@ COMPILE_CONTRACT: dict[str, ComponentSpec] = {
         "attachment_patterns", "dict", False, "how they bond and hold boundaries"
     ),
     "needs_and_desires": _spec("needs_and_desires", "list", False, "what they are after"),
+    "dominant_traits": _spec("dominant_traits", "list", False, "stable trait attractors"),
+    "embodied_identity": _spec("embodied_identity", "dict", False, "body and self-image"),
     "defenses": _spec("defenses", "list", False, "how they protect themselves"),
     # expression
     "expression_style": _spec("expression_style", "dict", True, "how they sound"),
     "vocabulary": _spec("vocabulary", "list", False, "characteristic phrasing"),
     "dialogue_examples": _spec("dialogue_examples", "list", False, "attested utterances"),
     "anti_patterns": _spec("anti_patterns", "list", False, "how they must never sound"),
+    "erotic_profile": _spec(
+        "erotic_profile",
+        "dict",
+        False,
+        "optional adult erotic repertoire; missing is unknown, not refusal",
+    ),
     # relationships
     "relationships": _spec("relationships", "list", True, "standing ties to others"),
 }
@@ -127,6 +135,17 @@ def _r(target: str, mode: BridgingMode = "append", label: str | None = None) -> 
 #: producer are present too, so a producer that already speaks the schema
 #: passes through unchanged.
 KEY_MAP: dict[str, MappingRule] = {
+    "dominant_traits": _r("dominant_traits"),
+    "core_behavioral_invariants": _r("dominant_traits"),
+    "dominant_drives": _r("needs_and_desires"),
+    "embodied_identity": _r("embodied_identity", "nest"),
+    "body_self_image": _r("embodied_identity", "nest", "body_self_image"),
+    "flirtation_frequency": _r("expression_style", "nest", "flirtation_frequency"),
+    "sexual_directness": _r("expression_style", "nest", "sexual_directness"),
+    "suggestive_humor": _r("expression_style", "nest", "suggestive_humor"),
+    "playful_provocation": _r("expression_style", "nest", "playful_provocation"),
+    "initiative": _r("expression_style", "nest", "initiative"),
+    "sexual_inhibition": _r("expression_style", "nest", "sexual_inhibition"),
     # -- identity ----------------------------------------------------------
     "identity_profile": _r("identity_profile", "nest"),
     "core_invariants": _r("identity_profile", "nest", "core_invariants"),
@@ -182,6 +201,7 @@ KEY_MAP: dict[str, MappingRule] = {
     "quotes": _r("dialogue_examples", "append", "quote"),
     "anti_patterns": _r("anti_patterns"),
     "excluded_styles": _r("anti_patterns", "append", "excluded_style"),
+    "erotic_profile": _r("erotic_profile", "nest"),
     # -- relationships -----------------------------------------------------
     "relationships": _r("relationships"),
     "relationship_inventory": _r("relationships", "append", "relationship"),
@@ -262,6 +282,10 @@ def normalize_artifact(dimension: str, components: dict[str, Any]) -> Normalizat
             if not value:
                 continue
         bucket = record.mapped.setdefault(rule.target, [])
+        if rule.target in {"dominant_traits", "needs_and_desires"} and rule.mode == "append":
+            # Preserve quantitative profiles; stringifying dicts loses baseline and kinetics.
+            bucket.extend(value if isinstance(value, list) else [value])
+            continue
         # Provenance is carried by ``aliases_used`` (and by the coverage
         # report / lineage rows), not by prefixing every value string with its
         # source key -- the compiled persona should stay readable.

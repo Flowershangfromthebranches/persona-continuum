@@ -6,6 +6,10 @@ from typing import Any
 from persona_continuum.application._utils import dumps, loads, new_id
 from persona_continuum.application.persona_service import PersonaService
 from persona_continuum.application.session_service import SessionService
+from persona_continuum.auth.profiles import redact_secrets
+from persona_continuum.domain.scene import RoomSceneState
+from persona_continuum.runtime.scene_runtime import SceneRuntime
+from persona_continuum.runtime.turn_normalizer import normalize_turn, normalize_turn_for_prompt
 from persona_continuum.security.validation import CodedError
 from persona_continuum.storage.database import Database
 
@@ -18,11 +22,18 @@ class RoomService:
         self.personas = personas
         self.sessions = sessions
 
-    def create_room(self, persona_ids: list[str], topic: str | None = None) -> dict[str, Any]:
+    def create_room(
+        self,
+        persona_ids: list[str],
+        topic: str | None = None,
+        initial_relationships: dict[str, dict[str, dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
         room_id = new_id("room")
         room_sessions: dict[str, str] = {}
         for persona_id in persona_ids:
             self.personas.get(persona_id)
+            for counterpart, prior in (initial_relationships or {}).get(persona_id, {}).items():
+                self.sessions.initialize_relationship(persona_id, counterpart, prior)
             session = self.sessions.start_session(
                 persona_id,
                 title=f"Room {room_id}",
@@ -39,6 +50,7 @@ class RoomService:
             "turn_index": 0,
             "room_sessions": room_sessions,
             "transcript": [],
+            "scene_state": RoomSceneState().model_dump(mode="json"),
             "shared_public_memory": [],
             "speaker_selection_state": {"previous_speaker_id": None},
             "previous_speaker_id": None,
@@ -91,17 +103,42 @@ class RoomService:
             session_id = session.id
             room["room_sessions"][persona_id] = session_id
             self._save(room)
+        scene = RoomSceneState.model_validate(room.get("scene_state") or {})
+        if message and room.get("pending_scene_message") != message:
+            input_id = new_id("room_input")
+            channels, scene_events = SceneRuntime().accept_turn(
+                scene,
+                room_id=room_id,
+                turn_id=input_id,
+                actor="user",
+                raw_content=str(redact_secrets(message)),
+            )
+            for event in scene_events:
+                self.database.conn.execute(
+                    "INSERT OR IGNORE INTO room_scene_events VALUES (?, ?, ?, ?)",
+                    (event.id, room_id, input_id, event.model_dump_json()),
+                )
+            room["pending_scene_message"] = message
+        else:
+            SceneRuntime.tick(scene)
+        room["scene_state"] = scene.model_dump(mode="json")
+        self._save(room)
+        previous_speech = normalize_turn(
+            room.get("previous_content") or "", actor="persona"
+        ).spoken_text
         visible_message = "\n".join(
             [
-                message or room.get("topic") or "",
+                normalize_turn(message or room.get("topic") or "").spoken_text,
                 f"Previous speaker: {room.get('previous_speaker_id') or ''}",
-                f"Previous content: {room.get('previous_content') or ''}",
+                f"Previous content: {previous_speech}",
+                SceneRuntime.prompt_state(scene),
             ]
         )
         prepared = self.sessions.prepare_turn(
             persona_id,
             session_id,
             visible_message,
+            current_time=scene.scene_time,
             counterpart_id=f"room:{room_id}",
         )
         public_memories = [
@@ -116,7 +153,20 @@ class RoomService:
             if self._memory_visible_in_room(memory.metadata, room_id)
         ]
         return {
-            "room": room,
+            "room": {
+                **{
+                    key: value
+                    for key, value in room.items()
+                    if key not in {"metadata", "pending_scene_message"}
+                },
+                "transcript": [normalize_turn_for_prompt(t) for t in room.get("transcript", [])],
+                "shared_public_memory": [
+                    normalize_turn_for_prompt(t) for t in room.get("shared_public_memory", [])
+                ],
+                "previous_content": normalize_turn(
+                    room.get("previous_content") or "", actor="persona"
+                ).spoken_text,
+            },
             "speaker_persona_id": persona_id,
             "session_id": session_id,
             "prepared": prepared,
@@ -138,14 +188,37 @@ class RoomService:
             raise CodedError("room_speaker_mismatch", persona_id)
         if room.get("room_sessions", {}).get(persona_id) != session_id:
             raise CodedError("room_session_mismatch", session_id)
+        scene = RoomSceneState.model_validate(room.get("scene_state") or {})
+        response_id = new_id("turn")
+        channels, scene_events = SceneRuntime().accept_turn(
+            scene,
+            room_id=room_id,
+            turn_id=response_id,
+            actor=persona_id,
+            raw_content=str(redact_secrets(persona_response)),
+            advance_clock=False,
+        )
         result = self.sessions.commit_turn(
             persona_id,
             session_id,
             user_message=user_message,
             persona_response=persona_response,
+            occurred_at=scene.scene_time,
+            scene_events=channels.scene_events,
+            source_turn_id=response_id,
             counterpart_id=f"room:{room_id}",
         )
+        room["scene_state"] = scene.model_dump(mode="json")
+        room.pop("pending_scene_message", None)
+        for event in scene_events:
+            self.database.conn.execute(
+                "INSERT OR IGNORE INTO room_scene_events VALUES (?, ?, ?, ?)",
+                (event.id, room_id, response_id, event.model_dump_json()),
+            )
         turn_record = {
+            **channels.model_dump(mode="json"),
+            "content": channels.spoken_text,
+            "scene_time": scene.scene_time.isoformat(),
             "persona_id": persona_id,
             "session_id": session_id,
             "user_message": user_message,
@@ -157,7 +230,7 @@ class RoomService:
         room.setdefault("shared_public_memory", []).append(turn_record)
         room["turn_index"] = int(room.get("turn_index", 0)) + 1
         room["previous_speaker_id"] = persona_id
-        room["previous_content"] = persona_response
+        room["previous_content"] = channels.spoken_text
         room["previous_evaluation"] = {"acknowledged": True}
         room.setdefault("speaker_selection_state", {})["previous_speaker_id"] = persona_id
         for other_id in room.get("persona_ids", []):
@@ -171,6 +244,7 @@ class RoomService:
                 session_id,
                 result["turn_id"],
                 "room_public_turn",
+                additive=True,
             )
             self.sessions._apply_relationship_delta(
                 other_id,
@@ -180,6 +254,7 @@ class RoomService:
                 room.get("room_sessions", {}).get(other_id),
                 result["turn_id"],
                 "room_public_turn",
+                additive=True,
             )
         self._save(room)
         return {"room": room, "turn": result}
@@ -216,6 +291,24 @@ class RoomService:
         return room_id in shared_rooms
 
     def _save(self, room: dict[str, Any]) -> None:
+        # This legacy room schema predates room metadata (it carries no
+        # ``metadata`` key at all), while the orchestrator owns keys such as
+        # ``rolling_summary``, the summary version stamp and the ``raw_archive_*``
+        # migration archives in the very same ``state_json`` column.  Saving this
+        # schema wholesale would therefore delete them, so the stored metadata is
+        # carried across instead of being dropped.
+        if "metadata" not in room:
+            row = self.database.conn.execute(
+                "SELECT state_json FROM rooms WHERE id = ?", (room["id"],)
+            ).fetchone()
+            if row is not None:
+                try:
+                    existing = loads(row["state_json"]) or {}
+                except Exception:
+                    existing = {}
+                metadata = existing.get("metadata") if isinstance(existing, dict) else None
+                if isinstance(metadata, dict) and metadata:
+                    room["metadata"] = metadata
         self.database.conn.execute(
             """
             UPDATE rooms

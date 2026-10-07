@@ -184,17 +184,17 @@ async def test_expert_consultation_30_followups_stay_transport_safe(app: Any) ->
 # --- legacy free_discussion room stress ---------------------------------------
 
 
-def _legacy_transcript(messages: int) -> list[dict[str, Any]]:
+def _legacy_transcript(messages: int, *, repeat: int = 6) -> list[dict[str, Any]]:
     transcript: list[dict[str, Any]] = []
     for index in range(messages):
         if index == 0:
             content = f"OLDEST_USER_FACT_{index}：我最开始的需求是长期稳健增值，不能接受本金亏损。"
             speaker, participant = "用户", "user"
         elif index % 2 == 0:
-            content = f"用户第{index}轮的补充说明，包含一些细节与约束。" * 6
+            content = f"用户第{index}轮的补充说明，包含一些细节与约束。" * repeat
             speaker, participant = "用户", "user"
         else:
-            content = f"主持人第{index}轮的回应，包含讨论内容与展开的分析细节。" * 6
+            content = f"主持人第{index}轮的回应，包含讨论内容与展开的分析细节。" * repeat
             speaker, participant = "主持人", "slot_host"
         transcript.append(
             {
@@ -215,8 +215,15 @@ def _transcript_bytes(turns: list[dict[str, Any]]) -> int:
     )
 
 
-async def _prepare_truncated_context(app: Any) -> tuple[Any, int, list[dict[str, Any]]]:
-    """Seed a 120-message legacy free room and pack it under the ARGV budget."""
+async def _prepare_truncated_context(
+    app: Any, *, repeat: int = 6
+) -> tuple[Any, int, list[dict[str, Any]]]:
+    """Seed a 120-message legacy free room and pack it under the ARGV budget.
+
+    ``repeat`` scales per-message size: the default keeps the RECENT window
+    itself inside the transport budget (the bounded-window path), while a large
+    value makes the recent window alone unshippable (the truncation path).
+    """
 
     app.agent_registry.register_adapter(ArgvFakeAdapter())
     fake = _argv_fake(app)
@@ -248,7 +255,7 @@ async def _prepare_truncated_context(app: Any) -> tuple[Any, int, list[dict[str,
     )
     state = app.orchestrator.get_room(room.id)
     assert state is not None
-    state.transcript = _legacy_transcript(120)
+    state.transcript = _legacy_transcript(120, repeat=repeat)
     app.orchestrator._save_room_state(state, force=True)
 
     capability = resolve_prompt_transport_capability(fake)
@@ -271,8 +278,37 @@ async def _prepare_truncated_context(app: Any) -> tuple[Any, int, list[dict[str,
 
 
 @pytest.mark.anyio
-async def test_legacy_free_room_truncates_transcript_instead_of_full_fallback(app: Any) -> None:
+async def test_legacy_free_room_never_resends_the_full_transcript(app: Any) -> None:
+    """The bounded recent window replaces the old whole-transcript trim.
+
+    Once history has left the recent window the full transcript must never be
+    sent again -- not even a byte-trimmed version of it, which is what the old
+    "trim the whole transcript and mark transport_truncated" behaviour did.
+    Older content reaches the model through the rolling summary instead.
+    """
+
     ctx, budget, transcript = await _prepare_truncated_context(app)
+
+    assert ctx.mode == "windowed"
+    assert len(ctx.turns) == RoomContextManager().raw_window
+    assert len(ctx.turns) < len(transcript)
+    # The transported window itself stays inside the transport budget.
+    assert _transcript_bytes(ctx.turns) <= budget
+    # The oldest turn is deliberately NOT in the prompt any more; nothing may
+    # silently smuggle it back in.
+    assert not any("OLDEST_USER_FACT_0" in str(item.get("content") or "") for item in ctx.turns)
+
+
+@pytest.mark.anyio
+async def test_legacy_free_room_truncates_a_window_that_cannot_be_shipped(app: Any) -> None:
+    """When even the recent window exceeds the budget, trim deterministically.
+
+    ``repeat=200`` makes eight recent messages alone larger than the ARGV
+    ceiling, so the packer must fall back to the deterministic user-priority
+    trim and salvage the user's own statements -- never to the full transcript.
+    """
+
+    ctx, budget, transcript = await _prepare_truncated_context(app, repeat=200)
 
     # Deterministic truncation, never a silent full-transcript fallback.
     assert ctx.mode == "transport_truncated"
@@ -280,9 +316,6 @@ async def test_legacy_free_room_truncates_transcript_instead_of_full_fallback(ap
     # The trim accounting itself (content bytes) stays within budget.
     content_bytes = sum(len(str(item.get("content") or "").encode("utf-8")) for item in ctx.turns)
     assert content_bytes <= budget
-    # What the user said survives: user turns are prioritised by the trim,
-    # so the oldest goal stays inside the transported window.
-    assert any("OLDEST_USER_FACT_0" in str(item.get("content") or "") for item in ctx.turns)
     # Salvage carries a bounded set of user statements (clipped to 300 chars).
     assert ctx.salvaged_facts
     user_contents = {

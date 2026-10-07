@@ -1,0 +1,148 @@
+{
+  "kind": "mock_persisted_classification_concurrency",
+  "target_turns": 10000,
+  "context_tokens": 500000,
+  "windows": 18,
+  "latency_s": [
+    0.4,
+    0.8
+  ],
+  "rows": [
+    {
+      "workers": 1,
+      "windows": 18,
+      "calls": 18,
+      "wall_s": 9.8142,
+      "avg_latency_s": 0.545,
+      "p50_s": 0.5475,
+      "p95_s": 0.7319,
+      "peak_active": 1,
+      "peak_independent_sessions": 1,
+      "agent_calls": 18,
+      "speedup_vs_serial": 1.0
+    },
+    {
+      "workers": 2,
+      "windows": 18,
+      "calls": 18,
+      "wall_s": 5.1418,
+      "avg_latency_s": 0.561,
+      "p50_s": 0.5535,
+      "p95_s": 0.7454,
+      "peak_active": 2,
+      "peak_independent_sessions": 2,
+      "agent_calls": 18,
+      "speedup_vs_serial": 1.909
+    },
+    {
+      "workers": 4,
+      "windows": 18,
+      "calls": 18,
+      "wall_s": 2.9989,
+      "avg_latency_s": 0.6191,
+      "p50_s": 0.6311,
+      "p95_s": 0.7513,
+      "peak_active": 4,
+      "peak_independent_sessions": 4,
+      "agent_calls": 18,
+      "speedup_vs_serial": 3.273
+    }
+  ],
+  "calls_consistent": true,
+  "scenario_a_simultaneous_wave": {
+    "workers": 4,
+    "windows": 18,
+    "wall_s": 6.3273,
+    "successful_windows": 18,
+    "window_attempts": 22,
+    "window_retries": 1,
+    "stale_replayed_windows": 3,
+    "stale_rejection_count": 3,
+    "concurrency_downgrades": 1,
+    "persistent_downgrades": [
+      [
+        "too_many_sessions",
+        2
+      ]
+    ],
+    "downgrade_events": [
+      {
+        "from": 4,
+        "to": 2,
+        "reason": "too_many_sessions",
+        "window": "w03",
+        "generation": 1,
+        "at": 1789135208.918748
+      }
+    ],
+    "peak_active": 4,
+    "checkpoint_duplicates": 0,
+    "failed_windows": 0,
+    "terminal_error": null
+  },
+  "scenario_b_two_level_wave": {
+    "workers": 4,
+    "windows": 4,
+    "wall_s": 2.7055,
+    "successful_windows": 4,
+    "concurrency_downgrades": 2,
+    "downgrade_events": [
+      {
+        "from": 4,
+        "to": 2,
+        "reason": "too_many_sessions",
+        "window": "w03",
+        "generation": 1,
+        "at": 1789135215.2457972
+      },
+      {
+        "from": 2,
+        "to": 1,
+        "reason": "too_many_sessions",
+        "window": "w02",
+        "generation": 2,
+        "at": 1789135215.2459872
+      }
+    ],
+    "final_effective_concurrency": 1,
+    "checkpoint_duplicates": 0,
+    "failed_windows": 0,
+    "terminal_error": null
+  },
+  "scenario_c_serial_failure": {
+    "workers": 4,
+    "concurrency_downgrades": 2,
+    "downgrade_events": [
+      {
+        "from": 4,
+        "to": 2,
+        "reason": "too_many_sessions",
+        "window": "serial",
+        "generation": 1,
+        "at": 1789135217.951297
+      },
+      {
+        "from": 2,
+        "to": 1,
+        "reason": "too_many_sessions",
+        "window": "serial",
+        "generation": 2,
+        "at": 1789135217.951342
+      }
+    ],
+    "final_effective_concurrency": 1,
+    "terminal_error": "PROVIDER_CONCURRENCY_LIMIT_AT_SERIAL_EXECUTION",
+    "terminal_concurrency_failures": 1
+  },
+  "scenario_d_generic_429": {
+    "workers": 4,
+    "windows": 18,
+    "successful_windows": 17,
+    "concurrency_downgrades": 0,
+    "persistent_downgrades": [],
+    "final_effective_concurrency": 4,
+    "provider_failure_kind": "unknown_429",
+    "terminal_error": "RuntimeError",
+    "checkpoint_duplicates": 0
+  }
+}
