@@ -257,6 +257,8 @@ class PersonaContinuum:
         self.database.migrate()
         with contextlib.suppress(Exception):
             self.material_uploads.cleanup_orphans()
+        with contextlib.suppress(Exception):
+            self.material_intelligence.reclaim_interrupted_jobs()
         # Episodes owed a summary when the process last stopped are put back on
         # the work list; nothing is re-summarised automatically at startup.
         with contextlib.suppress(Exception):

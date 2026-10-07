@@ -70,6 +70,7 @@ from persona_continuum.application.job_progress import (
 from persona_continuum.application.material_intelligence import (
     MATERIAL_AGENT_OUTPUT_SCHEMAS,
     MATERIAL_AGENT_SYSTEM_PROMPTS,
+    PersonaEvidenceIndex,
 )
 from persona_continuum.application.research_backend import (
     ResearchBackend,
@@ -4079,23 +4080,36 @@ class PersonaCreationOrchestrator:
             return {str(k): [str(v) for v in (val or [])] for k, val in (raw or {}).items()}
 
         processed = processed_map()
+        # One index per pass: its snapshot loads once and is shared by every
+        # dimension.  Evidence is not written while dimensions are extracted.
+        evidence_index = (
+            self.material_intelligence.get_index(persona_id)
+            if self.material_intelligence is not None
+            else None
+        )
+        retrieval_limit = (
+            safe_int(
+                getattr(self.continuum.config, "persona_dimension_retrieval_items", 48),
+                default=48,
+                minimum=8,
+            )
+            or 48
+        )
 
-        def plan_dimension(dimension: str) -> tuple[list[dict[str, Any]], list[str], str]:
+        async def retrieve_for_dimension(dimension: str) -> list[dict[str, Any]]:
+            if evidence_index is None:
+                return []
+            # Ranking a large ledger is CPU-bound; keep the event loop free so
+            # agent streams, heartbeats and the Web UI are not starved.
+            return await asyncio.to_thread(
+                evidence_index.retrieve, dimension, top_k=retrieval_limit, diversity=True
+            )
+
+        def plan_dimension(
+            dimension: str, retrieved: list[dict[str, Any]]
+        ) -> tuple[list[dict[str, Any]], list[str], str]:
             """Return (evidence_items, delta_source_ids, mode)."""
 
-            retrieved: list[dict[str, Any]] = []
-            if self.material_intelligence is not None:
-                retrieval_limit = (
-                    safe_int(
-                        getattr(self.continuum.config, "persona_dimension_retrieval_items", 48),
-                        default=48,
-                        minimum=8,
-                    )
-                    or 48
-                )
-                retrieved = self.material_intelligence.get_index(persona_id).retrieve(
-                    dimension, top_k=retrieval_limit, diversity=True
-                )
             units: list[dict[str, Any]] = []
             seen_unit_ids: set[str] = set()
             for item in retrieved:
@@ -4190,7 +4204,9 @@ class PersonaCreationOrchestrator:
                 participant = f"{dimension}:audit" if final_audit else str(dimension)
                 try:
                     self._raise_if_pause_requested(job)
-                    items, delta_ids, mode = plan_dimension(dimension)
+                    items, delta_ids, mode = plan_dimension(
+                        dimension, await retrieve_for_dimension(dimension)
+                    )
                     if mode == "skipped_no_delta":
                         return None
                     await self._emit(
@@ -4580,7 +4596,10 @@ class PersonaCreationOrchestrator:
                     if adapter is not None
                     else None
                 )
-                payload = self._global_audit_payload(
+                # Ledger ranking and token planning are CPU-bound on a large
+                # corpus; build the payload off the event loop.
+                payload = await asyncio.to_thread(
+                    self._global_audit_payload,
                     job,
                     artifacts,
                     transport_safe_bytes=(
@@ -4738,10 +4757,16 @@ class PersonaCreationOrchestrator:
         context_manager = getattr(
             self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
         )
+        evidence_index = (
+            self.material_intelligence.get_index(job.persona_id)
+            if self.material_intelligence is not None and job.persona_id
+            else None
+        )
         for ledger_limit, claims_limit, text_scale in compaction_levels:
             payload = self._build_audit_payload(
                 job,
                 artifacts,
+                evidence_index=evidence_index,
                 ledger_limit=ledger_limit,
                 claims_limit=claims_limit,
                 text_scale=text_scale,
@@ -4777,6 +4802,7 @@ class PersonaCreationOrchestrator:
         job: PersonaCreationJob,
         artifacts: dict[str, dict[str, Any]],
         *,
+        evidence_index: PersonaEvidenceIndex | None = None,
         ledger_limit: int,
         claims_limit: int,
         text_scale: float,
@@ -4790,8 +4816,10 @@ class PersonaCreationOrchestrator:
             )
             for dimension, artifact in artifacts.items()
         }
-        if self.material_intelligence is not None and job.persona_id:
-            index = self.material_intelligence.get_index(job.persona_id)
+        if evidence_index is None and self.material_intelligence is not None and job.persona_id:
+            evidence_index = self.material_intelligence.get_index(job.persona_id)
+        if evidence_index is not None:
+            index = evidence_index
             ledger = [
                 {
                     "id": item.get("id"),
@@ -4838,14 +4866,7 @@ class PersonaCreationOrchestrator:
             }
             missing_ids = referenced_ids - included_ids
             if missing_ids:
-                from persona_continuum.application.material_intelligence import (
-                    _is_persona_semantic_unit,
-                )
-
-                unit_by_id = {item.id: item for item in index.units()
-                              if _is_persona_semantic_unit(item)}
-                fused_by_id = {item.id: item for item in index.fused()
-                               if set(item.supporting_evidence_ids) <= unit_by_id.keys()}
+                unit_by_id, fused_by_id = index.lookup_semantic(missing_ids)
                 for evidence_id in sorted(missing_ids):
                     unit = unit_by_id.get(evidence_id)
                     if unit is not None:
@@ -5171,6 +5192,12 @@ class PersonaCreationOrchestrator:
             )
         sources = list(self.continuum.personas.get_sources(job.persona_id))
         source_by_id = {source.id: source for source in sources}
+        # Shared by every repair worker; evidence is read-only during repair.
+        evidence_index = (
+            self.material_intelligence.get_index(job.persona_id)
+            if self.material_intelligence is not None
+            else None
+        )
         context_manager = getattr(
             self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
         )
@@ -5200,12 +5227,12 @@ class PersonaCreationOrchestrator:
                 )
                 current_artifact = current_artifacts.get(dimension, {})
 
-                def retrieved_evidence_items() -> list[dict[str, Any]]:
+                async def retrieved_evidence_items() -> list[dict[str, Any]]:
                     retrieved = (
-                        self.material_intelligence.get_index(job.persona_id or "").retrieve(
-                            dimension, top_k=32, diversity=True
+                        await asyncio.to_thread(
+                            evidence_index.retrieve, dimension, top_k=32, diversity=True
                         )
-                        if self.material_intelligence is not None
+                        if evidence_index is not None
                         else []
                     )
                     return [
@@ -5233,9 +5260,9 @@ class PersonaCreationOrchestrator:
                         # An empty or claim-less artifact has no claim slice
                         # to repair from; without the index fallback the
                         # targeted repair could never rebuild anything.
-                        evidence_items = retrieved_evidence_items()
+                        evidence_items = await retrieved_evidence_items()
                 else:
-                    evidence_items = retrieved_evidence_items()
+                    evidence_items = await retrieved_evidence_items()
                 if not evidence_items:
                     if target_components:
                         return {
@@ -6061,7 +6088,9 @@ body_self_image、body_confidence 及长期 behavioral_implications。不要强�
         material_gap_payload: dict[str, Any] = {}
         if self.material_intelligence is not None and job.persona_id:
             with contextlib.suppress(Exception):
-                material_gap_payload = self.material_intelligence.gap_analysis(job.persona_id)
+                material_gap_payload = await asyncio.to_thread(
+                    self.material_intelligence.gap_analysis, job.persona_id
+                )
                 missing = [
                     str(item.get("dimension"))
                     for item in material_gap_payload.get("gaps", [])
@@ -6093,13 +6122,13 @@ body_self_image、body_confidence 及长期 behavioral_implications。不要强�
         existing_materials: list[dict[str, Any]] = []
         if self.material_intelligence is not None and job.persona_id:
             with contextlib.suppress(Exception):
-                existing_materials = [
-                    dict(item)
-                    for item in self.material_intelligence.get_index(job.persona_id).retrieve(
-                        missing[0] if missing else None, top_k=24, diversity=True
-                    )
-                    if isinstance(item, dict)
-                ]
+                retrieved = await asyncio.to_thread(
+                    self.material_intelligence.get_index(job.persona_id).retrieve,
+                    missing[0] if missing else None,
+                    top_k=24,
+                    diversity=True,
+                )
+                existing_materials = [dict(item) for item in retrieved if isinstance(item, dict)]
         context_manager = getattr(
             self.runtime_executor, "context_budget_manager", AgentContextBudgetManager()
         )

@@ -490,25 +490,28 @@ class WebAPIHandler:
 
     async def get_persona_evidence_index(self, request: Request) -> Response:
         persona_id = request.path_params.get("persona_id", "")
-        try:
+        dimension = request.query_params.get("dimension")
+        limit = self._query_int(request, "limit", default=24, minimum=1, maximum=100)
+
+        def build() -> dict[str, Any]:
             index = self.material_intelligence.get_index(persona_id)
-            dimension = request.query_params.get("dimension")
-            limit = self._query_int(request, "limit", default=24, minimum=1, maximum=100)
             items = index.retrieve(dimension, top_k=limit, diversity=True)
             coverage = self.material_intelligence.coverage(persona_id)
-            return json_ok(
-                {
-                    "persona_id": persona_id,
-                    "coverage": coverage.model_dump(mode="json"),
-                    "items": items,
-                    "contradictions": [
-                        item.model_dump(mode="json") for item in index.contradictions()
-                    ],
-                    "episodes": [item.model_dump(mode="json") for item in index.episodes()],
-                    "fused_count": len(index.fused()),
-                    "unit_count": index.unit_count(),
-                }
-            )
+            return {
+                "persona_id": persona_id,
+                "coverage": coverage.model_dump(mode="json"),
+                "items": items,
+                "contradictions": [
+                    item.model_dump(mode="json") for item in index.contradictions()
+                ],
+                "episodes": [item.model_dump(mode="json") for item in index.episodes()],
+                "fused_count": len(index.fused()),
+                "unit_count": index.unit_count(),
+            }
+
+        try:
+            # A large ledger takes seconds to rank; keep the server responsive.
+            return json_ok(await asyncio.to_thread(build))
         except Exception as exc:
             return json_err(str(exc), status_code=404)
 

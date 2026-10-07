@@ -919,3 +919,44 @@ def test_global_audit_payload_does_not_backfill_compacted_away_references(app) -
     assert visible_ids <= ledger_ids
     assert evidence_units[-1].id not in ledger_ids
     assert encoded_bytes + _GLOBAL_AUDIT_ENVELOPE_HEADROOM_BYTES <= budget
+
+
+@pytest.mark.anyio
+async def test_dimension_retrieval_runs_off_the_event_loop_on_one_index(app, monkeypatch) -> None:
+    """Ranking a large ledger must not freeze agent streams or the Web UI."""
+
+    import threading
+
+    from persona_continuum.application.material_intelligence import PersonaEvidenceIndex
+
+    runtime = RecordingRuntime()
+    app.agent_registry.register_adapter(runtime)
+    await app.agent_discovery.scan(force_refresh=True)
+    job = _make_job(app, runtime.adapter_id)
+    job.creation_mode = "private_materials"
+    job.source_ids = _add_sources(app, job.persona_id or "", 0, 1)
+    job.source_count = 1
+
+    loop_thread = threading.get_ident()
+    retrieve_threads: list[int] = []
+    indexes: list[PersonaEvidenceIndex] = []
+    original_retrieve = PersonaEvidenceIndex.retrieve
+    original_get_index = app.material_intelligence.get_index
+
+    def recording_retrieve(self, *args, **kwargs):
+        retrieve_threads.append(threading.get_ident())
+        return original_retrieve(self, *args, **kwargs)
+
+    def recording_get_index(persona_id):
+        index = original_get_index(persona_id)
+        indexes.append(index)
+        return index
+
+    monkeypatch.setattr(PersonaEvidenceIndex, "retrieve", recording_retrieve)
+    monkeypatch.setattr(app.material_intelligence, "get_index", recording_get_index)
+
+    await app.persona_creation._extract_dimensions(job)
+
+    assert len(retrieve_threads) == len(REQUIRED_DIMENSIONS)
+    assert loop_thread not in retrieve_threads
+    assert len(indexes) == 1

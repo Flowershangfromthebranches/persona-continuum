@@ -6,6 +6,7 @@ Does not send private chat or call an external model.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -382,7 +383,14 @@ async def test_persisted_production_windows_drop_from_128k_to_500k(app, tmp_path
     assert five["rebatched_windows"] <= max(1, int(five["initial_windows"] * 0.25))
     assert five["packing_accuracy"] >= 0.75
     assert five["estimation_error_p95"] >= -0.10
-    out = Path("docs/reports/implementation/context-window-scale-benchmark.json")
+    # Refresh the committed benchmark only on request; a plain test run must
+    # not dirty the working tree with timing noise.
+    out = (
+        Path(__file__).resolve().parents[2]
+        / "docs/reports/implementation/context-window-scale-benchmark.json"
+        if os.environ.get("PERSONA_CONTINUUM_WRITE_BENCHMARKS") == "1"
+        else tmp_path / "context-window-scale-benchmark.json"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         json.dumps(

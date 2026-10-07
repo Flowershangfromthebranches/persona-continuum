@@ -18,11 +18,14 @@ import contextlib
 import difflib
 import hashlib
 import json
+import os
 import re
+import threading
 import time
 import unicodedata
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -977,16 +980,138 @@ def _evidence_type(text: str, metadata: dict[str, Any]) -> str:
     return "behavioral_observation"
 
 
-class PersonaEvidenceIndex:
-    """Full-corpus retrieval over derived evidence, not a last-N source slice."""
+@dataclass(frozen=True)
+class _RetrievalSnapshot:
+    """What ranking reads: semantic fused claims and the units they cite."""
 
+    fused: list[FusedEvidence]
+    distinct_units: dict[str, EvidenceUnit]
+    intelligence: dict[str, Any]
+
+
+_SQL_ID_CHUNK = 900
+
+
+class PersonaEvidenceIndex:
+    """Full-corpus retrieval over derived evidence, not a last-N source slice.
+
+    One instance caches its retrieval snapshot, so a caller ranking several
+    dimensions in one pass should reuse the same instance, and create a new one
+    once evidence may have changed (the snapshot is never invalidated).
+    """
+
+    # Every read goes through ``Database.reader()``: retrieval runs on worker
+    # threads, and the event-loop connection must not be shared with them.
     def __init__(self, database: Any, persona_id: str) -> None:
         self.database = database
         self.persona_id = persona_id
+        self._snapshot: _RetrievalSnapshot | None = None
+        self._all_units: list[EvidenceUnit] | None = None
+        # Dimensions retrieve concurrently from worker threads; load once.
+        self._load_lock = threading.Lock()
+
+    def _rows_by_rowid(self, rowids: Sequence[int]) -> Iterator[Any]:
+        # rowid lookups stay fast where ``id IN (...)`` chunks did not (~30x).
+        ordered = sorted(rowids)
+        for start in range(0, len(ordered), _SQL_ID_CHUNK):
+            chunk = ordered[start : start + _SQL_ID_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            yield from self.database.reader().execute(
+                f"SELECT * FROM persona_evidence_units WHERE rowid IN ({placeholders})",
+                tuple(chunk),
+            )
+
+    def _retrieval_snapshot(self) -> _RetrievalSnapshot:
+        """Load only fused claims and the units they reference.
+
+        A chat ledger holds hundreds of thousands of units that no fused claim
+        cites.  Materialising all of them on every call blocked the event loop
+        for ~20s per dimension on a 385k-unit corpus.
+        """
+
+        with self._load_lock:
+            if self._snapshot is None:
+                self._snapshot = self._load_snapshot()
+            return self._snapshot
+
+    def _load_snapshot(self) -> _RetrievalSnapshot:
+        fused_all = self.fused()
+        supporting_ids = {
+            evidence_id for item in fused_all for evidence_id in item.supporting_evidence_ids
+        }
+        semantic: dict[str, bool] = {}
+        intelligence: dict[str, Any] = {}
+        rowid_by_id: dict[str, int] = {}
+        # One sequential pass over the persona's ledger reads only the small
+        # columns; full rows are fetched afterwards for the cited units alone.
+        for row in self.database.reader().execute(
+            "SELECT rowid, id, metadata_json FROM persona_evidence_units WHERE persona_id = ?",
+            (self.persona_id,),
+        ):
+            unit_id = str(row["id"])
+            if unit_id not in supporting_ids:
+                continue
+            rowid_by_id[unit_id] = int(row["rowid"])
+            metadata = MaterialIntelligenceService._row_json(row, "metadata_json", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            semantic[unit_id] = metadata.get("semantic_status") != "context_only"
+            found = metadata.get("evidence_intelligence") or metadata.get(
+                "source_factual_intelligence"
+            )
+            if found:
+                intelligence[unit_id] = found
+        # A claim citing a missing or context-only unit is excluded, exactly as
+        # the subset check against all semantic unit ids did before.
+        fused = [
+            item
+            for item in fused_all
+            if all(semantic.get(evidence_id, False) for evidence_id in item.supporting_evidence_ids)
+        ]
+        distinct_ids = {
+            evidence_id for item in fused for evidence_id in item.unique_evidence_ids
+        }
+        distinct_units = {
+            str(row["id"]): MaterialIntelligenceService._unit_from_row(row)
+            for row in self._rows_by_rowid(
+                [rowid_by_id[unit_id] for unit_id in distinct_ids if unit_id in rowid_by_id]
+            )
+        }
+        return _RetrievalSnapshot(
+            fused=fused, distinct_units=distinct_units, intelligence=intelligence
+        )
+
+    def lookup_semantic(
+        self, ids: Iterable[str]
+    ) -> tuple[dict[str, EvidenceUnit], dict[str, FusedEvidence]]:
+        """Resolve a few referenced ids without materialising the ledger."""
+
+        wanted = sorted({str(value) for value in ids})
+        fused = {
+            item.id: item for item in self._retrieval_snapshot().fused if item.id in wanted
+        }
+        units: dict[str, EvidenceUnit] = {}
+        for start in range(0, len(wanted), _SQL_ID_CHUNK):
+            chunk = wanted[start : start + _SQL_ID_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self.database.reader().execute(
+                f"SELECT * FROM persona_evidence_units "
+                f"WHERE persona_id = ? AND id IN ({placeholders})",
+                (self.persona_id, *chunk),
+            ):
+                unit = MaterialIntelligenceService._unit_from_row(row)
+                if _is_persona_semantic_unit(unit):
+                    units[unit.id] = unit
+        return units, fused
+
+    def _units_cached(self) -> list[EvidenceUnit]:
+        with self._load_lock:
+            if self._all_units is None:
+                self._all_units = self.units()
+            return self._all_units
 
     def _rows(self, table: str, order: str = "rowid") -> list[Any]:
         return list(
-            self.database.conn.execute(
+            self.database.reader().execute(
                 f"SELECT * FROM {table} WHERE persona_id = ? ORDER BY {order}",
                 (self.persona_id,),
             ).fetchall()
@@ -999,14 +1124,14 @@ class PersonaEvidenceIndex:
         ]
 
     def unit_count(self) -> int:
-        row = self.database.conn.execute(
+        row = self.database.reader().execute(
             "SELECT COUNT(*) AS count FROM persona_evidence_units WHERE persona_id = ?",
             (self.persona_id,),
         ).fetchone()
         return int(row["count"] if row is not None else 0)
 
     def contains_text(self, text: str) -> bool:
-        row = self.database.conn.execute(
+        row = self.database.reader().execute(
             "SELECT 1 FROM persona_evidence_units WHERE persona_id = ? AND text = ? LIMIT 1",
             (self.persona_id, text),
         ).fetchone()
@@ -1042,19 +1167,15 @@ class PersonaEvidenceIndex:
     ) -> list[dict[str, Any]]:
         """Rank every unit/fused item, then diversify by source and time."""
 
-        units = self.units()
-        semantic_ids = {item.id for item in units if _is_persona_semantic_unit(item)}
-        if dimension or not relationship:
-            units = [item for item in units if item.id in semantic_ids]
-        unit_by_id = {item.id: item for item in units}
-        fused = [item for item in self.fused()
-                 if set(item.supporting_evidence_ids) <= semantic_ids]
+        snapshot = self._retrieval_snapshot()
+        semantic_only = bool(dimension or not relationship)
+        fused = snapshot.fused
         candidates: list[dict[str, Any]] = []
         # Deterministic chat Expression DNA profile (P0-E/P0-F wiring): one
         # derived statistical record surfaces to the expression_dna retrieval
         # path without creating per-statistic EvidenceUnits.  It is labelled
         # statistical so no consumer can mistake frequency for intent.
-        style_row = self.database.conn.execute(
+        style_row = self.database.reader().execute(
             "SELECT profile_json FROM persona_chat_style_profiles WHERE persona_id = ?",
             (self.persona_id,),
         ).fetchone()
@@ -1146,30 +1267,28 @@ class PersonaEvidenceIndex:
                     "score": score + min(0.2, fused_item.confidence * 0.2),
                     "verbatim_samples": fused_item.verbatim_samples,
                     "intelligence": [
-                        unit_by_id[evidence_id].metadata.get("evidence_intelligence")
-                        or unit_by_id[evidence_id].metadata.get("source_factual_intelligence", {})
+                        snapshot.intelligence[evidence_id]
                         for evidence_id in fused_item.supporting_evidence_ids
-                        if evidence_id in unit_by_id
-                        and (
-                            unit_by_id[evidence_id].metadata.get("evidence_intelligence")
-                            or unit_by_id[evidence_id].metadata.get("source_factual_intelligence")
-                        )
+                        if evidence_id in snapshot.intelligence
                     ][:4],
                 }
             )
         # Every unique supporting unit stays retrievable, including the
         # canonical (first) one: dropping it would hide the full unit text
         # behind the fused one-line claim and starve extraction/repair.
-        distinct_unit_ids = {
-            evidence_id for item in fused for evidence_id in item.unique_evidence_ids
-        }
+        unit_candidates: list[EvidenceUnit]
         if not candidates:
-            unit_candidates = units
-        else:
+            # No claim matched: rank the whole ledger (small or legacy corpora).
             unit_candidates = [
-                unit_by_id[evidence_id]
-                for evidence_id in distinct_unit_ids
-                if evidence_id in unit_by_id
+                item
+                for item in self._units_cached()
+                if not semantic_only or _is_persona_semantic_unit(item)
+            ]
+        else:
+            # Sorted so tied scores rank identically across processes.
+            unit_candidates = [
+                snapshot.distinct_units[evidence_id]
+                for evidence_id in sorted(snapshot.distinct_units)
             ]
         for unit_item in unit_candidates:
             score = (
@@ -1277,6 +1396,33 @@ class PersonaEvidenceIndex:
 
     def get_decision_examples(self, top_k: int = 24) -> list[dict[str, Any]]:
         return self.retrieve(behavior="decision", top_k=top_k)
+
+
+# Jobs predating owner tracking are judged by silence alone.
+_LEGACY_MATERIAL_JOB_STALE_SECONDS = 3600
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _material_job_orphaned(job: MaterialAnalysisJob, now: datetime) -> bool:
+    pid = safe_int(job.progress.get("worker_pid"), default=None, minimum=1)
+    if pid is not None:
+        return pid != os.getpid() and not _process_alive(pid)
+    try:
+        updated = datetime.fromisoformat(job.updated_at)
+    except ValueError:
+        return True
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    return (now - updated).total_seconds() > _LEGACY_MATERIAL_JOB_STALE_SECONDS
 
 
 def _is_persona_semantic_unit(unit: EvidenceUnit) -> bool:
@@ -1650,6 +1796,9 @@ class MaterialIntelligenceService:
             source_ids=list(source_ids or []),
             runtime_snapshot=dict(runtime_snapshot or {}),
             incremental=incremental,
+            # Owner process: lets a later process tell a live job from one
+            # orphaned by a restart.
+            progress={"worker_pid": os.getpid()},
         )
         self._save_job(job)
         return job
@@ -2049,8 +2198,10 @@ class MaterialIntelligenceService:
             job.progress["classification_completed"] = chat_counts["completed"]
             job.progress["classification_pending"] = chat_counts["pending"]
             units = self._propagate_canonical_intelligence(units, dedup.supporting_units)
+            # Writes stay on the event-loop connection; the reload of a large
+            # ledger is the slow part and reads on a worker-private connection.
             self._persist_units(units)
-            all_units = self._load_units(persona_id)
+            all_units = await asyncio.to_thread(self._load_units, persona_id)
             canonical_ids = {item.id for item in dedup.canonical_units}
             relation_units = [item for item in all_units
                               if item.id in canonical_ids and _is_persona_semantic_unit(item)]
@@ -2159,7 +2310,7 @@ class MaterialIntelligenceService:
                 performance_metrics=metrics.model_dump(mode="json"),
                 chat_pipeline=self._chat_pipeline_progress(metrics),
             )
-            coverage = self.coverage(persona_id)
+            coverage = await asyncio.to_thread(self.coverage, persona_id)
             await stage(
                 MaterialJobStatus.GAP_ANALYSIS,
                 stage="coverage_gate",
@@ -2209,7 +2360,8 @@ class MaterialIntelligenceService:
         return PersonaEvidenceIndex(self.database, persona_id)
 
     def coverage(self, persona_id: str) -> PrivateMaterialCoverage:
-        conn = self.database.conn
+        # Called from worker threads as well as the event loop.
+        conn = self.database.reader()
 
         def _count(sql: str, params: tuple[Any, ...] = ()) -> int:
             row = conn.execute(sql, params).fetchone()
@@ -5311,6 +5463,41 @@ class MaterialIntelligenceService:
         )
 
     # ---- persistence -----------------------------------------------------
+    def reclaim_interrupted_jobs(self) -> int:
+        """Fail analysis jobs that a previous process left mid-run.
+
+        Nothing resumes them after a restart, so they would otherwise report an
+        active stage forever.  Agent classifications are cached per unit, so a
+        retry skips the work that already finished.
+        """
+
+        terminal = (MaterialJobStatus.READY_FOR_COMPILATION.value, MaterialJobStatus.FAILED.value)
+        rows = self.database.conn.execute(
+            "SELECT * FROM persona_material_jobs WHERE status NOT IN (?, ?)", terminal
+        ).fetchall()
+        now = datetime.now(UTC)
+        reclaimed = 0
+        for row in rows:
+            job = self._job_from_row(row)
+            # Every CLI command initialises the container too; a job still
+            # owned by a live Web server must never be failed underneath it.
+            if not _material_job_orphaned(job, now):
+                continue
+            job.progress = {
+                **job.progress,
+                "interrupted_stage": job.progress.get("stage") or job.status.value,
+                "stage": "interrupted",
+            }
+            job.status = MaterialJobStatus.FAILED
+            job.error = (
+                "MATERIAL_JOB_INTERRUPTED: the process restarted before analysis "
+                "finished; retry to resume from cached classifications"
+            )
+            job.updated_at = now.isoformat()
+            self._save_job(job)
+            reclaimed += 1
+        return reclaimed
+
     def _save_job(self, job: MaterialAnalysisJob) -> None:
         self.database.conn.execute(
             "INSERT OR REPLACE INTO persona_material_jobs "
@@ -5459,7 +5646,8 @@ class MaterialIntelligenceService:
         return data
 
     def _load_units(self, persona_id: str) -> list[EvidenceUnit]:
-        rows = self.database.conn.execute(
+        # Runs on worker threads; every writer commits before it is called.
+        rows = self.database.reader().execute(
             "SELECT * FROM persona_evidence_units WHERE persona_id = ? ORDER BY rowid",
             (persona_id,),
         ).fetchall()

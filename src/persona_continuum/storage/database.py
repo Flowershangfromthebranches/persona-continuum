@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -17,6 +18,9 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._conn: sqlite3.Connection | None = None
+        self._readers = threading.local()
+        self._reader_connections: list[sqlite3.Connection] = []
+        self._readers_lock = threading.Lock()
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -922,7 +926,40 @@ class Database:
         else:
             conn.commit()
 
+    def reader(self) -> sqlite3.Connection:
+        """A read-only connection private to the calling thread.
+
+        ``conn`` is shared with the event loop.  Python's sqlite3 caches
+        prepared statements per connection, so the same SQL run from two
+        threads at once fails with ``InterfaceError: API misuse``.  Worker
+        threads that read off the event loop use this instead; WAL lets them
+        run alongside the writer and they see every committed write.
+        """
+
+        connection: sqlite3.Connection | None = getattr(self._readers, "conn", None)
+        if connection is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30.0,
+                # Owned by one thread; the flag only lets close() release it.
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
+            self._readers.conn = connection
+            with self._readers_lock:
+                self._reader_connections.append(connection)
+        return connection
+
     def close(self) -> None:
+        with self._readers_lock:
+            for connection in self._reader_connections:
+                with contextlib.suppress(Exception):
+                    connection.close()
+            self._reader_connections.clear()
+        self._readers = threading.local()
         if self._conn is not None:
             self._conn.close()
             self._conn = None
